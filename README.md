@@ -2,8 +2,6 @@
 
 > 📖 Also available in [Simplified Chinese](README_CN.md).
 
-<a href="https://apps.apple.com/app/xntfs/id6782636021"><img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download xntfs on the App Store" height="44"></a>
-
 A macOS app + **FSKit file-system extension** that reads and writes NTFS volumes using the
 [ntfs-3g](https://github.com/tuxera/ntfs-3g) engine. No kernel extension, no macFUSE.
 
@@ -13,10 +11,8 @@ layer, the same way ntfs-3g's own `src/ntfs-3g.c` maps FUSE onto libntfs.
 
 NTFS drives **auto-mount under `/Volumes` by the system** (DiskArbitration probes the extension's
 registered `FSMediaTypes` — no app process needed, exactly like the built-in exFAT/MSDOS modules).
-The `xntfs` app is a **control panel**: it lists NTFS drives and attached images, does manual
-mount/unmount (to `/Volumes`) and read-only remounts, attaches/detaches disk images, and shows an
-extension-status diagnostics page. The sandbox can't run `hdiutil`/`mount`, so those are surfaced
-as **copyable Terminal commands** where the app can't act directly.
+The `xntfs` app is a **control panel**: it lists NTFS drives and does manual mount/unmount,
+mount-to-a-chosen-folder, read-only remounts, and disk-image mounting.
 
 ```
 xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
@@ -54,19 +50,15 @@ depends on code-signing/provisioning that's tied to your Apple Developer account
    so DiskArbitration auto-mounts NTFS drives read-write under `/Volumes` using our module — with
    no app process running (same model as the built-in exFAT/MSDOS modules). `FSProbeOrder` governs
    priority over the legacy read-only NTFS driver. The app only *detects/lists* drives for the UI.
-3. **Mount location** — drives mount under `/Volumes/<name>`; the system picks the path and
-   de-duplicates names. Mounting to a **custom folder is not possible** for a sandboxed FSKit
-   volume (the extension can only reach `/Volumes` and its own sandbox temp paths — see
-   *Sandbox & mounting*), so `/Volumes` is the only target.
+3. **Mount location** — drives mount under `/Volumes/<name>` by default; the system picks the path
+   and de-duplicates names, and it needs **no** folder grant under the sandbox. To mount elsewhere,
+   use *Mount to Folder…* on a drive and pick a folder — selecting it in the open panel is the
+   sandbox access grant.
 4. **Multiple drives at once** — devices are tracked by BSD name and mounted independently.
-5. **Manual mount / unmount** — per-device *Mount…* (to `/Volumes`, with a read-only toggle) and
-   *Eject*. On macOS 27 the app mounts in-app via `FSClient`; on macOS 26 a sandboxed app isn't
-   allowed to mount a third-party FSKit volume, so it shows a copyable
-   `diskutil mount [readOnly] /dev/diskXsY` command instead.
-6. **Disk images** — *Add Disk Image…* picks a raw NTFS image (`.img`/`.dd`/…) and shows a copyable
-   `hdiutil attach [-readonly] <img>` command (read-only by default); once attached, the device's
-   NTFS volume **auto-mounts** like any drive. *Detach Image…* shows `hdiutil detach`. The app can't
-   run `hdiutil` itself (the sandbox blocks `Process`), hence the copyable commands.
+5. **Manual mount / unmount to any permitted folder** — per-device *Mount* (→ `/Volumes`),
+   *Mount to Folder…* (folder picker → security-scoped URL), and *Eject*.
+6. **Mount raw NTFS image files** — *Mount Image…* attaches the image (`hdiutil attach -nomount`)
+   and mounts the resulting device under `/Volumes`.
 
 ## Build
 
@@ -98,28 +90,22 @@ works only if that team's App ID has the **FSKit File System Module** capability
 Apple Developer portal. Once provisioned, enable the module under **System Settings → General →
 Login Items & Extensions → File System Extensions**.
 
-## Sandbox & mounting
+## Sandbox & mounting (verified)
 
-Verified on macOS 26.5 with the sandboxed build. The reality is narrower than first assumed:
+Tested on macOS 26 with a sandboxed (ad-hoc `app-sandbox`) build driving the same DiskArbitration
+mount path against an FSKit volume — see `sandbox-test/` (`datest.swift`):
 
-- **Auto-mount is the main path.** The system mounts NTFS drives read-write under `/Volumes` via
-  the extension's `FSMediaTypes` — no app process, no mount entitlement. Fully working.
-- **A sandboxed app can't manually mount a third-party FSKit volume on macOS 26.** A
-  DiskArbitration mount returns `kDAReturnNotPrivileged`. The `com.apple.developer.fskit.mount`
-  entitlement + `FSClient.mountSingleVolume` authorize manual mounting **only on macOS 27**, and
-  even there the target is **`/Volumes` only**.
-- **`mount -F -t xntfs …` fails** ("Probing resource: Permission denied"). The working CLI path is
-  **`diskutil mount`**, which routes through `diskarbitrationd` — the same path auto-mount uses.
-- **Custom-folder mounting is impossible.** The extension declares
-  `FSRequiresSecurityScopedPathURLResources`; its sandbox can reach only `/Volumes` (owned by
-  `diskarbitrationd`) and its own temp paths (e.g. `/tmp`). An arbitrary folder would need a
-  security-scoped grant that neither a Terminal command nor the in-app path (un-privileged on 26,
-  `/Volumes`-only on 27) can hand to the extension.
-- **The app never shells out.** The sandbox blocks `Process`, so `hdiutil` (attach/detach) and the
-  pre-27 `diskutil mount` are surfaced as **copyable Terminal commands** for the user to run.
+- A sandboxed app **can** initiate a DiskArbitration mount. Mounting to `/Volumes/<name>` needs
+  **no** folder grant — `diskarbitrationd` (root) creates it. ✅
+- Mounting to a **custom folder** works whenever the app can access that folder — i.e. a folder
+  the user picked via the open panel (powerbox), which grants security-scoped access. ✅
+- The only failure observed was creating a folder where the app had **no** access — a *file-access*
+  limit, not a mount limit. The folder picker is the grant.
 
-So: auto-mount works everywhere; manual mount is in-app on macOS 27 (→ `/Volumes`) or a copyable
-`diskutil mount` command on macOS 26; image attach/detach is always a copyable `hdiutil` command.
+So physical-drive mounting (the main feature) is App-Store-sandbox-viable, to `/Volumes` or to a
+user-picked folder. The one genuinely sandbox-limited piece is **attaching a raw image file**:
+it shells out to `hdiutil` (`Process`), which the sandbox blocks — that feature needs a different
+attach path or a helper for App Store distribution.
 
 > This is a *technical* capability result; App Review is a separate policy gate.
 
@@ -128,21 +114,17 @@ So: auto-mount works everywhere; manual mount is in-app on macOS 27 (→ `/Volum
 ```
 xntfs/                     app target (SwiftUI)
   xntfsApp.swift           @main App + Settings scene
-  ContentView.swift        device/image list + detail, mount/attach/detach actions
-  MountSheet.swift         manual mount (→ /Volumes, read-only toggle)
-  CommandSheet.swift       attach/detach sheets (AttachImageSheet: read-only default)
-  CopyableCommand.swift    shared "copy this Terminal command" control
-  DiagnosticsView.swift    extension-status diagnostics page
+  ContentView.swift        device list, detail, manual + image mount
   SettingsView.swift       read-only-by-default preference
   Model/NTFSDevice.swift
   Services/                AppModel, AppSettings, DiskArbitrationMonitor, MountService,
-                           ExtensionStatus
+                           SecurityScope
   Localizable.xcstrings    en + zh-Hans
   Assets.xcassets/AppIcon  generated icon set
 ntfs3g/                    FSKit extension target
   ntfs3g*.swift            @main + FSUnaryFileSystem + FSVolume + FSItem
   bridge/                  ntfs_fskit.{h,c}, ntfs_device_fskit.m, bridging header
-  Info.plist               FSShortName=xntfs, FSMediaTypes, block resources
+  Info.plist               FSShortName=ntfs, FSMediaTypes, block resources
   ntfs3g.entitlements      com.apple.developer.fskit.fsmodule + sandbox
 ntfs-3g/                   upstream source + built libntfs-3g.a
 scripts/wire_project.rb    applies extension/app build settings (xcodeproj gem)

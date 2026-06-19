@@ -1,0 +1,44 @@
+# ───────── macOS ─────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ───────── Xcode build output / caches ─────────
+DerivedData/
+build/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+# Per-user Xcode state (keep shared schemes under xcshareddata/)
+xcuserdata/
+
+# ───────── Compiled objects / libraries ─────────
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.dylib
+
+# ───────── libntfs-3g ─────────
+# ntfs-3g/ is a pristine submodule; its generated autotools output + the built
+# libntfs-3g.a are produced by scripts/build-libntfs.sh and are not committed.
+
+# ───────── Disk-image test fixtures (large; regenerate with mkntfs / ntfscp) ─────────
+*.img
+*.ntfs
+*.dd
+*.raw
+
+# ───────── sandbox-test compiled outputs (keep the .swift/.m sources) ─────────
+sandbox-test/datest
+sandbox-test/datest.app/
+sandbox-test/fsclientdump
+
+# ───────── Tooling / session scratch ─────────
+.codex-gpt-session-id
+.derived-data-log-*
+
+# ───────── Local working docs (kept out of the repo) ─────────
+/CLAUDE.md
+/HANDOFF.md

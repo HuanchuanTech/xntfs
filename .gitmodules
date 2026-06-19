@@ -1,0 +1,4 @@
+[submodule "ntfs-3g"]
+	path = ntfs-3g
+	url = https://github.com/tuxera/ntfs-3g.git
+	ignore = untracked
