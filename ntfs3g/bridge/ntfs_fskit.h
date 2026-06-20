@@ -35,6 +35,8 @@ enum {
 
 /* Inode reported for the root directory (matches FSItem.Identifier.rootDirectory). */
 #define NFSK_ROOT_INO 2ULL
+/* Parent reported for the root directory (matches FSItem.Identifier.parentOfRoot). */
+#define NFSK_PARENT_OF_ROOT 1ULL
 
 typedef struct ntfs_fskit_volume ntfs_fskit_volume;
 
@@ -50,6 +52,7 @@ typedef struct {
 
 typedef struct {
     uint64_t ino;
+    uint64_t parent_ino;   /* parent dir in our numbering; 0 if unknown */
     uint32_t type;         /* NFSK_TYPE_* */
     uint32_t mode;         /* synthesized POSIX permission bits */
     uint32_t nlink;

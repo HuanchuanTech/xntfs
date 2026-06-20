@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -31,6 +32,7 @@
 #include <ntfs-3g/unistr.h>
 #include <ntfs-3g/ntfstime.h>
 #include <ntfs-3g/bootsect.h>
+#include <ntfs-3g/logging.h>
 
 #include "ntfs_fskit.h"
 
@@ -50,10 +52,15 @@ static int dev_open(struct ntfs_device *dev, int flags) {
 
 static int dev_close(struct ntfs_device *dev) {
     nfsk_devctx *c = dev->d_private;
+    int ret = 0;
     if (!NDevOpen(dev)) { errno = EBADF; return -1; }
-    if (NDevDirty(dev) && !NDevReadOnly(dev)) { nfsk_block_sync(c->resource); NDevClearDirty(dev); }
+    if (NDevDirty(dev) && !NDevReadOnly(dev)) {
+        int r = nfsk_block_sync(c->resource);
+        if (r == 0) NDevClearDirty(dev);   /* only forget dirty once the flush succeeds */
+        else { errno = -r; ret = -1; }      /* keep dirty so the failure isn't masked */
+    }
     NDevClearOpen(dev);
-    return 0;
+    return ret;
 }
 
 static s64 dev_seek(struct ntfs_device *dev, s64 offset, int whence) {
@@ -153,11 +160,93 @@ static inline uint64_t from_mft(u64 mft_no) {
     return (mft_no == (u64)FILE_root) ? NFSK_ROOT_INO : (uint64_t)mft_no;
 }
 
+/* NTFS records 0..15 are reserved metadata ($MFT, $MFTMirr, $LogFile, $Volume,
+ * $Bitmap, $Boot, $Extend, ...). FILE_root (5) is the visible root, remapped to
+ * NFSK_ROOT_INO; every other sub-FILE_first_user record is metadata that must never
+ * be exposed as a file — its raw MFT number also collides with reserved FSKit item
+ * IDs ($MFT=0=invalid, $MFTMirr=1=parentOfRoot, $LogFile=2=root). */
+static inline int is_reserved_mft(u64 mft_no) {
+    return mft_no < (u64)FILE_first_user && mft_no != (u64)FILE_root;
+}
+
+/* Returns 1 = directory, 0 = non-directory, -1 = error (errno set). When the inode
+ * is a directory and empty_out != NULL, *empty_out is set to 1 (empty) or 0 (not).
+ * A real emptiness-probe failure (EIO/corruption — NOT "directory not empty") is
+ * reported as -1 with errno, so it is never silently turned into ENOTEMPTY. */
+static int nfsk_isdir(ntfs_volume *vol, u64 ref, int *empty_out) {
+    ntfs_inode *ni = ntfs_inode_open(vol, ref);
+    if (!ni) return -1;
+    int isdir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) ? 1 : 0;
+    int ret = isdir, saved = 0;
+    if (empty_out) {
+        *empty_out = 1;
+        if (isdir) {
+            errno = 0;
+            if (ntfs_check_empty_dir(ni) != 0) {
+                if (errno == ENOTEMPTY) *empty_out = 0;
+                else { ret = -1; saved = errno ? errno : EIO; }   /* real I/O error */
+            }
+        }
+    }
+    ntfs_inode_close(ni);
+    if (ret == -1 && saved) errno = saved;
+    return ret;
+}
+
+/* Raw parent MFT number from the inode's first FILE_NAME attribute, or (u64)-1 for
+ * the root or when the record can't be read. */
+static u64 nfsk_parent_mft_raw(ntfs_inode *ni) {
+    if (ni->mft_no == (u64)FILE_root) return (u64)-1;
+    ntfs_attr_search_ctx *ctx = ntfs_attr_get_search_ctx(ni, NULL);
+    if (!ctx) return (u64)-1;
+    u64 pmft = (u64)-1;
+    if (!ntfs_attr_lookup(AT_FILE_NAME, AT_UNNAMED, 0, CASE_SENSITIVE, 0, NULL, 0, ctx)) {
+        const FILE_NAME_ATTR *fn = (const FILE_NAME_ATTR *)
+            ((const u8 *)ctx->attr + le16_to_cpu(ctx->attr->value_offset));
+        pmft = MREF(le64_to_cpu(fn->parent_directory));
+    }
+    ntfs_attr_put_search_ctx(ctx);
+    return pmft;
+}
+
+/* Parent directory (in our numbering) for attributes. NTFS hard links give one inode
+ * several FILE_NAME attrs in different directories; we report the first — a stable,
+ * deterministic choice — because FSKit identity is per fileID and cannot represent
+ * multiple parents. Returns 0 when it can't be read (Swift then falls back to the
+ * lookup hint, and enumeration overrides this with the listing directory). */
+static uint64_t nfsk_parent_ino(ntfs_inode *ni) {
+    if (ni->mft_no == (u64)FILE_root) return NFSK_PARENT_OF_ROOT;
+    u64 pmft = nfsk_parent_mft_raw(ni);
+    if (pmft == (u64)-1 || is_reserved_mft(pmft)) return 0;
+    return from_mft(pmft);
+}
+
+/* Returns 1 if `sref` is `dst_dir` itself or an ancestor of it — i.e. moving the
+ * directory `sref` into `dst_dir` would create a cycle (mv A A/B/C). 0 if not, -1 on
+ * error (errno set). Walks dst_dir's FILE_NAME parent chain up toward the root. */
+static int nfsk_dir_contains(ntfs_volume *vol, u64 sref, uint64_t dst_dir) {
+    u64 cur = to_mref(dst_dir);
+    for (int guard = 0; guard < 65536; guard++) {
+        if (MREF(cur) == MREF(sref)) return 1;
+        if (MREF(cur) == (u64)FILE_root) return 0;
+        ntfs_inode *ni = ntfs_inode_open(vol, cur);
+        if (!ni) return -1;                                /* errno from ntfs_inode_open */
+        u64 par = nfsk_parent_mft_raw(ni);
+        ntfs_inode_close(ni);                              /* clobbers errno, so set it below */
+        if (par == (u64)-1) { errno = EIO; return -1; }    /* unreadable parent chain */
+        cur = par;
+    }
+    errno = ELOOP;   /* chain too long → cyclic/corrupt metadata, not a real ancestry */
+    return -1;
+}
+
 static uint32_t map_dt(unsigned dt_type) {
     switch (dt_type) {
         case NTFS_DT_DIR:     return NFSK_TYPE_DIR;
-        case NTFS_DT_LNK:     return NFSK_TYPE_SYMLINK;
-        case NTFS_DT_REPARSE: return NFSK_TYPE_SYMLINK;
+        /* We don't resolve symlinks/reparse points, so don't advertise them as
+           symlinks (the OS would then try, and fail, to read the link target). */
+        case NTFS_DT_LNK:     return NFSK_TYPE_FILE;
+        case NTFS_DT_REPARSE: return NFSK_TYPE_FILE;
         case NTFS_DT_FIFO:    return NFSK_TYPE_FIFO;
         case NTFS_DT_SOCK:    return NFSK_TYPE_SOCKET;
         case NTFS_DT_BLK:     return NFSK_TYPE_BLOCKDEV;
@@ -260,11 +349,13 @@ static void fill_times(nfsk_attr_t *out, ntfs_inode *ni) {
 
 int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
     if (!v || !v->vol || !out) return -EINVAL;
+    if (is_reserved_mft(to_mref(ino))) return -ENOENT;   /* metadata is not a file */
     ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
 
     memset(out, 0, sizeof(*out));
     out->ino = from_mft(ni->mft_no);
+    out->parent_ino = nfsk_parent_ino(ni);
     out->nlink = le16_to_cpu(ni->mrec->link_count);
 
     int is_dir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) ? 1 : 0;
@@ -280,10 +371,12 @@ int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
         out->mode = 0777;
         if (out->nlink == 0) out->nlink = 1;
     } else if (ni->flags & FILE_ATTR_REPARSE_POINT) {
-        out->type = NFSK_TYPE_SYMLINK;
+        /* Reparse points (Windows symlinks/junctions): we can't resolve them, so
+           expose them as opaque regular files rather than unreadable symlinks. */
+        out->type = NFSK_TYPE_FILE;
         out->size = (uint64_t)ni->data_size;
         out->alloc_size = (uint64_t)ni->allocated_size;
-        out->mode = 0777;
+        out->mode = (ni->flags & FILE_ATTR_READONLY) ? 0444 : 0666;
     } else {
         out->type = NFSK_TYPE_FILE;
         ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
@@ -308,6 +401,7 @@ uint64_t nfsk_lookup(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_ut
     free(uname);
     ntfs_inode_close(dir);
     if (mref == (u64)-1) { if (out_errno) *out_errno = errno ? errno : ENOENT; return 0; }
+    if (is_reserved_mft(MREF(mref))) { if (out_errno) *out_errno = ENOENT; return 0; }  /* don't expose metadata */
     return from_mft(MREF(mref));
 }
 
@@ -357,6 +451,7 @@ int nfsk_readdir(ntfs_fskit_volume *v, uint64_t dir_ino, int64_t start_cookie, v
 /* ---- File I/O ---- */
 int64_t nfsk_read(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, void *buf, int64_t len, int *out_errno) {
     if (!v || !v->vol || len < 0) { if (out_errno) *out_errno = EINVAL; return -1; }
+    if (is_reserved_mft(to_mref(ino))) { if (out_errno) *out_errno = EPERM; return -1; }
     if (len == 0) return 0;
     ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
     if (!ni) { if (out_errno) *out_errno = errno; return -1; }
@@ -385,6 +480,7 @@ done:
 int64_t nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const void *buf, int64_t len, int *out_errno) {
     if (!v || !v->vol || len < 0) { if (out_errno) *out_errno = EINVAL; return -1; }
     if (v->read_only) { if (out_errno) *out_errno = EROFS; return -1; }
+    if (is_reserved_mft(to_mref(ino))) { if (out_errno) *out_errno = EPERM; return -1; }
     if (len == 0) return 0;
     ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
     if (!ni) { if (out_errno) *out_errno = errno; return -1; }
@@ -407,6 +503,7 @@ int64_t nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const voi
 uint64_t nfsk_create(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8, uint32_t type, int *out_errno) {
     if (!v || !v->vol) { if (out_errno) *out_errno = EINVAL; return 0; }
     if (v->read_only) { if (out_errno) *out_errno = EROFS; return 0; }
+    if (is_reserved_mft(to_mref(dir_ino))) { if (out_errno) *out_errno = EPERM; return 0; }
     ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) { if (out_errno) *out_errno = errno; return 0; }
 
@@ -427,6 +524,7 @@ uint64_t nfsk_create(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_ut
 int nfsk_remove(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8) {
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return -EROFS;
+    if (is_reserved_mft(to_mref(dir_ino))) return -EPERM;
     ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) return -errno;
 
@@ -436,6 +534,7 @@ int nfsk_remove(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8) {
 
     u64 mref = ntfs_inode_lookup_by_name(dir, uname, ulen);
     if (mref == (u64)-1) { int e = errno ? errno : ENOENT; free(uname); ntfs_inode_close(dir); return -e; }
+    if (is_reserved_mft(MREF(mref))) { free(uname); ntfs_inode_close(dir); return -EPERM; }  /* don't remove metadata */
     ntfs_inode *ni = ntfs_inode_open(v->vol, mref);
     if (!ni) { int e = errno; free(uname); ntfs_inode_close(dir); return -e; }
     int rc = ntfs_delete(v->vol, NULL, ni, dir, uname, ulen);   /* always closes ni and dir */
@@ -447,6 +546,7 @@ int nfsk_remove(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8) {
 int nfsk_truncate(ntfs_fskit_volume *v, uint64_t ino, uint64_t size) {
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return -EROFS;
+    if (is_reserved_mft(to_mref(ino))) return -EPERM;
     ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
     ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
@@ -463,6 +563,7 @@ int nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
                    int64_t mtime_sec, int64_t mtime_nsec, int64_t atime_sec, int64_t atime_nsec) {
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return -EROFS;
+    if (is_reserved_mft(to_mref(ino))) return -EPERM;
     ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
     if (mtime_sec != INT64_MIN) { struct timespec ts = { (time_t)mtime_sec, (long)mtime_nsec }; ni->last_data_change_time = timespec2ntfs(ts); }
@@ -473,6 +574,124 @@ int nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
     return rc ? -errno : 0;
 }
 
+/*
+ * Rename helpers. libntfs has no path-based front-end (that lives in ntfs-3g's
+ * FUSE layer, which we don't link), so these mirror src/ntfs-3g.c's rename logic
+ * on top of the inode primitives. Each is self-contained — it re-opens its
+ * directory by inode number — because ntfs_delete() closes BOTH the target inode
+ * and its directory inode (libntfs-3g/dir.c, out:), while ntfs_link() closes neither.
+ */
+
+/* Add directory entry `name` in directory #dir_no pointing at inode `ref`. */
+static int nfsk_link_name(ntfs_volume *vol, uint64_t dir_no, u64 ref,
+                          const ntfschar *name, int name_len) {
+    ntfs_inode *dir = ntfs_inode_open(vol, to_mref(dir_no));
+    if (!dir) return -1;
+    ntfs_inode *ni = ntfs_inode_open(vol, ref);
+    if (!ni) { int e = errno; ntfs_inode_close(dir); errno = e; return -1; }
+    int r = ntfs_link(ni, dir, name, name_len);   /* closes neither inode */
+    int e = errno;
+    ntfs_inode_close(ni);
+    ntfs_inode_close(dir);
+    if (r) { errno = e; return -1; }
+    return 0;
+}
+
+/* Remove directory entry `name` from directory #dir_no. */
+static int nfsk_unlink_name(ntfs_volume *vol, uint64_t dir_no,
+                            const ntfschar *name, int name_len) {
+    ntfs_inode *dir = ntfs_inode_open(vol, to_mref(dir_no));
+    if (!dir) return -1;
+    u64 ref = ntfs_inode_lookup_by_name(dir, name, name_len);
+    if (ref == (u64)-1) { int e = errno; ntfs_inode_close(dir); errno = e ? e : ENOENT; return -1; }
+    ntfs_inode *ni = ntfs_inode_open(vol, ref);
+    if (!ni) { int e = errno; ntfs_inode_close(dir); errno = e; return -1; }
+    /* ntfs_delete closes BOTH ni and dir, even on failure. */
+    return ntfs_delete(vol, NULL, ni, dir, name, name_len) ? -1 : 0;
+}
+
+/* Unique temp-name disambiguator; all bridge calls run under the volume lock. */
+static unsigned nfsk_rename_seq = 0;
+
+/*
+ * Replace an existing, different destination, mirroring
+ * src/ntfs-3g.c:ntfs_fuse_safe_rename(). The destination is first backed up under a
+ * temp name, the source is moved into place, and only then is the backup dropped —
+ * with the destination restored on any failure. So a failed link never destroys the
+ * destination's data (the flaw in the previous delete-first implementation). A
+ * non-empty-directory destination fails cleanly at step (2): ntfs_delete refuses it.
+ */
+static int nfsk_safe_overwrite(ntfs_volume *vol,
+                               uint64_t src_dir, const ntfschar *usrc, int slen, u64 sref,
+                               uint64_t dst_dir, const ntfschar *udst, int dlen, u64 dref) {
+    ntfschar *utmp = NULL;
+    int tmplen = 0, e;
+    /* Pick a temp name that does not already exist in the destination directory. */
+    {
+        ntfs_inode *ddir = ntfs_inode_open(vol, to_mref(dst_dir));
+        if (!ddir) return -1;
+        int found = 0;
+        for (int tries = 0; tries < 4096; tries++) {
+            char tmpname[64];
+            snprintf(tmpname, sizeof(tmpname), "ntfs3g-rn-%016llx-%u",
+                     (unsigned long long)MREF(dref), ++nfsk_rename_seq);
+            free(utmp); utmp = NULL;
+            tmplen = ntfs_mbstoucs(tmpname, &utmp);
+            if (tmplen < 0) { ntfs_inode_close(ddir); free(utmp); return -1; }
+            errno = 0;
+            u64 ex = ntfs_inode_lookup_by_name(ddir, utmp, tmplen);
+            if (ex == (u64)-1) {
+                if (errno == 0 || errno == ENOENT) { found = 1; break; }   /* name is free */
+                int le = errno; ntfs_inode_close(ddir); free(utmp); errno = le; return -1;
+            }
+        }
+        ntfs_inode_close(ddir);
+        if (!found) { free(utmp); errno = EEXIST; return -1; }
+    }
+
+    /* (1) back up the destination under the temp name */
+    if (nfsk_link_name(vol, dst_dir, dref, utmp, tmplen)) {
+        e = errno; free(utmp); errno = e; return -1;
+    }
+    /* (2) remove the destination's original name */
+    if (nfsk_unlink_name(vol, dst_dir, udst, dlen)) {
+        e = errno;                                    /* dst keeps its name */
+        nfsk_unlink_name(vol, dst_dir, utmp, tmplen); /* drop the backup */
+        free(utmp); errno = e; return -1;
+    }
+    /* (3) give the source the destination's name */
+    if (nfsk_link_name(vol, dst_dir, sref, udst, dlen)) {
+        e = errno;
+        if (nfsk_link_name(vol, dst_dir, dref, udst, dlen) == 0)  /* restore dst */
+            nfsk_unlink_name(vol, dst_dir, utmp, tmplen);
+        free(utmp); errno = e; return -1;
+    }
+    /* (4) drop the source's old name */
+    if (nfsk_unlink_name(vol, src_dir, usrc, slen)) {
+        e = errno;
+        if (nfsk_unlink_name(vol, dst_dir, udst, dlen) == 0) {        /* undo (3) */
+            if (nfsk_link_name(vol, dst_dir, dref, udst, dlen) == 0)  /* restore dst */
+                nfsk_unlink_name(vol, dst_dir, utmp, tmplen);
+        }
+        free(utmp); errno = e; return -1;
+    }
+    /* success: the source holds the destination name; dropping the backup frees the
+       destination's data (its last reference). The rename has already succeeded, so a
+       cleanup failure is logged (leaving an orphan temp link) rather than reported as
+       a rename error. */
+    if (nfsk_unlink_name(vol, dst_dir, utmp, tmplen) != 0)
+        ntfs_log_error("xntfs: rename left an orphan temp backup link (errno %d)\n", errno);
+    free(utmp);
+    return 0;
+}
+
+/*
+ * Rename src_dir/src_name -> dst_dir/dst_name, mirroring src/ntfs-3g.c's
+ * ntfs_fuse_rename(): a rename whose destination resolves to the same inode (a
+ * case-only change, or another hard-link name) is a no-op; an existing, different
+ * destination is replaced recoverably; otherwise the new name is linked before the
+ * old name is unlinked, so the source is never lost if the unlink fails.
+ */
 int nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_name,
                 uint64_t dst_dir, const char *dst_name) {
     if (!v || !v->vol) return -EINVAL;
@@ -480,68 +699,80 @@ int nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_name,
     if (!src_name || !dst_name) return -EINVAL;
     if (src_dir == dst_dir && !strcmp(src_name, dst_name)) return 0;
 
-    ntfs_inode *sdir = ntfs_inode_open(v->vol, to_mref(src_dir));
-    if (!sdir) return -errno;
-    ntfs_inode *ddir = (dst_dir == src_dir) ? sdir : ntfs_inode_open(v->vol, to_mref(dst_dir));
-    if (!ddir) { int e = errno; ntfs_inode_close(sdir); return -e; }
-
+    ntfs_volume *vol = v->vol;
+    if (is_reserved_mft(to_mref(src_dir)) || is_reserved_mft(to_mref(dst_dir))) return -EPERM;
     ntfschar *usrc = NULL, *udst = NULL;
-    int slen = ntfs_mbstoucs(src_name, &usrc);
-    int dlen = (slen < 0) ? -1 : ntfs_mbstoucs(dst_name, &udst);
-    if (slen < 0 || dlen < 0) {
-        int e = errno; free(usrc); free(udst);
-        if (ddir != sdir) ntfs_inode_close(ddir);
+    int slen, dlen, rc = 0, e = 0, src_isdir = 0;
+    u64 sref = (u64)-1, dref = (u64)-1;
+
+    slen = ntfs_mbstoucs(src_name, &usrc);
+    if (slen < 0) { e = errno; rc = -1; goto out; }
+    dlen = ntfs_mbstoucs(dst_name, &udst);
+    if (dlen < 0) { e = errno; rc = -1; goto out; }
+
+    /* Resolve the source inode. */
+    {
+        ntfs_inode *sdir = ntfs_inode_open(vol, to_mref(src_dir));
+        if (!sdir) { e = errno; rc = -1; goto out; }
+        sref = ntfs_inode_lookup_by_name(sdir, usrc, slen);
+        e = errno;
         ntfs_inode_close(sdir);
-        return -e;
+        if (sref == (u64)-1) { e = e ? e : ENOENT; rc = -1; goto out; }
+    }
+    if (is_reserved_mft(MREF(sref))) { e = EPERM; rc = -1; goto out; }  /* can't move metadata */
+
+    src_isdir = nfsk_isdir(vol, sref, NULL);
+    if (src_isdir < 0) { e = errno ? errno : EIO; rc = -1; goto out; }
+    /* Moving a directory into its own subtree would create a cycle (mv A A/B/C). */
+    if (src_isdir && src_dir != dst_dir) {
+        int desc = nfsk_dir_contains(vol, sref, dst_dir);
+        if (desc < 0) { e = errno ? errno : EIO; rc = -1; goto out; }
+        if (desc)     { e = EINVAL; rc = -1; goto out; }
     }
 
-    int rc = 0, e = 0;
-    int same_dir = (dst_dir == src_dir);
-    u64 dref = ntfs_inode_lookup_by_name(ddir, udst, dlen);
+    /* Resolve the destination inode (may be absent). A -1 result means "not found"
+       only when errno is ENOENT/unset; any other errno is a real error (corruption or
+       I/O) and must abort rather than fall through to the "no destination" path. */
+    {
+        ntfs_inode *ddir = ntfs_inode_open(vol, to_mref(dst_dir));
+        if (!ddir) { e = errno; rc = -1; goto out; }
+        errno = 0;
+        dref = ntfs_inode_lookup_by_name(ddir, udst, dlen);
+        int le = errno;
+        ntfs_inode_close(ddir);
+        if (dref == (u64)-1 && le != 0 && le != ENOENT) { e = le; rc = -1; goto out; }
+    }
+
     if (dref != (u64)-1) {
-        ntfs_inode *over = ntfs_inode_open(v->vol, dref);
-        if (over) {
-            rc = ntfs_delete(v->vol, NULL, over, ddir, udst, dlen);
-            if (rc) e = errno ? errno : EIO;
-            if (same_dir) sdir = NULL;
-            ddir = NULL;
-            if (!rc) {
-                sdir = ntfs_inode_open(v->vol, to_mref(src_dir));
-                if (!sdir) { rc = -1; e = errno ? errno : EIO; }
-                else {
-                    ddir = same_dir ? sdir : ntfs_inode_open(v->vol, to_mref(dst_dir));
-                    if (!ddir) { rc = -1; e = errno ? errno : EIO; }
-                }
-            }
-        } else {
-            rc = -1;
-            e = errno ? errno : EIO;
-        }
-    }
-    if (!rc) {
-        u64 sref = ntfs_inode_lookup_by_name(sdir, usrc, slen);
-        if (sref == (u64)-1) { rc = -1; e = errno ? errno : ENOENT; }
-        else {
-            ntfs_inode *ni = ntfs_inode_open(v->vol, sref);
-            if (!ni) { rc = -1; e = errno; }
-            else if (ntfs_link(ni, ddir, udst, dlen)) { rc = -1; e = errno ? errno : EIO; ntfs_inode_close(ni); }
-            else {
-                ntfs_inode_close(ni);
-                ntfs_inode *ni2 = ntfs_inode_open(v->vol, sref);
-                if (!ni2) { rc = -1; e = errno ? errno : EIO; }
-                else {
-                    int delete_closes_ddir = (ddir == sdir);
-                    if (ntfs_delete(v->vol, NULL, ni2, sdir, usrc, slen)) { rc = -1; e = errno ? errno : EIO; }
-                    if (delete_closes_ddir) ddir = NULL;
-                    sdir = NULL;
-                }
-            }
-        }
+        /* Same underlying file (case-only rename, or another hard-link name): a
+           no-op, exactly as upstream ntfs_fuse_rename treats it. The on-disk name
+           keeps its existing case. */
+        if (MREF(dref) == MREF(sref)) { rc = 0; goto out; }
+        if (is_reserved_mft(MREF(dref))) { e = EPERM; rc = -1; goto out; }  /* don't clobber metadata */
+        /* POSIX type compatibility + empty-target checks, before any mutation. */
+        int dst_empty = 0;
+        int dst_isdir = nfsk_isdir(vol, dref, &dst_empty);
+        if (dst_isdir < 0) { e = errno ? errno : EIO; rc = -1; goto out; }
+        if (dst_isdir && !src_isdir)  { e = EISDIR;    rc = -1; goto out; }  /* file over dir      */
+        if (!dst_isdir && src_isdir)  { e = ENOTDIR;   rc = -1; goto out; }  /* dir over non-dir   */
+        if (dst_isdir && !dst_empty)  { e = ENOTEMPTY; rc = -1; goto out; }  /* over non-empty dir */
+        /* Replace an existing, different destination — recoverable. */
+        if (nfsk_safe_overwrite(vol, src_dir, usrc, slen, sref,
+                                dst_dir, udst, dlen, dref)) { e = errno; rc = -1; }
+        goto out;
     }
 
+    /* No existing destination: link the new name, then unlink the old; if the
+       unlink fails, undo the new link. The new name is always created before the
+       old is removed, so the source is never lost. */
+    if (nfsk_link_name(vol, dst_dir, sref, udst, dlen)) { e = errno; rc = -1; goto out; }
+    if (nfsk_unlink_name(vol, src_dir, usrc, slen)) {
+        e = errno; rc = -1;
+        nfsk_unlink_name(vol, dst_dir, udst, dlen);   /* undo the new link */
+    }
+
+out:
     free(usrc); free(udst);
-    if (ddir && ddir != sdir) ntfs_inode_close(ddir);
-    if (sdir) ntfs_inode_close(sdir);
     return rc ? -e : 0;
 }
 

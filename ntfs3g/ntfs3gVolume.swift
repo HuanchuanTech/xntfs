@@ -83,17 +83,17 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     private func item(for ino: UInt64, parentIno: UInt64, name: FSFileName) -> ntfs3gItem {
-        if let existing = items[ino] {
-            existing.parentIno = parentIno
-            existing.name = name
-            return existing
-        }
+        // FSKit identity is per-fileID (inode), so we cache one item per inode. The
+        // parentIno/name held here are only a fallback hint: reported attributes take
+        // their parent from the bridge (derived from the inode's FILE_NAME), so they
+        // don't shift when the same inode is reached through another hard-link path.
+        if let existing = items[ino] { return existing }
         let it = ntfs3gItem(ino: ino, parentIno: parentIno, name: name)
         items[ino] = it
         return it
     }
 
-    fileprivate func makeAttributes(_ a: nfsk_attr_t, parentIno: UInt64) -> FSItem.Attributes {
+    fileprivate func makeAttributes(_ a: nfsk_attr_t, parentIno: UInt64, preferContext: Bool = false) -> FSItem.Attributes {
         let attrs = FSItem.Attributes()
         attrs.type = FSItem.ItemType(rawValue: Int(a.type)) ?? .file
         attrs.mode = a.mode
@@ -101,7 +101,14 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         attrs.size = a.size
         attrs.allocSize = a.alloc_size
         attrs.fileID = FSItem.Identifier(rawValue: a.ino) ?? .invalid
-        attrs.parentID = FSItem.Identifier(rawValue: parentIno) ?? .invalid
+        // Parent reporting: directory enumeration knows the directory being listed and
+        // passes preferContext=true to report it, so a hard link's parentID stays
+        // consistent with the directory it appears in. Context-free attributes(of:)
+        // instead prefer the stable parent the bridge derives from the inode's
+        // FILE_NAME (not mutated by lookups, so a held handle's parentID can't be
+        // corrupted by another hard-link path), falling back to the supplied hint.
+        let parent = preferContext ? parentIno : (a.parent_ino != 0 ? a.parent_ino : parentIno)
+        attrs.parentID = FSItem.Identifier(rawValue: parent) ?? .invalid
         attrs.uid = 0
         attrs.gid = 0
         attrs.flags = 0
@@ -124,8 +131,11 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     // MARK: properties
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let caps = FSVolume.SupportedCapabilities()
-        caps.supportsHardLinks = true
-        caps.supportsSymbolicLinks = true
+        // We don't implement createLink / createSymbolicLink / readSymbolicLink,
+        // so don't advertise these — otherwise the OS/Finder offers operations
+        // that then fail at runtime.
+        caps.supportsHardLinks = false
+        caps.supportsSymbolicLinks = false
         caps.supportsPersistentObjectIDs = true
         caps.supports64BitObjectIDs = true
         caps.supports2TBFiles = true
@@ -136,7 +146,10 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     var volumeStatistics: FSStatFSResult {
-        let stats = FSStatFSResult(fileSystemTypeName: "ntfs")
+        // Must match the extension's FSShortName (ntfs3g/Info.plist) so the mounted
+        // volume's statfs f_fstypename reads "xntfs" — that is how the app tells our
+        // mounts apart from the legacy system NTFS driver.
+        let stats = FSStatFSResult(fileSystemTypeName: "xntfs")
         return withLock {
             guard let h = handle else { return stats }
             var st = nfsk_statfs_t()
@@ -165,7 +178,13 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func mount(options: FSTaskOptions) async throws {}
-    func unmount() async { withLock { if let h = handle { _ = nfsk_sync(h) } } }
+    func unmount() async {
+        withLock {
+            guard let h = handle else { return }
+            let rc = nfsk_sync(h)
+            if rc != 0 { NSLog("[xntfs] flush on unmount failed: errno \(-rc)") }
+        }
+    }
 
     func synchronize(flags: FSSyncFlags) async throws {
         try withLock {
@@ -396,7 +415,7 @@ extension ntfs3gVolume {
         guard let h = handle else { return nil }
         var a = nfsk_attr_t()
         if nfsk_getattr(h, ino, &a) != 0 { return nil }
-        return makeAttributes(a, parentIno: parentIno)
+        return makeAttributes(a, parentIno: parentIno, preferContext: true)
     }
 }
 
