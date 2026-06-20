@@ -12,8 +12,6 @@ import Observation
 final class AppModel {
     let settings = AppSettings()
     private(set) var devices: [NTFSDevice] = []
-    /// BSD names this app mounted itself (vs. volumes the system auto-mounted).
-    private(set) var appMountedIDs: Set<String> = []
     var lastError: String?
 
     private let monitor: DiskArbitrationMonitor?
@@ -41,10 +39,6 @@ final class AppModel {
                    case .mounting = existing.state { return existing }
                 return incoming
             }
-            // Drop app-mounted marks for volumes that are gone or no longer mounted.
-            self.appMountedIDs = self.appMountedIDs.filter { id in
-                self.devices.contains { $0.id == id && $0.state.isMounted }
-            }
         }
         monitor.start()
         devices = monitor.currentDevices
@@ -61,7 +55,6 @@ final class AppModel {
         updateState(device.id, .mounting)
         do {
             let mounted = try await mounter.mount(device, at: target, readOnly: readOnly)
-            appMountedIDs.insert(device.id)
             updateState(device.id, .mounted(mounted))
         } catch {
             updateState(device.id, .failed(error.localizedDescription))
@@ -74,7 +67,6 @@ final class AppModel {
         updateState(device.id, .unmounting)
         do {
             try await mounter.unmount(device, force: force)
-            appMountedIDs.remove(device.id)
             updateState(device.id, .unmounted)
         } catch {
             updateState(device.id, .failed(error.localizedDescription))

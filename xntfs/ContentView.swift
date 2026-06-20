@@ -30,7 +30,7 @@ struct ContentView: View {
     private var mainContent: some View {
         NavigationSplitView {
             List(model.devices, selection: $selection) { device in
-                DeviceRow(device: device, byApp: model.appMountedIDs.contains(device.id))
+                DeviceRow(device: device, byXntfs: device.mountedByXntfs)
                     .tag(device.id)
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 280)
@@ -115,7 +115,7 @@ struct ExtensionBanner: View {
 
 struct DeviceRow: View {
     let device: NTFSDevice
-    var byApp: Bool = false
+    var byXntfs: Bool = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -129,11 +129,11 @@ struct DeviceRow: View {
             }
             Spacer()
             if device.state.isMounted {
-                Text(byApp ? "xntfs" : "System")
+                Text(byXntfs ? "xntfs" : "System")
                     .font(.caption2).fontWeight(.semibold)
                     .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background((byApp ? Color.accentColor : Color.secondary).opacity(0.18))
-                    .foregroundStyle(byApp ? Color.accentColor : Color.secondary)
+                    .background((byXntfs ? Color.accentColor : Color.secondary).opacity(0.18))
+                    .foregroundStyle(byXntfs ? Color.accentColor : Color.secondary)
                     .clipShape(Capsule())
             }
         }

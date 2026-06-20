@@ -32,6 +32,10 @@ struct NTFSDevice: Identifiable, Equatable {
     var isRemovable: Bool
     var devicePath: String         // "/dev/disk4s1"
     var state: MountState = .unmounted
+    /// True when the volume is currently mounted through our FSKit module (its
+    /// mount fs-type matches the extension's FSShortName), regardless of whether
+    /// this app or the system performed the mount.
+    var mountedByXntfs: Bool = false
     /// For disk-image devices: the source image file URL (so we can detach later).
     var imageSourceURL: URL? = nil
 
@@ -39,7 +43,8 @@ struct NTFSDevice: Identifiable, Equatable {
 
     static func == (lhs: NTFSDevice, rhs: NTFSDevice) -> Bool {
         lhs.id == rhs.id && lhs.volumeName == rhs.volumeName &&
-        lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes
+        lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes &&
+        lhs.mountedByXntfs == rhs.mountedByXntfs
     }
 }
 

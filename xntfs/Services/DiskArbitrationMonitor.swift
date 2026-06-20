@@ -68,20 +68,29 @@ final class DiskArbitrationMonitor {
         DADiskCopyDescription(disk) as? [String: Any]
     }
 
+    /// The mount fs-type our extension reports — must match the extension's
+    /// FSShortName (ntfs3g/Info.plist). Used to recognize volumes we're serving.
+    static let moduleFSType = "xntfs"
+
     private func makeDevice(_ disk: DADisk, bsd: String) -> NTFSDevice? {
         guard let d = description(disk) else { return nil }
         let leaf = d[kDADiskDescriptionMediaLeafKey as String] as? Bool ?? false
         let content = d[kDADiskDescriptionMediaContentKey as String] as? String ?? ""
-        let kind = d[kDADiskDescriptionVolumeKindKey as String] as? String ?? ""
-        let ntfs = content == "Windows_NTFS" || kind.lowercased() == "ntfs"
-        guard ntfs, leaf else { return nil }
+        let kind = (d[kDADiskDescriptionVolumeKindKey as String] as? String ?? "").lowercased()
+        let mountURL = d[kDADiskDescriptionVolumePathKey as String] as? URL
+
+        // Authoritative: is the volume actually mounted through our module? The media
+        // content hint can't be trusted for mounted volumes — DiskArbitration has been
+        // seen to mislabel NTFS as MS-DOS/exFAT — so check the real mount fs-type.
+        let byModule = mountURL.flatMap { Self.mountFSType($0) } == Self.moduleFSType
+        let isNTFSMedia = content == "Windows_NTFS" || kind == "ntfs" || kind == Self.moduleFSType
+        guard byModule || (isNTFSMedia && leaf) else { return nil }
 
         let name = d[kDADiskDescriptionVolumeNameKey as String] as? String
             ?? (d[kDADiskDescriptionMediaNameKey as String] as? String) ?? bsd
         let size = (d[kDADiskDescriptionMediaSizeKey as String] as? NSNumber)?.uint64Value ?? 0
         let removable = (d[kDADiskDescriptionMediaRemovableKey as String] as? Bool) ?? false
         let ejectable = (d[kDADiskDescriptionMediaEjectableKey as String] as? Bool) ?? false
-        let mountURL = d[kDADiskDescriptionVolumePathKey as String] as? URL
 
         var dev = NTFSDevice(
             id: bsd,
@@ -91,8 +100,19 @@ final class DiskArbitrationMonitor {
             contentHint: content,
             isRemovable: removable || ejectable,
             devicePath: "/dev/\(bsd)")
+        dev.mountedByXntfs = byModule
         if let url = mountURL { dev.state = .mounted(url) }
         return dev
+    }
+
+    /// `f_fstypename` of the filesystem mounted at `url`, or nil if not mounted.
+    private static func mountFSType(_ url: URL) -> String? {
+        guard url.isFileURL else { return nil }
+        var s = statfs()
+        guard statfs(url.path, &s) == 0 else { return nil }
+        return withUnsafeBytes(of: &s.f_fstypename) { raw in
+            String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+        }
     }
 }
 
