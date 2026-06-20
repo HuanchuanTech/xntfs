@@ -88,7 +88,7 @@ macOS(AMFI)只有在该权限被描述文件授权后才会加载扩展。在**�
 ## 沙盒与挂载(已验证)
 
 在 macOS 26 上,用一个沙盒化(临时 `app-sandbox`)构建驱动同一条 DiskArbitration 挂载路径
-去挂载 FSKit 卷,做过测试——见 `sandbox-test/`(`datest.swift`):
+去挂载 FSKit 卷,做过测试:
 
 - 沙盒应用**可以**发起 DiskArbitration 挂载。挂到 `/Volumes/<名称>` **无需**文件夹授权
   ——`diskarbitrationd`(root)会创建它。✅
@@ -118,7 +118,7 @@ xntfs/                     应用 target(SwiftUI)
 ntfs3g/                    FSKit 扩展 target
   ntfs3g*.swift            @main + FSUnaryFileSystem + FSVolume + FSItem
   bridge/                  ntfs_fskit.{h,c}、ntfs_device_fskit.m、桥接头
-  Info.plist               FSShortName=ntfs、FSMediaTypes、块资源
+  Info.plist               FSShortName=xntfs、FSMediaTypes、块资源
   ntfs3g.entitlements      com.apple.developer.fskit.fsmodule + 沙盒
 ntfs-3g/                   上游源码 + 构建出的 libntfs-3g.a
 scripts/wire_project.rb    应用扩展/应用的构建设置(xcodeproj gem)

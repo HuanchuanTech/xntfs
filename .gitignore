@@ -30,11 +30,6 @@ xcuserdata/
 *.dd
 *.raw
 
-# ───────── sandbox-test compiled outputs (keep the .swift/.m sources) ─────────
-sandbox-test/datest
-sandbox-test/datest.app/
-sandbox-test/fsclientdump
-
 # ───────── Tooling / session scratch ─────────
 .codex-gpt-session-id
 .derived-data-log-*

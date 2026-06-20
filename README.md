@@ -93,7 +93,7 @@ Login Items & Extensions → File System Extensions**.
 ## Sandbox & mounting (verified)
 
 Tested on macOS 26 with a sandboxed (ad-hoc `app-sandbox`) build driving the same DiskArbitration
-mount path against an FSKit volume — see `sandbox-test/` (`datest.swift`):
+mount path against an FSKit volume:
 
 - A sandboxed app **can** initiate a DiskArbitration mount. Mounting to `/Volumes/<name>` needs
   **no** folder grant — `diskarbitrationd` (root) creates it. ✅
@@ -124,7 +124,7 @@ xntfs/                     app target (SwiftUI)
 ntfs3g/                    FSKit extension target
   ntfs3g*.swift            @main + FSUnaryFileSystem + FSVolume + FSItem
   bridge/                  ntfs_fskit.{h,c}, ntfs_device_fskit.m, bridging header
-  Info.plist               FSShortName=ntfs, FSMediaTypes, block resources
+  Info.plist               FSShortName=xntfs, FSMediaTypes, block resources
   ntfs3g.entitlements      com.apple.developer.fskit.fsmodule + sandbox
 ntfs-3g/                   upstream source + built libntfs-3g.a
 scripts/wire_project.rb    applies extension/app build settings (xcodeproj gem)
