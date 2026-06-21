@@ -62,8 +62,147 @@ static uint64_t find_child(ntfs_fskit_volume *v, uint64_t dir, const char *name)
     return ino;
 }
 
+/* ---- assertion-based checks (rename / metadata / parentID) ---- */
+#define U(x) ((unsigned long long)(x))
+static int g_pass = 0, g_fail = 0;
+#define CHECK(cond, ...) do { \
+    if (cond) { g_pass++; printf("  [PASS] "); } \
+    else      { g_fail++; printf("  [FAIL] "); } \
+    printf(__VA_ARGS__); printf("\n"); \
+} while (0)
+
+/* Best-effort removal of scratch names left by a prior (possibly crashed) run. */
+static void pre_clean(ntfs_fskit_volume *v) {
+    uint64_t sub = find_child(v, NFSK_ROOT_INO, "t_sub");
+    if (sub) { nfsk_remove(v, sub, "t_x.txt"); nfsk_remove(v, NFSK_ROOT_INO, "t_sub"); }
+    uint64_t d = find_child(v, NFSK_ROOT_INO, "t_d");
+    if (d) {
+        uint64_t s = find_child(v, d, "sub"); if (s) nfsk_remove(v, d, "sub");
+        nfsk_remove(v, d, "c.txt"); nfsk_remove(v, d, "loop");
+        nfsk_remove(v, NFSK_ROOT_INO, "t_d");
+    }
+    uint64_t pd = find_child(v, NFSK_ROOT_INO, "t_pdir");
+    if (pd) { nfsk_remove(v, pd, "child.txt"); nfsk_remove(v, NFSK_ROOT_INO, "t_pdir"); }
+    const char *flat[] = { "t_a.txt","t_b.txt","t_src.txt","t_dst.txt","t_x.txt","t_f.txt","t_d2","t_rootfile.txt" };
+    for (int i = 0; i < 8; i++)
+        if (find_child(v, NFSK_ROOT_INO, flat[i])) nfsk_remove(v, NFSK_ROOT_INO, flat[i]);
+}
+
+static void test_rename_simple(ntfs_fskit_volume *v) {
+    printf("-- rename: simple (no existing dest) --\n");
+    int e = 0;
+    uint64_t a = nfsk_create(v, NFSK_ROOT_INO, "t_a.txt", NFSK_TYPE_FILE, &e);
+    CHECK(a != 0, "create t_a.txt (ino=%llu)", U(a));
+    int rc = nfsk_rename(v, NFSK_ROOT_INO, "t_a.txt", NFSK_ROOT_INO, "t_b.txt");
+    CHECK(rc == 0, "rename t_a.txt -> t_b.txt (rc=%d)", rc);
+    CHECK(find_child(v, NFSK_ROOT_INO, "t_a.txt") == 0, "old name gone");
+    uint64_t b = find_child(v, NFSK_ROOT_INO, "t_b.txt");
+    CHECK(b == a, "new name same inode (%llu == %llu)", U(b), U(a));
+    nfsk_remove(v, NFSK_ROOT_INO, "t_b.txt");
+}
+
+static void test_rename_overwrite(ntfs_fskit_volume *v) {
+    printf("-- rename: overwrite file-over-file (recoverable) --\n");
+    int e = 0;
+    uint64_t src = nfsk_create(v, NFSK_ROOT_INO, "t_src.txt", NFSK_TYPE_FILE, &e);
+    uint64_t dst = nfsk_create(v, NFSK_ROOT_INO, "t_dst.txt", NFSK_TYPE_FILE, &e);
+    const char *sc = "SRC-CONTENT";
+    if (src) nfsk_write(v, src, 0, sc, (int64_t)strlen(sc), &e);
+    if (dst) { const char *dc = "DST-OLD"; nfsk_write(v, dst, 0, dc, (int64_t)strlen(dc), &e); }
+    CHECK(src && dst && src != dst, "created t_src=%llu t_dst=%llu", U(src), U(dst));
+    int rc = nfsk_rename(v, NFSK_ROOT_INO, "t_src.txt", NFSK_ROOT_INO, "t_dst.txt");
+    CHECK(rc == 0, "rename t_src -> t_dst overwrite (rc=%d)", rc);
+    CHECK(find_child(v, NFSK_ROOT_INO, "t_src.txt") == 0, "t_src gone");
+    uint64_t now = find_child(v, NFSK_ROOT_INO, "t_dst.txt");
+    CHECK(now == src, "t_dst now has src inode (%llu == %llu)", U(now), U(src));
+    char buf[64]; memset(buf, 0, sizeof buf);
+    if (now) nfsk_read(v, now, 0, buf, sizeof(buf) - 1, &e);
+    CHECK(strcmp(buf, sc) == 0, "t_dst content is src's (<<<%s>>>)", buf);
+    nfsk_remove(v, NFSK_ROOT_INO, "t_dst.txt");
+}
+
+static void test_rename_crossdir(ntfs_fskit_volume *v) {
+    printf("-- rename: cross-directory + parentID --\n");
+    int e = 0;
+    uint64_t sub = nfsk_create(v, NFSK_ROOT_INO, "t_sub", NFSK_TYPE_DIR, &e);
+    uint64_t x = nfsk_create(v, NFSK_ROOT_INO, "t_x.txt", NFSK_TYPE_FILE, &e);
+    CHECK(sub && x, "created t_sub=%llu t_x.txt=%llu", U(sub), U(x));
+    int rc = nfsk_rename(v, NFSK_ROOT_INO, "t_x.txt", sub, "t_x.txt");
+    CHECK(rc == 0, "rename root/t_x.txt -> t_sub/t_x.txt (rc=%d)", rc);
+    CHECK(find_child(v, NFSK_ROOT_INO, "t_x.txt") == 0, "root no longer has t_x.txt");
+    uint64_t moved = find_child(v, sub, "t_x.txt");
+    CHECK(moved == x, "moved file same inode (%llu == %llu)", U(moved), U(x));
+    nfsk_attr_t a; int gr = (moved ? nfsk_getattr(v, moved, &a) : -1);
+    CHECK(gr == 0 && a.parent_ino == sub, "moved file parent_ino == t_sub (%llu want %llu)", U(a.parent_ino), U(sub));
+    if (moved) nfsk_remove(v, sub, "t_x.txt");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_sub");
+}
+
+static void test_rename_errors(ntfs_fskit_volume *v) {
+    printf("-- rename: type / non-empty / cycle errors --\n");
+    int e = 0;
+    uint64_t f = nfsk_create(v, NFSK_ROOT_INO, "t_f.txt", NFSK_TYPE_FILE, &e);
+    uint64_t d = nfsk_create(v, NFSK_ROOT_INO, "t_d", NFSK_TYPE_DIR, &e);
+    uint64_t child = (d ? nfsk_create(v, d, "c.txt", NFSK_TYPE_FILE, &e) : 0);
+    CHECK(f && d && child, "setup t_f.txt + non-empty t_d/");
+    int rc = nfsk_rename(v, NFSK_ROOT_INO, "t_f.txt", NFSK_ROOT_INO, "t_d");
+    CHECK(rc == -EISDIR, "file over dir -> EISDIR (rc=%d want %d)", rc, -EISDIR);
+    rc = nfsk_rename(v, NFSK_ROOT_INO, "t_d", NFSK_ROOT_INO, "t_f.txt");
+    CHECK(rc == -ENOTDIR, "dir over file -> ENOTDIR (rc=%d want %d)", rc, -ENOTDIR);
+    uint64_t d2 = nfsk_create(v, NFSK_ROOT_INO, "t_d2", NFSK_TYPE_DIR, &e);
+    rc = nfsk_rename(v, NFSK_ROOT_INO, "t_d2", NFSK_ROOT_INO, "t_d");
+    CHECK(rc == -ENOTEMPTY, "dir over non-empty dir -> ENOTEMPTY (rc=%d want %d)", rc, -ENOTEMPTY);
+    uint64_t sub = (d ? nfsk_create(v, d, "sub", NFSK_TYPE_DIR, &e) : 0);
+    rc = nfsk_rename(v, NFSK_ROOT_INO, "t_d", d, "loop");
+    CHECK(rc == -EINVAL, "move dir into itself -> EINVAL (rc=%d want %d)", rc, -EINVAL);
+    rc = (sub ? nfsk_rename(v, NFSK_ROOT_INO, "t_d", sub, "loop") : -EINVAL);
+    CHECK(rc == -EINVAL, "move dir into own subtree -> EINVAL (rc=%d want %d)", rc, -EINVAL);
+    if (sub) nfsk_remove(v, d, "sub");
+    nfsk_remove(v, d, "c.txt");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_d");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_d2");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_f.txt");
+}
+
+static void test_metadata_protection(ntfs_fskit_volume *v) {
+    printf("-- metadata: reserved records hidden/protected --\n");
+    int e = 0;
+    const char *meta[] = { "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$Bitmap", "$Boot" };
+    for (int i = 0; i < 6; i++) {
+        e = 0;
+        uint64_t m = nfsk_lookup(v, NFSK_ROOT_INO, meta[i], &e);
+        CHECK(m == 0, "lookup %s blocked (ino=%llu err=%d)", meta[i], U(m), e);
+    }
+    nfsk_attr_t a;
+    CHECK(nfsk_getattr(v, 3, &a) < 0, "getattr(reserved ino 3 / $Volume) fails");
+    CHECK(nfsk_getattr(v, 0, &a) < 0, "getattr(reserved ino 0 / $MFT) fails");
+    CHECK(nfsk_remove(v, NFSK_ROOT_INO, "$Volume") != 0, "remove $Volume blocked");
+}
+
+static void test_parent_id(ntfs_fskit_volume *v) {
+    printf("-- parentID: parent_ino reflects directory --\n");
+    int e = 0;
+    uint64_t d = nfsk_create(v, NFSK_ROOT_INO, "t_pdir", NFSK_TYPE_DIR, &e);
+    uint64_t f = (d ? nfsk_create(v, d, "child.txt", NFSK_TYPE_FILE, &e) : 0);
+    nfsk_attr_t a;
+    int rc = (f ? nfsk_getattr(v, f, &a) : -1);
+    CHECK(rc == 0 && a.parent_ino == d, "child parent_ino == t_pdir (%llu want %llu)", U(a.parent_ino), U(d));
+    uint64_t rf = nfsk_create(v, NFSK_ROOT_INO, "t_rootfile.txt", NFSK_TYPE_FILE, &e);
+    rc = (rf ? nfsk_getattr(v, rf, &a) : -1);
+    CHECK(rc == 0 && a.parent_ino == NFSK_ROOT_INO, "root file parent_ino == root (%llu want %llu)", U(a.parent_ino), U(NFSK_ROOT_INO));
+    if (f) nfsk_remove(v, d, "child.txt");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_pdir");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_rootfile.txt");
+}
+
 int main(int argc, char **argv) {
-    const char *path = argc > 1 ? argv[1] : "test.ntfs";
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <writable-ntfs-image>\n"
+                        "  The test MUTATES the image — pass a throwaway copy, not the repo's test.ntfs.\n",
+                argv[0]);
+        return 1;
+    }
+    const char *path = argv[1];
 
     int fd = open(path, O_RDWR);
     if (fd < 0) { perror("open"); return 1; }
@@ -108,22 +247,41 @@ int main(int argc, char **argv) {
     }
 
     printf("== CREATE new file 'created_by_bridge.txt' ==\n");
+    if (find_child(v, NFSK_ROOT_INO, "created_by_bridge.txt"))   /* idempotent across runs */
+        nfsk_remove(v, NFSK_ROOT_INO, "created_by_bridge.txt");
     uint64_t nino = nfsk_create(v, NFSK_ROOT_INO, "created_by_bridge.txt", NFSK_TYPE_FILE, &err);
+    CHECK(nino != 0, "create created_by_bridge.txt (ino=%llu err=%d)", U(nino), err);
     if (nino) {
         const char *msg = "This file was created through the NTFS-3G FSKit bridge.\n";
         int64_t n = nfsk_write(v, nino, 0, msg, (int64_t)strlen(msg), &err);
-        printf("  created ino=%llu, wrote %lld bytes\n", (unsigned long long)nino, (long long)n);
-    } else printf("  create failed err=%d (%s)\n", err, strerror(err));
+        printf("  wrote %lld bytes\n", (long long)n);
+    }
 
     printf("== CREATE directory 'newdir' + file inside ==\n");
+    {
+        uint64_t old = find_child(v, NFSK_ROOT_INO, "newdir");   /* idempotent across runs */
+        if (old) {
+            if (find_child(v, old, "inside.txt")) nfsk_remove(v, old, "inside.txt");
+            nfsk_remove(v, NFSK_ROOT_INO, "newdir");
+        }
+    }
     uint64_t dino = nfsk_create(v, NFSK_ROOT_INO, "newdir", NFSK_TYPE_DIR, &err);
+    CHECK(dino != 0, "mkdir newdir (ino=%llu err=%d)", U(dino), err);
     if (dino) {
         uint64_t f2 = nfsk_create(v, dino, "inside.txt", NFSK_TYPE_FILE, &err);
+        CHECK(f2 != 0, "create newdir/inside.txt (ino=%llu err=%d)", U(f2), err);
         const char *m = "nested file\n";
         if (f2) nfsk_write(v, f2, 0, m, (int64_t)strlen(m), &err);
-        printf("  newdir ino=%llu, inside.txt ino=%llu\n",
-               (unsigned long long)dino, (unsigned long long)f2);
-    } else printf("  mkdir failed err=%d\n", err);
+    }
+
+    printf("\n== EXTENDED CHECKS (rename / metadata / parentID) ==\n");
+    pre_clean(v);
+    test_rename_simple(v);
+    test_rename_overwrite(v);
+    test_rename_crossdir(v);
+    test_rename_errors(v);
+    test_metadata_protection(v);
+    test_parent_id(v);
 
     nfsk_sync(v);
     printf("== UNMOUNT ==\n");
@@ -155,5 +313,6 @@ int main(int argc, char **argv) {
     nfsk_umount(v);
     close(fd);
     printf("\n== TEST COMPLETE ==\n");
-    return 0;
+    printf("== EXTENDED CHECKS: %d passed, %d failed ==\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
 }
