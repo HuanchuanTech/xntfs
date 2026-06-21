@@ -11,7 +11,9 @@ ntfs-3g 自带的 `src/ntfs-3g.c` 把 FUSE 映射到 libntfs 如出一辙。
 
 NTFS 磁盘**由系统自动挂载到 `/Volumes`**(DiskArbitration 探测扩展注册的 `FSMediaTypes`
 ——无需任何应用进程,与内置的 exFAT/MSDOS 模块完全一样)。`xntfs` 应用是一个**控制面板**:
-列出 NTFS 磁盘,并提供手动挂载/卸载、挂载到指定文件夹、只读重新挂载,以及磁盘映像挂载。
+列出 NTFS 磁盘与已附加的映像,提供手动挂载/卸载(到 `/Volumes`)、只读重新挂载、附加/分离
+磁盘映像,以及一个扩展状态诊断页。沙盒无法运行 `hdiutil`/`mount`,因此这些在应用无法直接
+执行时会以**可复制的终端命令**形式给出。
 
 ```
 xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
@@ -48,14 +50,17 @@ NTFS 引擎本身已独立验证正确(挂载 / 枚举 / 读 / 写 / 创建,并�
    会用我们的模块把 NTFS 磁盘以读写方式自动挂载到 `/Volumes`——全程无需应用进程(与内置
    exFAT/MSDOS 模块同一模型)。`FSProbeOrder` 决定相对于老式只读 NTFS 驱动的优先级。
    应用只负责为 UI *检测/列出*磁盘。
-3. **挂载位置** —— 磁盘默认挂载到 `/Volumes/<名称>`;路径由系统选择并对重名去重,在沙盒下
-   **无需**文件夹授权。要挂到别处,对某个磁盘用 *Mount to Folder…* 选择一个文件夹——在打开
-   面板里选中它就是沙盒访问授权。
+3. **挂载位置** —— 磁盘挂载到 `/Volumes/<名称>`,路径由系统选择并对重名去重。沙盒化的 FSKit
+   卷**无法挂载到自定义文件夹**(扩展只能访问 `/Volumes` 及其自身沙盒临时路径——见*沙盒与
+   挂载*),所以 `/Volumes` 是唯一目标。
 4. **同时挂载多个磁盘** —— 设备按 BSD 名跟踪,各自独立挂载。
-5. **手动挂载/卸载到任意有权限的文件夹** —— 每个设备有 *Mount*(→ `/Volumes`)、
-   *Mount to Folder…*(文件夹选择器 → 安全作用域 URL)和 *Eject*。
-6. **挂载原始 NTFS 映像文件** —— *Mount Image…* 附加映像(`hdiutil attach -nomount`)
-   并把生成的设备挂载到 `/Volumes`。
+5. **手动挂载/卸载** —— 每个设备有 *Mount…*(挂到 `/Volumes`,带只读开关)和 *Eject*。
+   macOS 27 上应用通过 `FSClient` 在应用内挂载;macOS 26 上沙盒应用无权挂载第三方 FSKit 卷,
+   于是改为给出可复制的 `diskutil mount [readOnly] /dev/diskXsY` 命令。
+6. **磁盘映像** —— *Add Disk Image…* 选择一个原始 NTFS 映像(`.img`/`.dd`/…),并给出可复制的
+   `hdiutil attach [-readonly] <映像>` 命令(默认只读);附加后,该设备上的 NTFS 卷会像普通
+   磁盘一样**自动挂载**。*Detach Image…* 给出 `hdiutil detach`。应用自身无法运行 `hdiutil`
+   (沙盒拦截 `Process`),所以用可复制命令。
 
 ## 构建
 
@@ -85,21 +90,25 @@ macOS(AMFI)只有在该权限被描述文件授权后才会加载扩展。在**�
 下,只有当该团队的 App ID 在 Apple 开发者门户里开通了 **FSKit File System Module** 能力时
 才行。开通后,在 **系统设置 → 通用 → 登录项与扩展 → 文件系统扩展** 中启用该模块。
 
-## 沙盒与挂载(已验证)
+## 沙盒与挂载
 
-在 macOS 26 上,用一个沙盒化(临时 `app-sandbox`)构建驱动同一条 DiskArbitration 挂载路径
-去挂载 FSKit 卷,做过测试:
+在 macOS 26.5 的沙盒构建上验证过,实际情况比最初设想的更窄:
 
-- 沙盒应用**可以**发起 DiskArbitration 挂载。挂到 `/Volumes/<名称>` **无需**文件夹授权
-  ——`diskarbitrationd`(root)会创建它。✅
-- 挂到**自定义文件夹**在应用能访问该文件夹时可行——即用户通过打开面板(powerbox)选中的
-  文件夹,这会授予安全作用域访问。✅
-- 唯一观察到的失败,是在应用**没有**访问权的位置创建文件夹——这是*文件访问*限制,不是
-  挂载限制。文件夹选择器就是授权。
+- **自动挂载是主路径。** 系统通过扩展的 `FSMediaTypes` 把 NTFS 磁盘以读写方式自动挂载到
+  `/Volumes`——无需应用进程、无需挂载权限。完全可用。
+- **macOS 26 上沙盒应用无法手动挂载第三方 FSKit 卷。** DiskArbitration 挂载会返回
+  `kDAReturnNotPrivileged`。`com.apple.developer.fskit.mount` 权限 + `FSClient.mountSingleVolume`
+  **只在 macOS 27** 才授权手动挂载,而且即便在 27 上目标也**只能是 `/Volumes`**。
+- **`mount -F -t xntfs …` 会失败**(“Probing resource: Permission denied”)。可用的命令行路径是
+  **`diskutil mount`**,它经由 `diskarbitrationd`——和自动挂载同一条路。
+- **无法挂载到自定义文件夹。** 扩展声明了 `FSRequiresSecurityScopedPathURLResources`,其沙盒
+  只能访问 `/Volumes`(由 `diskarbitrationd` 拥有)和自身临时路径(如 `/tmp`)。任意文件夹需要
+  一个安全作用域授权,而终端命令给不了、应用内路径也给不了(26 上无权、27 上只能 `/Volumes`)。
+- **应用从不 shell 出去。** 沙盒拦截 `Process`,所以 `hdiutil`(附加/分离)和 27 之前的
+  `diskutil mount` 都以**可复制的终端命令**交给用户运行。
 
-所以物理磁盘挂载(主功能)在 App Store 沙盒下是可行的,挂到 `/Volumes` 或用户选中的文件夹
-都行。唯一真正受沙盒限制的是**附加原始映像文件**:它要 shell 出去调 `hdiutil`(`Process`),
-会被沙盒拦截——这个功能要上 App Store 需要换一条附加路径或借助一个辅助工具。
+所以:自动挂载到处可用;手动挂载在 macOS 27 上是应用内(→ `/Volumes`)、在 macOS 26 上是
+可复制的 `diskutil mount` 命令;映像附加/分离始终是可复制的 `hdiutil` 命令。
 
 > 这是*技术*能力结论;App Review 是另一道独立的政策关卡。
 
@@ -108,11 +117,15 @@ macOS(AMFI)只有在该权限被描述文件授权后才会加载扩展。在**�
 ```
 xntfs/                     应用 target(SwiftUI)
   xntfsApp.swift           @main App + Settings 场景
-  ContentView.swift        设备列表、详情、手动 + 映像挂载
+  ContentView.swift        设备/映像列表 + 详情,挂载/附加/分离操作
+  MountSheet.swift         手动挂载(→ /Volumes,只读开关)
+  CommandSheet.swift       附加/分离 sheet(AttachImageSheet:默认只读)
+  CopyableCommand.swift    共享的「复制此终端命令」控件
+  DiagnosticsView.swift    扩展状态诊断页
   SettingsView.swift       默认只读偏好
   Model/NTFSDevice.swift
   Services/                AppModel、AppSettings、DiskArbitrationMonitor、MountService、
-                           SecurityScope
+                           ExtensionStatus
   Localizable.xcstrings    en + zh-Hans
   Assets.xcassets/AppIcon  生成的图标集
 ntfs3g/                    FSKit 扩展 target

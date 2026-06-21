@@ -36,15 +36,22 @@ struct NTFSDevice: Identifiable, Equatable {
     /// mount fs-type matches the extension's FSShortName), regardless of whether
     /// this app or the system performed the mount.
     var mountedByXntfs: Bool = false
-    /// For disk-image devices: the source image file URL (so we can detach later).
-    var imageSourceURL: URL? = nil
+    /// True when the mounted volume is read-only (statfs MNT_RDONLY).
+    var readOnly: Bool = false
+    /// Whether the underlying media is writable (DAMediaWritable). When false the volume
+    /// can only be mounted read-only — e.g. an image attached with `hdiutil attach -readonly`.
+    var mediaWritable: Bool = true
+    /// For image-backed devices (kind == .diskImage): the whole-disk node (e.g. "disk6"),
+    /// used to detach the image via `hdiutil detach`.
+    var wholeDiskBSD: String = ""
 
     var displayName: String { volumeName.isEmpty ? id : volumeName }
 
     static func == (lhs: NTFSDevice, rhs: NTFSDevice) -> Bool {
         lhs.id == rhs.id && lhs.volumeName == rhs.volumeName &&
         lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes &&
-        lhs.mountedByXntfs == rhs.mountedByXntfs
+        lhs.mountedByXntfs == rhs.mountedByXntfs && lhs.readOnly == rhs.readOnly &&
+        lhs.mediaWritable == rhs.mediaWritable
     }
 }
 

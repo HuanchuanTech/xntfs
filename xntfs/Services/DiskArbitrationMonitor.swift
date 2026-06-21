@@ -72,6 +72,10 @@ final class DiskArbitrationMonitor {
     /// FSShortName (ntfs3g/Info.plist). Used to recognize volumes we're serving.
     static let moduleFSType = "xntfs"
 
+    /// DADeviceModel value reported by disk-image-backed devices (verified via the DA
+    /// description: Apple's AppleDiskImagesController reports model "Disk Image").
+    static let imageDeviceModel = "Disk Image"
+
     private func makeDevice(_ disk: DADisk, bsd: String) -> NTFSDevice? {
         guard let d = description(disk) else { return nil }
         let leaf = d[kDADiskDescriptionMediaLeafKey as String] as? Bool ?? false
@@ -82,7 +86,8 @@ final class DiskArbitrationMonitor {
         // Authoritative: is the volume actually mounted through our module? The media
         // content hint can't be trusted for mounted volumes — DiskArbitration has been
         // seen to mislabel NTFS as MS-DOS/exFAT — so check the real mount fs-type.
-        let byModule = mountURL.flatMap { Self.mountFSType($0) } == Self.moduleFSType
+        let info = mountURL.flatMap { Self.mountInfo($0) }
+        let byModule = info?.fsType == Self.moduleFSType
         let isNTFSMedia = content == "Windows_NTFS" || kind == "ntfs" || kind == Self.moduleFSType
         guard byModule || (isNTFSMedia && leaf) else { return nil }
 
@@ -92,27 +97,47 @@ final class DiskArbitrationMonitor {
         let removable = (d[kDADiskDescriptionMediaRemovableKey as String] as? Bool) ?? false
         let ejectable = (d[kDADiskDescriptionMediaEjectableKey as String] as? Bool) ?? false
 
+        // Image-backed devices report DADeviceModel == "Disk Image"; their NTFS volumes go
+        // in the "Disk Images" section and detach via the whole-disk node (disk<unit>).
+        let isImage = (d[kDADiskDescriptionDeviceModelKey as String] as? String) == Self.imageDeviceModel
+        let deviceKind: DeviceKind = isImage ? .diskImage : ((removable || ejectable) ? .removable : .fixed)
+
         var dev = NTFSDevice(
             id: bsd,
             volumeName: name,
             sizeBytes: size,
-            kind: (removable || ejectable) ? .removable : .fixed,
+            kind: deviceKind,
             contentHint: content,
             isRemovable: removable || ejectable,
             devicePath: "/dev/\(bsd)")
         dev.mountedByXntfs = byModule
+        dev.readOnly = info?.readOnly ?? false
+        dev.mediaWritable = (d[kDADiskDescriptionMediaWritableKey as String] as? Bool) ?? true
+        // The whole-disk node for detach — straight from DiskArbitration, not inferred from
+        // the BSD unit number (DADiskCopyWholeDisk returns the parent disk of a partition,
+        // or the disk itself if it is already whole).
+        if isImage {
+            if let whole = DADiskCopyWholeDisk(disk), let c = DADiskGetBSDName(whole) {
+                dev.wholeDiskBSD = String(cString: c)
+            } else {
+                // Fallback so detach always has a valid node: strip the partition suffix
+                // (disk6s1 -> disk6); a whole-disk name is left unchanged.
+                dev.wholeDiskBSD = bsd.replacingOccurrences(of: #"s\d+$"#, with: "", options: .regularExpression)
+            }
+        }
         if let url = mountURL { dev.state = .mounted(url) }
         return dev
     }
 
-    /// `f_fstypename` of the filesystem mounted at `url`, or nil if not mounted.
-    private static func mountFSType(_ url: URL) -> String? {
+    /// `(f_fstypename, read-only)` of the filesystem mounted at `url`, or nil if not mounted.
+    private static func mountInfo(_ url: URL) -> (fsType: String, readOnly: Bool)? {
         guard url.isFileURL else { return nil }
         var s = statfs()
         guard statfs(url.path, &s) == 0 else { return nil }
-        return withUnsafeBytes(of: &s.f_fstypename) { raw in
+        let fsType = withUnsafeBytes(of: &s.f_fstypename) { raw in
             String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
         }
+        return (fsType, (s.f_flags & UInt32(MNT_RDONLY)) != 0)
     }
 }
 

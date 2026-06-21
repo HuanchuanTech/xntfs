@@ -1,6 +1,8 @@
 //
 //  ContentView.swift
-//  Device list + per-device mount/unmount actions, plus raw-image mounting.
+//  Disk Utility-style tree (Devices + Disk Images, both monitor-detected) with a detail
+//  pane. Attaching/detaching images and mounting (on <27 or to a folder) are copyable
+//  Terminal commands, since a sandboxed app can't run hdiutil/mount itself.
 //
 
 import SwiftUI
@@ -11,13 +13,15 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var extStatus = ExtensionStatus()
     @State private var selection: NTFSDevice.ID?
-    @State private var showImageSheet = false
+    @State private var showAddImage = false
+    @State private var showDiagnostics = false
+    @State private var pendingAttach: PendingAttach?
     @State private var showError = false
 
     var body: some View {
         VStack(spacing: 0) {
             if extStatus.state == .disabled || extStatus.state == .notInstalled {
-                ExtensionBanner(status: extStatus)
+                ExtensionBanner(status: extStatus, onDiagnostics: { showDiagnostics = true })
             }
             mainContent
         }
@@ -27,22 +31,38 @@ struct ContentView: View {
         }
     }
 
+    private var physicalDevices: [NTFSDevice] { model.devices.filter { $0.kind != .diskImage } }
+    private var imageDevices: [NTFSDevice] { model.devices.filter { $0.kind == .diskImage } }
+
+    private var selectedDevice: NTFSDevice? {
+        guard let id = selection else { return nil }
+        return model.devices.first { $0.id == id }
+    }
+
     private var mainContent: some View {
         NavigationSplitView {
-            List(model.devices, selection: $selection) { device in
-                DeviceRow(device: device, byXntfs: device.mountedByXntfs)
-                    .tag(device.id)
+            List(selection: $selection) {
+                Section("Devices") {
+                    ForEach(physicalDevices) { device in
+                        DeviceRow(device: device, byXntfs: device.mountedByXntfs, isSelected: selection == device.id).tag(device.id)
+                    }
+                }
+                Section("Disk Images") {
+                    ForEach(imageDevices) { device in
+                        DeviceRow(device: device, byXntfs: device.mountedByXntfs, isSelected: selection == device.id).tag(device.id)
+                    }
+                }
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 280)
             .overlay {
                 if model.devices.isEmpty {
                     ContentUnavailableView("No NTFS volumes",
                                            systemImage: "externaldrive.badge.questionmark",
-                                           description: Text("Plug in an NTFS drive, or mount a disk image."))
+                                           description: Text("Plug in an NTFS drive, or add a disk image."))
                 }
             }
         } detail: {
-            if let id = selection, let device = model.devices.first(where: { $0.id == id }) {
+            if let device = selectedDevice {
                 DeviceDetailView(device: device)
             } else {
                 ContentUnavailableView("Select a volume", systemImage: "externaldrive")
@@ -50,15 +70,24 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    showImageSheet = true
-                } label: {
-                    Label("Mount Image…", systemImage: "opticaldiscdrive")
+                Button { showAddImage = true } label: {
+                    Label("Add Disk Image…", systemImage: "plus")
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button { showDiagnostics = true } label: {
+                    Label("Diagnostics…", systemImage: "stethoscope")
                 }
             }
         }
-        .sheet(isPresented: $showImageSheet) {
-            MountImageView().environment(model)
+        .fileImporter(isPresented: $showAddImage, allowedContentTypes: Self.imageTypes) { result in
+            if case .success(let url) = result { pendingAttach = PendingAttach(url: url) }
+        }
+        .sheet(isPresented: $showDiagnostics) {
+            DiagnosticsView(status: extStatus)
+        }
+        .sheet(item: $pendingAttach) { p in
+            AttachImageSheet(url: p.url)
         }
         .onChange(of: model.lastError) { _, newValue in showError = (newValue != nil) }
         .alert("Operation failed", isPresented: $showError) {
@@ -67,10 +96,19 @@ struct ContentView: View {
             Text(model.lastError ?? "")
         }
     }
+
+    private static var imageTypes: [UTType] {
+        var types: [UTType] = [.diskImage, .data]
+        for ext in ["ntfs", "img", "dd", "raw", "bin"] {
+            if let u = UTType(filenameExtension: ext) { types.append(u) }
+        }
+        return types
+    }
 }
 
 struct ExtensionBanner: View {
     let status: ExtensionStatus
+    var onDiagnostics: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -81,8 +119,11 @@ struct ExtensionBanner: View {
                 Text(title).font(.callout).fontWeight(.semibold)
                 Text(instruction)
                     .font(.caption).foregroundStyle(.secondary)
+                Text("Can't enable it? Open Diagnostics to troubleshoot.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
+            Button("Diagnostics…") { onDiagnostics() }
             Button("Open Settings…") { ExtensionStatus.openSettings() }
                 .buttonStyle(.borderedProminent)
             Button {
@@ -116,12 +157,13 @@ struct ExtensionBanner: View {
 struct DeviceRow: View {
     let device: NTFSDevice
     var byXntfs: Bool = false
+    var isSelected: Bool = false
 
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.title2)
-                .foregroundStyle(device.state.isMounted ? Color.accentColor : .secondary)
+                .foregroundStyle(iconColor)
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.displayName).font(.body)
                 Text("\(device.sizeBytes.humanSize) · \(Text(statusText))")
@@ -132,12 +174,23 @@ struct DeviceRow: View {
                 Text(byXntfs ? "xntfs" : "System")
                     .font(.caption2).fontWeight(.semibold)
                     .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background((byXntfs ? Color.accentColor : Color.secondary).opacity(0.18))
-                    .foregroundStyle(byXntfs ? Color.accentColor : Color.secondary)
+                    .background(badgeColor.opacity(0.18))
+                    .foregroundStyle(badgeColor)
                     .clipShape(Capsule())
             }
         }
         .padding(.vertical, 2)
+    }
+
+    // When the row is selected the List paints an accent background, so accent-colored
+    // content (the icon, the badge) blends in and vanishes — use white instead.
+    private var iconColor: Color {
+        if isSelected { return .white }
+        return device.state.isMounted ? .accentColor : .secondary
+    }
+    private var badgeColor: Color {
+        if isSelected { return .white }
+        return byXntfs ? .accentColor : .secondary
     }
 
     private var icon: String {
@@ -152,7 +205,7 @@ struct DeviceRow: View {
         switch device.state {
         case .unmounted: return "Not mounted"
         case .mounting: return "Mounting…"
-        case .mounted: return "Mounted"
+        case .mounted: return device.readOnly ? "Mounted · read-only" : "Mounted"
         case .unmounting: return "Ejecting…"
         case .failed: return "Failed"
         }
@@ -162,7 +215,8 @@ struct DeviceRow: View {
 struct DeviceDetailView: View {
     @Environment(AppModel.self) private var model
     let device: NTFSDevice
-    @State private var showFolderPicker = false
+    @State private var showMountSheet = false
+    @State private var showDetach = false
 
     var body: some View {
         Form {
@@ -173,6 +227,7 @@ struct DeviceDetailView: View {
                 LabeledContent("Format", value: "NTFS")
                 if case .mounted(let url) = device.state {
                     LabeledContent("Mounted at", value: url.path)
+                    LabeledContent("Access", value: device.readOnly ? "Read-only" : "Read/write")
                 }
             }
 
@@ -189,12 +244,14 @@ struct DeviceDetailView: View {
                     }
                 } else {
                     Button {
-                        Task { await model.mount(device, to: nil, readOnly: model.settings.defaultReadOnly) }
-                    } label: { Label("Mount", systemImage: "play.fill") }
-
-                    Button {
-                        showFolderPicker = true
-                    } label: { Label("Mount to Folder…", systemImage: "folder.badge.plus") }
+                        showMountSheet = true
+                    } label: { Label("Mount…", systemImage: "play.fill") }
+                }
+                if device.kind == .diskImage {
+                    Button(role: .destructive) {
+                        showDetach = true
+                    } label: { Label("Detach Image…", systemImage: "eject.circle") }
+                    .disabled(device.wholeDiskBSD.isEmpty)
                 }
             }
 
@@ -204,16 +261,12 @@ struct DeviceDetailView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(device.displayName)
-        .fileImporter(isPresented: $showFolderPicker,
-                      allowedContentTypes: [.folder],
-                      allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let folder = urls.first {
-                Task {
-                    await SecurityScope.withAccessAsync(folder) {
-                        await model.mount(device, to: folder, readOnly: model.settings.defaultReadOnly)
-                    }
-                }
-            }
+        .sheet(isPresented: $showMountSheet) {
+            MountSheet(device: device).environment(model)
+        }
+        .sheet(isPresented: $showDetach) {
+            CommandSheet(title: "Detach Disk Image",
+                         command: MountService.detachCommand(wholeDiskBSD: device.wholeDiskBSD))
         }
     }
 }

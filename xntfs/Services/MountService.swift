@@ -1,33 +1,40 @@
 //
 //  MountService.swift
-//  Mounts / unmounts NTFS volumes through DiskArbitration, and attaches raw
-//  NTFS disk images. Mount-point selection (with duplicate handling) lives here.
+//  Mounts / unmounts NTFS device volumes via DiskArbitration, and builds the copyable
+//  Terminal commands the sandbox can't run itself: `mount` (on macOS < 27 or a custom
+//  folder) and `hdiutil attach` / `detach` for disk images.
 //
 
 import Foundation
 import DiskArbitration
-import FSKit
 
 enum MountError: LocalizedError {
     case daUnavailable
     case diskNotFound(String)
-    case dissented(String)
+    case dissented(status: DAReturn, message: String?)
     case cannotCreateMountPoint(String)
 
     var errorDescription: String? {
         switch self {
         case .daUnavailable: return "DiskArbitration is unavailable."
         case .diskNotFound(let b): return "Device \(b) was not found."
-        case .dissented(let m): return "Mount was refused: \(m)"
+        case .dissented(let status, let message): return "Mount was refused: \(message ?? "status \(status)")"
         case .cannotCreateMountPoint(let p): return "Couldn't create the mount folder at \(p)."
         }
     }
+
+    /// kDAReturnNotPrivileged — the sandbox isn't allowed to perform this mount, so the
+    /// only path is a user-run Terminal command (every other failure is a real error).
+    var isNotPrivileged: Bool {
+        if case .dissented(let status, _) = self { return status == kDAReturnNotPrivileged }
+        return false
+    }
 }
 
-/// Result of an image-file mount attempt.
-enum ImageMountOutcome {
+/// Result of a mount attempt.
+enum MountOutcome {
     case mounted(URL)
-    case needsManualCommand(String)
+    case needsCommand(String)
     case failed(String)
 }
 
@@ -35,25 +42,35 @@ final class MountService {
     private let monitor: DiskArbitrationMonitor
     init(monitor: DiskArbitrationMonitor) { self.monitor = monitor }
 
-    // MARK: mount / unmount
+    // MARK: mount
+    //
+    // FSKit Mounter only authorizes the macOS 27 FSClient API (into /Volumes); a sandboxed
+    // app's DiskArbitration mount of a third-party FSKit volume is refused as not-privileged.
+    // So the in-app path is best-effort on macOS 27; otherwise we hand back a `mount` command.
 
-    /// Mounts `device`. Pass `mountPoint == nil` to use the standard location
-    /// (`/Volumes/<name>`, chosen by the system, which also de-duplicates names);
-    /// pass a user-chosen folder URL to mount there. Returns the resulting path.
+    func unifiedMount(_ device: NTFSDevice, to target: URL?, readOnly: Bool) async -> MountOutcome {
+        let command = Self.mountCommand(for: device, target: target, readOnly: readOnly)
+        guard #available(macOS 27.0, *) else { return .needsCommand(command) }
+        do { return .mounted(try await mount(device, at: target, readOnly: readOnly)) }
+        catch {
+            if let me = error as? MountError, me.isNotPrivileged { return .needsCommand(command) }
+            return .failed(error.localizedDescription)
+        }
+    }
+
     func mount(_ device: NTFSDevice, at mountPoint: URL?, readOnly: Bool) async throws -> URL {
         let session = monitor.sessionRef()
         guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device.id) else {
             throw MountError.diskNotFound(device.id)
         }
-
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let args = readOnly ? ["rdonly"] : []
             withMountArguments(args) { argv in
                 let box = DACallbackBox { dissenter in
-                    if let dissenter, let msg = DADissenterGetStatusString(dissenter) {
-                        cont.resume(throwing: MountError.dissented(msg as String))
-                    } else if let dissenter {
-                        cont.resume(throwing: MountError.dissented("status \(DADissenterGetStatus(dissenter))"))
+                    if let dissenter {
+                        let status = DADissenterGetStatus(dissenter)
+                        let msg = DADissenterGetStatusString(dissenter).map { $0 as String }
+                        cont.resume(throwing: MountError.dissented(status: status, message: msg))
                     } else {
                         cont.resume(returning: ())
                     }
@@ -63,7 +80,6 @@ final class MountService {
                                          Unmanaged.passRetained(box).toOpaque(), argv)
             }
         }
-
         if let mountPoint { return mountPoint }
         if let desc = DADiskCopyDescription(disk) as? [String: Any],
            let url = desc[kDADiskDescriptionVolumePathKey as String] as? URL {
@@ -79,7 +95,7 @@ final class MountService {
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let box = DACallbackBox { dissenter in
-                if let dissenter { cont.resume(throwing: MountError.dissented("status \(DADissenterGetStatus(dissenter))")) }
+                if let dissenter { cont.resume(throwing: MountError.dissented(status: DADissenterGetStatus(dissenter), message: nil)) }
                 else { cont.resume(returning: ()) }
             }
             let opts: DADiskUnmountOptions = force ? DADiskUnmountOptions(kDADiskUnmountOptionForce) : DADiskUnmountOptions(kDADiskUnmountOptionDefault)
@@ -88,50 +104,36 @@ final class MountService {
         }
     }
 
-    // MARK: image-file mounting
-    //
-    // A raw NTFS image is an FSPathURLResource (the extension sets FSSupportsPathURLs).
-    // On macOS 27+ the app mounts it directly via FSClient.mountSingleVolume (needs the
-    // `com.apple.developer.fskit.mount` entitlement). That API mounts ONLY into /Volumes
-    // -- it has no custom-path parameter -- so a user-chosen target folder is offered via a
-    // copyable `mount` command instead (a sandboxed app can't run mount itself).
+    // MARK: copyable commands
 
-    static let moduleBundleID = "com.huanchuan.xntfs.ntfs3g"
+    /// `diskutil mount` command for a device volume — routed through diskarbitrationd, the
+    /// same path the system uses to auto-mount xntfs. `mount -F -t xntfs` instead does a
+    /// low-level FSKit probe the extension's sandbox denies ("Probing resource: Permission
+    /// denied"). A custom mount point still only works where the extension's sandbox allows
+    /// it (e.g. /tmp); /Volumes works because diskarbitrationd owns it.
+    static func mountCommand(for device: NTFSDevice, target: URL?, readOnly: Bool) -> String {
+        let ro = readOnly ? "readOnly " : ""
+        if let target {
+            return "diskutil mount \(ro)-mountPoint \(shellQuote(target.path)) \(shellQuote(device.devicePath))"
+        }
+        return "diskutil mount \(ro)\(shellQuote(device.devicePath))"
+    }
 
-    /// A command the user can paste into Terminal to mount `source` at `target`.
-    static func manualMountCommand(source: URL, target: URL, readOnly: Bool) -> String {
-        let ro = readOnly ? " -o rdonly" : ""
-        return "sudo mount -F -t xntfs\(ro) \(shellQuote(source.path)) \(shellQuote(target.path))"
+    /// Attach a disk image as a device — xntfs then auto-mounts any NTFS volume on it.
+    /// Read-only by default (an attached image mounts with the device's writability);
+    /// pass readOnly: false to attach writable.
+    static func attachCommand(_ imagePath: String, readOnly: Bool) -> String {
+        let ro = readOnly ? " -readonly" : ""
+        return "hdiutil attach\(ro) \(shellQuote(imagePath))"
+    }
+
+    /// Detach an attached image by its whole-disk node (e.g. "disk6").
+    static func detachCommand(wholeDiskBSD: String) -> String {
+        "hdiutil detach /dev/\(wholeDiskBSD)"
     }
 
     private static func shellQuote(_ path: String) -> String {
         "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    /// Mount an NTFS image file.
-    /// - A non-nil `target` (custom folder) returns a copyable Terminal command -- the
-    ///   sandbox-safe FSKit API only mounts into /Volumes.
-    /// - With `target == nil`, macOS 27+ mounts into /Volumes directly via FSClient; earlier
-    ///   systems return a command (no sandbox-safe mount API before macOS 27).
-    func mountImage(source: URL, target: URL?, readOnly: Bool) async -> ImageMountOutcome {
-        if target == nil, #available(macOS 27.0, *) {
-            return await mountImageToVolumes(source: source, readOnly: readOnly)
-        }
-        let dst = target ?? URL(fileURLWithPath: "/Volumes/\(source.deletingPathExtension().lastPathComponent)")
-        return .needsManualCommand(Self.manualMountCommand(source: source, target: dst, readOnly: readOnly))
-    }
-
-    @available(macOS 27.0, *)
-    private func mountImageToVolumes(source: URL, readOnly: Bool) async -> ImageMountOutcome {
-        let resource = FSPathURLResource(url: source, writable: !readOnly)
-        let options = readOnly ? ["rdonly"] : []
-        do {
-            let mountPath = try await FSClient.shared.mountSingleVolume(
-                resource: resource, bundleID: Self.moduleBundleID, options: options)
-            return .mounted(mountPath)
-        } catch {
-            return .failed(error.localizedDescription)
-        }
     }
 }
 

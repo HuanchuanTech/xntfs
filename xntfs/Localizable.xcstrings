@@ -1,6 +1,16 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该卷为只读(例如以只读方式 attach 的镜像),只能以只读方式挂载。"
+          }
+        }
+      }
+    },
     "%@ · %@" : {
       "localizations" : {
         "en" : {
@@ -11,12 +21,82 @@
         }
       }
     },
+    "A sandboxed app can't mount this here, so paste this into Terminal:" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "沙盒应用无法在此处挂载,请把下面命令粘贴到「终端」运行:"
+          }
+        }
+      }
+    },
+    "A single copy under /Applications." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "/Applications 下只有一份。"
+          }
+        }
+      }
+    },
+    "Access" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "访问权限"
+          }
+        }
+      }
+    },
+    "Add Disk Image…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "添加磁盘映像…"
+          }
+        }
+      }
+    },
+    "Attach Disk Image" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "附加磁盘映像"
+          }
+        }
+      }
+    },
+    "Attach writable" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "以读写方式 attach"
+          }
+        }
+      }
+    },
     "BSD device" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "BSD 设备"
+          }
+        }
+      }
+    },
+    "Can't enable it? Open Diagnostics to troubleshoot." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法启用?打开「诊断」排查。"
           }
         }
       }
@@ -32,6 +112,7 @@
       }
     },
     "Choose Folder…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -42,6 +123,7 @@
       }
     },
     "Choose Image…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -81,6 +163,86 @@
         }
       }
     },
+    "Couldn't query FSKit — try Re-check." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法查询 FSKit——请点「重新检测」。"
+          }
+        }
+      }
+    },
+    "Couldn't read install paths in-app. Check in Terminal — expect a single /Applications path (not DerivedData) and no duplicates:" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用内无法读取安装路径。请在终端检查——应只有一个 /Applications 路径(而非 DerivedData)且无重复:"
+          }
+        }
+      }
+    },
+    "Detach Disk Image" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "分离磁盘映像"
+          }
+        }
+      }
+    },
+    "Detach Image…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "分离映像…"
+          }
+        }
+      }
+    },
+    "Devices" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设备"
+          }
+        }
+      }
+    },
+    "Diagnostics…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "诊断…"
+          }
+        }
+      }
+    },
+    "Disk Images" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "磁盘映像"
+          }
+        }
+      }
+    },
+    "Done" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完成"
+          }
+        }
+      }
+    },
     "Eject" : {
       "localizations" : {
         "zh-Hans" : {
@@ -101,22 +263,32 @@
         }
       }
     },
-    "In Settings, scroll to Extensions → open “File System Extensions” → turn on “ntfs3g”." : {
+    "Extension Diagnostics" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在系统设置中向下滚动到「扩展」→ 打开「文件系统扩展」→ 启用「ntfs3g」。"
+            "value" : "扩展诊断"
           }
         }
       }
     },
-    "Turn on “ntfs3g” in the File System Extensions list." : {
+    "Extension enabled" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在「文件系统扩展」列表中启用「ntfs3g」。"
+            "value" : "扩展已启用"
+          }
+        }
+      }
+    },
+    "Extension installed" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "扩展已安装"
           }
         }
       }
@@ -131,6 +303,17 @@
         }
       }
     },
+    "Folder…" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "文件夹…"
+          }
+        }
+      }
+    },
     "Format" : {
       "localizations" : {
         "zh-Hans" : {
@@ -141,7 +324,19 @@
         }
       }
     },
+    "Image" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "映像"
+          }
+        }
+      }
+    },
     "Image file" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -151,12 +346,43 @@
         }
       }
     },
+    "In Settings, scroll to Extensions → open “File System Extensions” → turn on “ntfs3g”." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在系统设置中向下滚动到「扩展」→ 打开「文件系统扩展」→ 启用「ntfs3g」。"
+          }
+        }
+      }
+    },
     "In-app mount goes to /Volumes (macOS 27+). Choose a folder to mount into a custom location via a Terminal command." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "应用内挂载会挂到 /Volumes(需 macOS 27+)。若要挂载到自定义位置,请选择一个文件夹,通过终端命令完成。"
+          }
+        }
+      }
+    },
+    "Install path unknown." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "安装路径未知。"
+          }
+        }
+      }
+    },
+    "Loaded from a dev build (DerivedData) — install the release app to /Applications." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从开发构建(DerivedData)加载——请将正式版应用安装到 /Applications。"
           }
         }
       }
@@ -171,12 +397,32 @@
         }
       }
     },
+    "More than one registration found — this can grey out the toggle." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "发现多个注册——这可能导致开关变灰。"
+          }
+        }
+      }
+    },
     "Mount" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "挂载"
+          }
+        }
+      }
+    },
+    "Mount %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "挂载 %@"
           }
         }
       }
@@ -192,6 +438,7 @@
       }
     },
     "Mount Disk Image" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -202,6 +449,7 @@
       }
     },
     "Mount Image…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -212,6 +460,7 @@
       }
     },
     "Mount into folder" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -231,12 +480,34 @@
         }
       }
     },
+    "Mount to" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "挂载到"
+          }
+        }
+      }
+    },
     "Mount to Folder…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "挂载到文件夹…"
+          }
+        }
+      }
+    },
+    "Mount…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "挂载…"
           }
         }
       }
@@ -247,6 +518,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已挂载"
+          }
+        }
+      }
+    },
+    "Mounted · read-only" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已挂载 · 只读"
           }
         }
       }
@@ -271,12 +552,43 @@
         }
       }
     },
+    "Mounts under /Volumes." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "挂载到 /Volumes。"
+          }
+        }
+      }
+    },
+    "Multiple registrations — remove the stale copies (old DerivedData/dev builds) so only the /Applications copy remains, then Re-check. Duplicates are a known cause of a greyed-out toggle." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "存在多个注册——请移除陈旧副本(旧的 DerivedData/开发构建),只保留 /Applications 那份,然后重新检测。重复注册是开关变灰的已知原因。"
+          }
+        }
+      }
+    },
     "Name" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "名称"
+          }
+        }
+      }
+    },
+    "No folder selected" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未选择文件夹"
           }
         }
       }
@@ -292,11 +604,22 @@
       }
     },
     "None selected" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "未选择"
+          }
+        }
+      }
+    },
+    "Not found. Run the app from Xcode once, or install it to /Applications." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未找到。请用 Xcode 运行一次本应用,或将其安装到 /Applications。"
           }
         }
       }
@@ -341,6 +664,26 @@
         }
       }
     },
+    "ntfs3g is enabled and available to mount NTFS volumes." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ntfs3g 已启用,可用于挂载 NTFS 卷。"
+          }
+        }
+      }
+    },
+    "ntfs3g is registered with the system." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ntfs3g 已在系统中注册。"
+          }
+        }
+      }
+    },
     "OK" : {
       "localizations" : {
         "zh-Hans" : {
@@ -352,6 +695,7 @@
       }
     },
     "On this macOS a sandboxed app can't run mount for you. Paste this into Terminal:" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -381,7 +725,18 @@
         }
       }
     },
+    "Plug in an NTFS drive, or add a disk image." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请插入 NTFS 磁盘,或添加磁盘映像。"
+          }
+        }
+      }
+    },
     "Plug in an NTFS drive, or mount a disk image." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -401,12 +756,65 @@
         }
       }
     },
+    "Read-only" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只读"
+          }
+        }
+      }
+    },
+    "Read/write" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "读写"
+          }
+        }
+      }
+    },
+    "Registration" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "注册"
+          }
+        }
+      }
+    },
+    "Remove from List" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从列表移除"
+          }
+        }
+      }
+    },
     "Reveal in Finder" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "在访达中显示"
+          }
+        }
+      }
+    },
+    "Run this in Terminal — a sandboxed app can't do it for you:" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在终端运行——沙盒应用无法替你执行:"
           }
         }
       }
@@ -421,12 +829,83 @@
         }
       }
     },
+    "Still off after toggling? On macOS 26 the File System Extensions switch can be a no-op (a known system bug). As a last resort — unsupported — inspect the FSKit settings, force-enable, and restart its agent:" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "开了开关还是没启用?在 macOS 26 上「文件系统扩展」开关可能无效(已知系统 bug)。作为最后手段(非官方支持):检查 FSKit 设置、强制启用,并重启其 agent:"
+          }
+        }
+      }
+    },
     "System" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "系统"
+          }
+        }
+      }
+    },
+    "System (/Volumes)" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "系统(/Volumes)"
+          }
+        }
+      }
+    },
+    "The image will mount read-only (recommended)." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "镜像将以只读方式挂载(推荐)。"
+          }
+        }
+      }
+    },
+    "The image will mount read-write." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "镜像将以读写方式挂载。"
+          }
+        }
+      }
+    },
+    "This appends ntfs3g to the enabled-modules list only if it's missing, then restarts fskit_agent. It edits files outside the sandbox, so the app can't run it for you." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅在缺失时把 ntfs3g 追加到已启用模块列表,然后重启 fskit_agent。它会修改沙盒之外的文件,所以应用无法替你执行。"
+          }
+        }
+      }
+    },
+    "Turn on “ntfs3g” in the File System Extensions list." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在「文件系统扩展」列表中启用「ntfs3g」。"
+          }
+        }
+      }
+    },
+    "Turn on ntfs3g under File System Extensions." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在「文件系统扩展」中开启 ntfs3g。"
           }
         }
       }
