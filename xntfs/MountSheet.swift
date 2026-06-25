@@ -1,10 +1,8 @@
 //
 //  MountSheet.swift
-//  Manual (re)mount of a device/image volume. Mounting only ever targets /Volumes: a
-//  sandboxed app/extension can't be granted access to an arbitrary folder (only /Volumes,
-//  owned by diskarbitrationd, and the extension's own sandbox-allowed temp paths work).
-//  On macOS 27 the in-app FSClient path mounts directly; otherwise a copyable
-//  `diskutil mount` command is shown.
+//  In-app mount of a device/image volume — only presented on macOS 27+, the only systems
+//  where a sandboxed app can mount a third-party FSKit volume (FSKit Mounter). Always targets
+//  /Volumes. On earlier systems the UI routes the user to Disk Utility instead.
 //
 
 import SwiftUI
@@ -15,8 +13,8 @@ struct MountSheet: View {
     let device: NTFSDevice
 
     @State private var readOnly = false
-    @State private var command: String?
     @State private var busy = false
+    @State private var errorText: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -25,17 +23,15 @@ struct MountSheet: View {
 
             Toggle("Mount read-only", isOn: $readOnly)
                 .disabled(!device.mediaWritable)
-                .onChange(of: readOnly) { _, _ in command = nil }
             if !device.mediaWritable {
                 Text("This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            if let command {
+            if let errorText {
                 Divider()
-                Text("A sandboxed app can't mount this here, so paste this into Terminal:")
-                    .font(.callout)
-                CopyableCommand(command: command)
+                Text(errorText).font(.callout).foregroundStyle(.red)
+                Button("Open Disk Utility") { DiskUtility.open() }
             }
 
             Spacer(minLength: 0)
@@ -49,18 +45,16 @@ struct MountSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 560, height: command == nil ? 240 : 380)
+        .frame(width: 520, height: errorText == nil ? 230 : 320)
         .onAppear { readOnly = device.mediaWritable ? model.settings.defaultReadOnly : true }
     }
 
     private func doMount() async {
         busy = true
         defer { busy = false }
-        let outcome = await model.mount(device, to: nil, readOnly: readOnly)
-        switch outcome {
+        switch await model.mount(device, readOnly: readOnly) {
         case .mounted: dismiss()
-        case .needsCommand(let cmd): command = cmd
-        case .failed: dismiss()   // error surfaced by the model's alert
+        case .failed(let msg): errorText = msg
         }
     }
 }

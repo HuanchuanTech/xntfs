@@ -1,16 +1,6 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-    "This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "该卷为只读(例如以只读方式 attach 的镜像),只能以只读方式挂载。"
-          }
-        }
-      }
-    },
     "%@ · %@" : {
       "localizations" : {
         "en" : {
@@ -22,11 +12,23 @@
       }
     },
     "A sandboxed app can't mount this here, so paste this into Terminal:" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "沙盒应用无法在此处挂载,请把下面命令粘贴到「终端」运行:"
+          }
+        }
+      }
+    },
+    "A sandboxed app can't mount this on macOS 26 — select this volume in Disk Utility and click Mount." : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "沙盒应用在 macOS 26 上无法挂载——请在磁盘工具中选中此卷并点「挂载」。"
           }
         }
       }
@@ -52,6 +54,7 @@
       }
     },
     "Add Disk Image…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -62,6 +65,7 @@
       }
     },
     "Attach Disk Image" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -72,6 +76,7 @@
       }
     },
     "Attach writable" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -184,6 +189,7 @@
       }
     },
     "Detach Disk Image" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -194,6 +200,7 @@
       }
     },
     "Detach Image…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -459,6 +466,16 @@
         }
       }
     },
+    "Mount in Disk Utility…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在磁盘工具中挂载…"
+          }
+        }
+      }
+    },
     "Mount into folder" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -503,6 +520,7 @@
       }
     },
     "Mount…" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -538,6 +556,27 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "挂载于"
+          }
+        }
+      }
+    },
+    "Mounting in the app isn't available — use Disk Utility to mount this volume." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用内挂载不可用——请用磁盘工具挂载此卷。"
+          }
+        }
+      }
+    },
+    "Mounting in the app requires macOS 27. Use Disk Utility to mount this volume." : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用内挂载需要 macOS 27。请用磁盘工具挂载此卷。"
           }
         }
       }
@@ -705,6 +744,16 @@
         }
       }
     },
+    "Open Disk Utility" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开磁盘工具"
+          }
+        }
+      }
+    },
     "Open Settings…" : {
       "localizations" : {
         "zh-Hans" : {
@@ -726,11 +775,22 @@
       }
     },
     "Plug in an NTFS drive, or add a disk image." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "请插入 NTFS 磁盘,或添加磁盘映像。"
+          }
+        }
+      }
+    },
+    "Plug in an NTFS drive, or attach a disk image in Disk Utility." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "插入 NTFS 磁盘,或在磁盘工具中附加磁盘映像。"
           }
         }
       }
@@ -810,6 +870,7 @@
       }
     },
     "Run this in Terminal — a sandboxed app can't do it for you:" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -825,6 +886,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "选择一个卷"
+          }
+        }
+      }
+    },
+    "Select this volume in Disk Utility and click Mount." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在磁盘工具中选中此卷并点「挂载」。"
           }
         }
       }
@@ -861,6 +932,7 @@
       }
     },
     "The image will mount read-only (recommended)." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -871,6 +943,7 @@
       }
     },
     "The image will mount read-write." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -890,7 +963,18 @@
         }
       }
     },
+    "This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "该卷为只读(例如以只读方式 attach 的镜像),只能以只读方式挂载。"
+          }
+        }
+      }
+    },
     "Turn on “ntfs3g” in the File System Extensions list." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {

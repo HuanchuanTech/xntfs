@@ -1,8 +1,8 @@
 //
 //  MountService.swift
-//  Mounts / unmounts NTFS device volumes via DiskArbitration, and builds the copyable
-//  Terminal commands the sandbox can't run itself: `mount` (on macOS < 27 or a custom
-//  folder) and `hdiutil attach` / `detach` for disk images.
+//  Mounts / unmounts NTFS device volumes via DiskArbitration. In-app mounting is only
+//  attempted on macOS 27+ (FSKit Mounter); on earlier systems the user mounts via Disk
+//  Utility instead.
 //
 
 import Foundation
@@ -23,18 +23,11 @@ enum MountError: LocalizedError {
         }
     }
 
-    /// kDAReturnNotPrivileged — the sandbox isn't allowed to perform this mount, so the
-    /// only path is a user-run Terminal command (every other failure is a real error).
-    var isNotPrivileged: Bool {
-        if case .dissented(let status, _) = self { return status == kDAReturnNotPrivileged }
-        return false
-    }
 }
 
 /// Result of a mount attempt.
 enum MountOutcome {
     case mounted(URL)
-    case needsCommand(String)
     case failed(String)
 }
 
@@ -44,18 +37,15 @@ final class MountService {
 
     // MARK: mount
     //
-    // FSKit Mounter only authorizes the macOS 27 FSClient API (into /Volumes); a sandboxed
-    // app's DiskArbitration mount of a third-party FSKit volume is refused as not-privileged.
-    // So the in-app path is best-effort on macOS 27; otherwise we hand back a `mount` command.
+    // In-app mounting needs the macOS 27 FSKit Mounter, which can only be built against the
+    // (still beta) macOS 27 SDK — disabled for now; the UI routes the user to Disk Utility.
+    // Re-enable the body below (and `mount(_:at:readOnly:)`) when the 27 SDK is out of beta.
 
-    func unifiedMount(_ device: NTFSDevice, to target: URL?, readOnly: Bool) async -> MountOutcome {
-        let command = Self.mountCommand(for: device, target: target, readOnly: readOnly)
-        guard #available(macOS 27.0, *) else { return .needsCommand(command) }
-        do { return .mounted(try await mount(device, at: target, readOnly: readOnly)) }
-        catch {
-            if let me = error as? MountError, me.isNotPrivileged { return .needsCommand(command) }
-            return .failed(error.localizedDescription)
-        }
+    func unifiedMount(_ device: NTFSDevice, readOnly: Bool) async -> MountOutcome {
+        // guard #available(macOS 27.0, *) else { … }
+        // do { return .mounted(try await mount(device, at: nil, readOnly: readOnly)) }
+        // catch { return .failed(error.localizedDescription) }
+        return .failed(String(localized: "Mounting in the app isn't available — use Disk Utility to mount this volume."))
     }
 
     func mount(_ device: NTFSDevice, at mountPoint: URL?, readOnly: Bool) async throws -> URL {
@@ -104,37 +94,6 @@ final class MountService {
         }
     }
 
-    // MARK: copyable commands
-
-    /// `diskutil mount` command for a device volume — routed through diskarbitrationd, the
-    /// same path the system uses to auto-mount xntfs. `mount -F -t xntfs` instead does a
-    /// low-level FSKit probe the extension's sandbox denies ("Probing resource: Permission
-    /// denied"). A custom mount point still only works where the extension's sandbox allows
-    /// it (e.g. /tmp); /Volumes works because diskarbitrationd owns it.
-    static func mountCommand(for device: NTFSDevice, target: URL?, readOnly: Bool) -> String {
-        let ro = readOnly ? "readOnly " : ""
-        if let target {
-            return "diskutil mount \(ro)-mountPoint \(shellQuote(target.path)) \(shellQuote(device.devicePath))"
-        }
-        return "diskutil mount \(ro)\(shellQuote(device.devicePath))"
-    }
-
-    /// Attach a disk image as a device — xntfs then auto-mounts any NTFS volume on it.
-    /// Read-only by default (an attached image mounts with the device's writability);
-    /// pass readOnly: false to attach writable.
-    static func attachCommand(_ imagePath: String, readOnly: Bool) -> String {
-        let ro = readOnly ? " -readonly" : ""
-        return "hdiutil attach\(ro) \(shellQuote(imagePath))"
-    }
-
-    /// Detach an attached image by its whole-disk node (e.g. "disk6").
-    static func detachCommand(wholeDiskBSD: String) -> String {
-        "hdiutil detach /dev/\(wholeDiskBSD)"
-    }
-
-    private static func shellQuote(_ path: String) -> String {
-        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
 }
 
 // MARK: - DiskArbitration callback bridging

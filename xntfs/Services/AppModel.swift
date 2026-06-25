@@ -53,16 +53,15 @@ final class AppModel {
 
     // MARK: actions
 
-    /// Mount a device/image volume. Returns the outcome so the mount sheet can show a
-    /// copyable command when the sandbox can't mount in-app.
+    /// Mount a device/image volume (in-app only on macOS 27+). Returns the outcome so the
+    /// mount sheet can surface an error.
     @discardableResult
-    func mount(_ device: NTFSDevice, to target: URL?, readOnly: Bool) async -> MountOutcome {
+    func mount(_ device: NTFSDevice, readOnly: Bool) async -> MountOutcome {
         guard let mounter else { let m = "DiskArbitration unavailable"; setError(m); return .failed(m) }
-        let outcome = await mounter.unifiedMount(device, to: target, readOnly: readOnly)
+        let outcome = await mounter.unifiedMount(device, readOnly: readOnly)
         switch outcome {
         case .mounted(let url): updateState(device.id, .mounted(url))
         case .failed(let msg): updateState(device.id, .failed(msg)); setError(msg)
-        case .needsCommand: break   // the user runs it; the monitor reflects the result
         }
         return outcome
     }

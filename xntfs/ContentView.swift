@@ -6,16 +6,13 @@
 //
 
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
     @State private var extStatus = ExtensionStatus()
     @State private var selection: NTFSDevice.ID?
-    @State private var showAddImage = false
     @State private var showDiagnostics = false
-    @State private var pendingAttach: PendingAttach?
     @State private var showError = false
 
     var body: some View {
@@ -58,7 +55,7 @@ struct ContentView: View {
                 if model.devices.isEmpty {
                     ContentUnavailableView("No NTFS volumes",
                                            systemImage: "externaldrive.badge.questionmark",
-                                           description: Text("Plug in an NTFS drive, or add a disk image."))
+                                           description: Text("Plug in an NTFS drive, or attach a disk image in Disk Utility."))
                 }
             }
         } detail: {
@@ -70,8 +67,8 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button { showAddImage = true } label: {
-                    Label("Add Disk Image…", systemImage: "plus")
+                Button { DiskUtility.open() } label: {
+                    Label("Open Disk Utility", systemImage: "externaldrive")
                 }
             }
             ToolbarItem(placement: .primaryAction) {
@@ -80,14 +77,8 @@ struct ContentView: View {
                 }
             }
         }
-        .fileImporter(isPresented: $showAddImage, allowedContentTypes: Self.imageTypes) { result in
-            if case .success(let url) = result { pendingAttach = PendingAttach(url: url) }
-        }
         .sheet(isPresented: $showDiagnostics) {
             DiagnosticsView(status: extStatus)
-        }
-        .sheet(item: $pendingAttach) { p in
-            AttachImageSheet(url: p.url)
         }
         .onChange(of: model.lastError) { _, newValue in showError = (newValue != nil) }
         .alert("Operation failed", isPresented: $showError) {
@@ -97,13 +88,6 @@ struct ContentView: View {
         }
     }
 
-    private static var imageTypes: [UTType] {
-        var types: [UTType] = [.diskImage, .data]
-        for ext in ["ntfs", "img", "dd", "raw", "bin"] {
-            if let u = UTType(filenameExtension: ext) { types.append(u) }
-        }
-        return types
-    }
 }
 
 struct ExtensionBanner: View {
@@ -144,12 +128,14 @@ struct ExtensionBanner: View {
         status.state == .notInstalled ? "NTFS extension not installed" : "NTFS extension not enabled"
     }
 
-    /// Before macOS 27 the button can only open the pane (no deep-link to the detail), so
-    /// spell out the remaining steps; on macOS 27 the official jump lands on the list.
+    /// The Settings button can only open the Login Items & Extensions pane (no deep-link to the
+    /// File System Extensions detail), so spell out the remaining steps.
     private var instruction: LocalizedStringKey {
-        if #available(macOS 27.0, *) {
-            return "Turn on “ntfs3g” in the File System Extensions list."
-        }
+        // macOS 27: FSClient deep-links straight onto the File System Extensions list — disabled
+        // until the macOS 27 SDK is out of beta. Re-enable then:
+        // if #available(macOS 27.0, *) {
+        //     return "Turn on “ntfs3g” in the File System Extensions list."
+        // }
         return "In Settings, scroll to Extensions → open “File System Extensions” → turn on “ntfs3g”."
     }
 }
@@ -216,7 +202,6 @@ struct DeviceDetailView: View {
     @Environment(AppModel.self) private var model
     let device: NTFSDevice
     @State private var showMountSheet = false
-    @State private var showDetach = false
 
     var body: some View {
         Form {
@@ -243,15 +228,16 @@ struct DeviceDetailView: View {
                         } label: { Label("Reveal in Finder", systemImage: "folder") }
                     }
                 } else {
+                    // macOS 27+ in-app mount (FSKit Mounter) — disabled until the macOS 27 SDK
+                    // is out of beta (beta builds can't be submitted). Re-enable this branch then:
+                    // if #available(macOS 27.0, *) {
+                    //     Button { showMountSheet = true } label: { Label("Mount…", systemImage: "play.fill") }
+                    // } else { …the Disk Utility branch below… }
                     Button {
-                        showMountSheet = true
-                    } label: { Label("Mount…", systemImage: "play.fill") }
-                }
-                if device.kind == .diskImage {
-                    Button(role: .destructive) {
-                        showDetach = true
-                    } label: { Label("Detach Image…", systemImage: "eject.circle") }
-                    .disabled(device.wholeDiskBSD.isEmpty)
+                        DiskUtility.open()
+                    } label: { Label("Mount in Disk Utility…", systemImage: "externaldrive") }
+                    Text("Select this volume in Disk Utility and click Mount.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
 
@@ -263,10 +249,6 @@ struct DeviceDetailView: View {
         .navigationTitle(device.displayName)
         .sheet(isPresented: $showMountSheet) {
             MountSheet(device: device).environment(model)
-        }
-        .sheet(isPresented: $showDetach) {
-            CommandSheet(title: "Detach Disk Image",
-                         command: MountService.detachCommand(wholeDiskBSD: device.wholeDiskBSD))
         }
     }
 }

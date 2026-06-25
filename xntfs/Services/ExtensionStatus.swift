@@ -91,11 +91,13 @@ final class ExtensionStatus {
     /// "File System Extensions" toggle lives. Returns whether a pane opened.
     @discardableResult
     static func openSettings() -> Bool {
-        // macOS 27 ships an official jump straight to File System Extensions.
-        if #available(macOS 27.0, *) {
-            if FSClient.shared.openFileSystemExtensionsSettings() { return true }
-        }
-        // Pre-27 there is no anchor for the File System Extensions detail (the pane only
+        // macOS 27 ships an official jump straight to File System Extensions, but
+        // FSClient.openFileSystemExtensionsSettings() isn't in the stable SDK. Re-enable when
+        // building against the macOS 27 SDK (out of beta):
+        // if #available(macOS 27.0, *) {
+        //     if FSClient.shared.openFileSystemExtensionsSettings() { return true }
+        // }
+        // Without that anchor for the File System Extensions detail (the pane only
         // exposes "ExtensionItems"/"startupItemsPref"), so just open the Login Items &
         // Extensions page; the banner covers the remaining steps.
         if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {

@@ -11,9 +11,9 @@ ntfs-3g 自带的 `src/ntfs-3g.c` 把 FUSE 映射到 libntfs 如出一辙。
 
 NTFS 磁盘**由系统自动挂载到 `/Volumes`**(DiskArbitration 探测扩展注册的 `FSMediaTypes`
 ——无需任何应用进程,与内置的 exFAT/MSDOS 模块完全一样)。`xntfs` 应用是一个**控制面板**:
-列出 NTFS 磁盘与已附加的映像,提供手动挂载/卸载(到 `/Volumes`)、只读重新挂载、附加/分离
-磁盘映像,以及一个扩展状态诊断页。沙盒无法运行 `hdiutil`/`mount`,因此这些在应用无法直接
-执行时会以**可复制的终端命令**形式给出。
+列出 NTFS 磁盘与已附加的磁盘映像,推出/在 Finder 中显示已挂载卷,并有一个扩展状态诊断页。
+沙盒应用无法自行挂载第三方 FSKit 卷或附加映像,这些操作会打开**磁盘工具**完成;日常磁盘
+则由系统自动挂载。
 
 ```
 xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
@@ -51,16 +51,15 @@ NTFS 引擎本身已独立验证正确(挂载 / 枚举 / 读 / 写 / 创建,并�
    exFAT/MSDOS 模块同一模型)。`FSProbeOrder` 决定相对于老式只读 NTFS 驱动的优先级。
    应用只负责为 UI *检测/列出*磁盘。
 3. **挂载位置** —— 磁盘挂载到 `/Volumes/<名称>`,路径由系统选择并对重名去重。沙盒化的 FSKit
-   卷**无法挂载到自定义文件夹**(扩展只能访问 `/Volumes` 及其自身沙盒临时路径——见*沙盒与
-   挂载*),所以 `/Volumes` 是唯一目标。
+   卷**无法挂载到自定义文件夹**(扩展只能访问 `/Volumes` 及其自身沙盒临时路径),所以
+   `/Volumes` 是唯一目标。
 4. **同时挂载多个磁盘** —— 设备按 BSD 名跟踪,各自独立挂载。
-5. **手动挂载/卸载** —— 每个设备有 *Mount…*(挂到 `/Volumes`,带只读开关)和 *Eject*。
-   macOS 27 上应用通过 `FSClient` 在应用内挂载;macOS 26 上沙盒应用无权挂载第三方 FSKit 卷,
-   于是改为给出可复制的 `diskutil mount [readOnly] /dev/diskXsY` 命令。
-6. **磁盘映像** —— *Add Disk Image…* 选择一个原始 NTFS 映像(`.img`/`.dd`/…),并给出可复制的
-   `hdiutil attach [-readonly] <映像>` 命令(默认只读);附加后,该设备上的 NTFS 卷会像普通
-   磁盘一样**自动挂载**。*Detach Image…* 给出 `hdiutil detach`。应用自身无法运行 `hdiutil`
-   (沙盒拦截 `Process`),所以用可复制命令。
+5. **手动挂载/卸载** —— 每个设备有 *Eject* 和 *在 Finder 中显示*。沙盒应用无法自行挂载第三方
+   FSKit 卷,所以要(重新)挂载未挂载的 NTFS 卷时,应用提供一个 *打开磁盘工具* 按钮——在那里
+   挂载(磁盘工具经由 `diskarbitrationd` 挂载,和系统自动挂载同一条路)。
+6. **磁盘映像** —— 在**磁盘工具**里附加原始 NTFS 映像(*文件 ▸ 打开磁盘映像…*,或双击它);
+   xntfs 随后会把该设备上的 NTFS 卷像普通磁盘一样**自动挂载**,并列在 *磁盘映像* 分节下。
+   应用只是跳转到磁盘工具,而不自行运行 `hdiutil`(沙盒拦截 `Process`)。
 
 ## 构建
 
@@ -92,23 +91,16 @@ macOS(AMFI)只有在该权限被描述文件授权后才会加载扩展。在**�
 
 ## 沙盒与挂载
 
-在 macOS 26.5 的沙盒构建上验证过,实际情况比最初设想的更窄:
+在 macOS 26.5 的沙盒构建上验证过:
 
 - **自动挂载是主路径。** 系统通过扩展的 `FSMediaTypes` 把 NTFS 磁盘以读写方式自动挂载到
-  `/Volumes`——无需应用进程、无需挂载权限。完全可用。
-- **macOS 26 上沙盒应用无法手动挂载第三方 FSKit 卷。** DiskArbitration 挂载会返回
-  `kDAReturnNotPrivileged`。`com.apple.developer.fskit.mount` 权限 + `FSClient.mountSingleVolume`
-  **只在 macOS 27** 才授权手动挂载,而且即便在 27 上目标也**只能是 `/Volumes`**。
-- **`mount -F -t xntfs …` 会失败**(“Probing resource: Permission denied”)。可用的命令行路径是
-  **`diskutil mount`**,它经由 `diskarbitrationd`——和自动挂载同一条路。
-- **无法挂载到自定义文件夹。** 扩展声明了 `FSRequiresSecurityScopedPathURLResources`,其沙盒
-  只能访问 `/Volumes`(由 `diskarbitrationd` 拥有)和自身临时路径(如 `/tmp`)。任意文件夹需要
-  一个安全作用域授权,而终端命令给不了、应用内路径也给不了(26 上无权、27 上只能 `/Volumes`)。
-- **应用从不 shell 出去。** 沙盒拦截 `Process`,所以 `hdiutil`(附加/分离)和 27 之前的
-  `diskutil mount` 都以**可复制的终端命令**交给用户运行。
-
-所以:自动挂载到处可用;手动挂载在 macOS 27 上是应用内(→ `/Volumes`)、在 macOS 26 上是
-可复制的 `diskutil mount` 命令;映像附加/分离始终是可复制的 `hdiutil` 命令。
+  `/Volumes`——无需应用进程、无需额外权限。完全可用。
+- **沙盒应用无法自行挂载第三方 FSKit 卷。** DiskArbitration 挂载会被拒
+  (`kDAReturnNotPrivileged`),`mount -F -t xntfs …` 也会在 FSKit 探测处被拒
+  (“Permission denied”)。所以手动(重新)挂载和附加磁盘映像都交给**磁盘工具**完成,它经由
+  `diskarbitrationd` 挂载——和自动挂载同一条路。
+- **应用从不 shell 出去。** 沙盒拦截 `Process`(`hdiutil`、`mount` 等);应用的职责是检测、
+  列出,以及一键跳转到磁盘工具。
 
 > 这是*技术*能力结论;App Review 是另一道独立的政策关卡。
 
@@ -117,10 +109,10 @@ macOS(AMFI)只有在该权限被描述文件授权后才会加载扩展。在**�
 ```
 xntfs/                     应用 target(SwiftUI)
   xntfsApp.swift           @main App + Settings 场景
-  ContentView.swift        设备/映像列表 + 详情,挂载/附加/分离操作
-  MountSheet.swift         手动挂载(→ /Volumes,只读开关)
-  CommandSheet.swift       附加/分离 sheet(AttachImageSheet:默认只读)
-  CopyableCommand.swift    共享的「复制此终端命令」控件
+  ContentView.swift        设备/映像列表 + 详情;挂载/附加走磁盘工具
+  DiskUtility.swift        打开 Apple 磁盘工具(挂载 / 附加映像)
+  MountSheet.swift         应用内挂载 sheet(当前禁用)
+  CopyableCommand.swift    可复制命令控件(供诊断页使用)
   DiagnosticsView.swift    扩展状态诊断页
   SettingsView.swift       默认只读偏好
   Model/NTFSDevice.swift
