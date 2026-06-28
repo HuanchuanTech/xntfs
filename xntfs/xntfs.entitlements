@@ -6,5 +6,9 @@
 	<true/>
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>529LJDH392.group.com.huanchuan.xntfs</string>
+	</array>
 </dict>
 </plist>

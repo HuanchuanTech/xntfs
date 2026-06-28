@@ -46,7 +46,10 @@ struct MountSheet: View {
         }
         .padding(20)
         .frame(width: 520, height: errorText == nil ? 230 : 320)
-        .onAppear { readOnly = device.mediaWritable ? model.settings.defaultReadOnly : true }
+        .onAppear {
+            readOnly = !device.mediaWritable ? true
+                : (device.kind == .diskImage ? model.settings.imageReadOnly : model.settings.deviceReadOnly)
+        }
     }
 
     private func doMount() async {

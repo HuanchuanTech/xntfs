@@ -4,5 +4,9 @@
 <dict>
 	<key>com.apple.developer.fskit.fsmodule</key>
 	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>529LJDH392.group.com.huanchuan.xntfs</string>
+	</array>
 </dict>
 </plist>

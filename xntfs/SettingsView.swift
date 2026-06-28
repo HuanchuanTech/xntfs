@@ -1,7 +1,8 @@
 //
 //  SettingsView.swift
-//  A couple of manual-mount preferences. NTFS drives auto-mount under /Volumes
-//  via the file-system extension; this app is the control panel.
+//  Read-only mount preferences, one per scenario (drives / disk images). They set the
+//  access the extension uses when the system auto-mounts a volume, and the default for
+//  in-app mounting on macOS 27+.
 //
 
 import SwiftUI
@@ -13,16 +14,19 @@ struct SettingsView: View {
         @Bindable var settings = model.settings
 
         Form {
-            Section("Manual mounting") {
-                Toggle("Mount as read-only by default", isOn: $settings.defaultReadOnly)
+            Section("Disk drives") {
+                Toggle("Mount read-only", isOn: $settings.deviceReadOnly)
+                Text("Read-only access for NTFS disk drives.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section {
-                Text("NTFS drives mount automatically under /Volumes via the file-system extension. Use this app to eject, remount read-only, mount to a folder you choose, or open a disk image.")
+            Section("Disk images") {
+                Toggle("Mount read-only", isOn: $settings.imageReadOnly)
+                Text("Read-only access for attached NTFS disk images.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 470, height: 240)
+        .frame(width: 460, height: 280)
     }
 }

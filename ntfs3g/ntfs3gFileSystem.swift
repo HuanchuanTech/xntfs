@@ -6,12 +6,115 @@
 
 import Foundation
 import FSKit
+import DiskArbitration
 
 @available(macOS 15.4, *)
 final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                               FSManageableResourceMaintenanceOperations {
 
     private var volume: ntfs3gVolume?
+
+    // MARK: read-only resolution (mount options + per-scenario app preference)
+
+    /// App Group + keys shared with the host app's AppSettings (keep both in sync).
+    /// macOS requires third-party group container identifiers to use the Team ID prefix.
+    private static let appGroupID = "529LJDH392.group.com.huanchuan.xntfs"
+    private static let deviceReadOnlyKey = "deviceReadOnly"
+    private static let imageReadOnlyKey = "imageReadOnly"
+
+    private struct ReadOnlyDecision {
+        let readOnly: Bool
+        let isImage: Bool
+        let key: String?
+        let storedPreference: Bool?
+        let source: String
+    }
+
+    /// Read-only if the mount explicitly asks for it; otherwise (a system auto-mount,
+    /// carrying no explicit ro/rw) fall back to the user's per-scenario default from the
+    /// shared App Group container — keyed by whether this is a disk image (default
+    /// read-only) or a physical drive (default read/write).
+    private static func readOnlyDecision(_ opts: [String], resource: FSResource) -> ReadOnlyDecision {
+        if requestsReadOnly(opts) {
+            return ReadOnlyDecision(readOnly: true, isImage: false, key: nil, storedPreference: nil, source: "mount-option-ro")
+        }
+        if requestsReadWrite(opts) {
+            return ReadOnlyDecision(readOnly: false, isImage: false, key: nil, storedPreference: nil, source: "mount-option-rw")
+        }
+        let isImage = isDiskImage(resource)
+        let key = isImage ? imageReadOnlyKey : deviceReadOnlyKey
+        let stored = storedPreference(forKey: key)
+        return ReadOnlyDecision(readOnly: stored ?? isImage,
+                                isImage: isImage,
+                                key: key,
+                                storedPreference: stored,
+                                source: stored == nil ? "scenario-default" : "app-group")
+    }
+
+    private static func storedPreference(forKey key: String) -> Bool? {
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) else {
+            return nil
+        }
+        let url = container.appendingPathComponent("Library/Preferences/\(appGroupID).plist")
+        guard let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        return plist[key] as? Bool
+    }
+
+    /// A disk image presents as a block device whose DiskArbitration device model is
+    /// "Disk Image" or whose protocol is "Disk Image" (the same signal diskutil shows);
+    /// anything else is a drive.
+    private static func isDiskImage(_ resource: FSResource) -> Bool {
+        if #available(macOS 26.0, *), resource is FSPathURLResource { return true }
+        guard let block = resource as? FSBlockDeviceResource,
+              let session = DASessionCreate(kCFAllocatorDefault) else { return false }
+        let names = bsdNameCandidates(block.bsdName)
+        for name in names {
+            let disk = name.withCString { DADiskCreateFromBSDName(kCFAllocatorDefault, session, $0) }
+            guard let disk, let desc = DADiskCopyDescription(disk) as? [String: Any] else { continue }
+            let model = desc[kDADiskDescriptionDeviceModelKey as String] as? String
+            let proto = desc[kDADiskDescriptionDeviceProtocolKey as String] as? String
+            if model?.localizedCaseInsensitiveContains("disk image") == true ||
+                proto?.localizedCaseInsensitiveContains("disk image") == true {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func bsdNameCandidates(_ name: String) -> [String] {
+        if name.hasPrefix("/dev/") {
+            return [name, String(name.dropFirst("/dev/".count))]
+        }
+        return [name, "/dev/\(name)"]
+    }
+
+    /// `-r`, `--rdonly`, `--read-only`, bare `ro`/`rdonly`, or `-o <list>` containing them.
+    private static func requestsReadOnly(_ taskOptions: [String]) -> Bool {
+        matchOptions(taskOptions, tokens: ["ro", "rdonly"], flags: ["-r", "--rdonly", "--read-only", "rdonly", "ro"])
+    }
+    /// `-w`, bare `rw`, or `-o <list>` containing `rw`.
+    private static func requestsReadWrite(_ taskOptions: [String]) -> Bool {
+        matchOptions(taskOptions, tokens: ["rw"], flags: ["-w", "rw"])
+    }
+
+    private static func matchOptions(_ taskOptions: [String], tokens: Set<String>, flags: Set<String>) -> Bool {
+        var i = 0
+        while i < taskOptions.count {
+            let opt = taskOptions[i]
+            if flags.contains(opt) { return true }
+            var oArg: String? = nil
+            if opt == "-o", i + 1 < taskOptions.count { oArg = taskOptions[i + 1]; i += 1 }
+            else if opt.hasPrefix("-o"), opt.count > 2 { oArg = String(opt.dropFirst(2)) }
+            if let oArg {
+                for tok in oArg.split(separator: ",") where tokens.contains(tok.trimmingCharacters(in: .whitespaces)) { return true }
+            }
+            i += 1
+        }
+        return false
+    }
 
     // MARK: probe / load / unload
 
@@ -43,7 +146,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
     func loadResource(resource: FSResource, options: FSTaskOptions,
                       replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
         debugLog("loadResource start resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
-        let forceReadOnly = options.taskOptions.contains("--rdonly") || options.taskOptions.contains("-r")
+        let decision = Self.readOnlyDecision(options.taskOptions, resource: resource)
         var e: Int32 = 0
         guard let made = makeBackend(resource, out: &e) else {
             let error = posixError(e)
@@ -56,7 +159,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             // ntfs3gVolume takes ownership of the backend; on failure its init frees
             // the backend and runs cleanup itself.
             let vol = try ntfs3gVolume(backend: made.backend,
-                                       readOnly: forceReadOnly || !made.writable,
+                                       readOnly: decision.readOnly || !made.writable,
                                        resourceRetain: made.retain,
                                        onTeardown: made.cleanup,
                                        onContainerStatusChange: { [weak self] status in
@@ -64,7 +167,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                                        })
             self.volume = vol
             containerStatus = .ready
-            debugLog("loadResource success name=\(vol.name.string ?? "") uuid=\(vol.volumeID.uuid.uuidString) readOnly=\(forceReadOnly || !made.writable)")
+            debugLog("loadResource success name=\(vol.name.string ?? "") uuid=\(vol.volumeID.uuid.uuidString) readOnly=\(decision.readOnly || !made.writable) decisionSource=\(decision.source) isImage=\(decision.isImage) key=\(decision.key ?? "none") storedPreference=\(String(describing: decision.storedPreference)) backendWritable=\(made.writable)")
             replyHandler(vol, nil)
         } catch {
             containerStatus = .notReady(status: error as NSError)

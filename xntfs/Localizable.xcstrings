@@ -230,6 +230,26 @@
         }
       }
     },
+    "Disk drives" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "磁盘驱动器"
+          }
+        }
+      }
+    },
+    "Disk images" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "磁盘映像"
+          }
+        }
+      }
+    },
     "Disk Images" : {
       "localizations" : {
         "zh-Hans" : {
@@ -395,6 +415,7 @@
       }
     },
     "Manual mounting" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -435,6 +456,7 @@
       }
     },
     "Mount as read-only by default" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -674,6 +696,7 @@
       }
     },
     "NTFS drives mount automatically under /Volumes via the file-system extension. Use this app to eject, remount read-only, mount to a folder you choose, or open a disk image." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -823,6 +846,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "只读"
+          }
+        }
+      }
+    },
+    "Read-only access for attached NTFS disk images." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "对已附加的 NTFS 磁盘映像使用只读访问。"
+          }
+        }
+      }
+    },
+    "Read-only access for NTFS disk drives." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "对 NTFS 磁盘驱动器使用只读访问。"
           }
         }
       }

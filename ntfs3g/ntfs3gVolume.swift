@@ -167,6 +167,12 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
 
+    @available(macOS 26.4, *)
+    var requestedMountOptions: FSVolume.MountOptions {
+        get { readOnly ? [.readOnly] : [] }
+        set { }
+    }
+
     // MARK: lifecycle
     func activate(options: FSTaskOptions) async throws -> FSItem {
         onContainerStatusChange(.active)

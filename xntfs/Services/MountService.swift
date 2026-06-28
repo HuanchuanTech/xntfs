@@ -54,7 +54,9 @@ final class MountService {
             throw MountError.diskNotFound(device.id)
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            let args = readOnly ? ["rdonly"] : []
+            // Pass an explicit ro/rw so the extension can tell a deliberate in-app mount
+            // from a system auto-mount (which carries no ro/rw and honors the app setting).
+            let args = readOnly ? ["rdonly"] : ["rw"]
             withMountArguments(args) { argv in
                 let box = DACallbackBox { dissenter in
                     if let dissenter {
