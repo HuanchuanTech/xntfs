@@ -131,10 +131,11 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     // MARK: properties
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let caps = FSVolume.SupportedCapabilities()
-        // We don't implement createLink / createSymbolicLink / readSymbolicLink,
-        // so don't advertise these — otherwise the OS/Finder offers operations
-        // that then fail at runtime.
-        caps.supportsHardLinks = false
+        caps.supportsHardLinks = true           // via ntfs_link (writable mounts)
+        // Read-only symlinks: getattr/enumerate report resolvable reparse points as symlinks
+        // and readSymbolicLink resolves them (FSKit drives readlink off the item type, not
+        // this flag — see FSVolume.h). We do NOT advertise the capability, because creation is
+        // unsupported; leaving it true would let the OS/Finder offer `ln -s` and then fail.
         caps.supportsSymbolicLinks = false
         caps.supportsPersistentObjectIDs = true
         caps.supports64BitObjectIDs = true
@@ -254,7 +255,15 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
 
-    func readSymbolicLink(_ item: FSItem) async throws -> FSFileName { throw posixError(EINVAL) }
+    func readSymbolicLink(_ item: FSItem) async throws -> FSFileName {
+        try withLock {
+            guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
+            var buf = [CChar](repeating: 0, count: 4096)
+            let rc = buf.withUnsafeMutableBufferPointer { nfsk_readlink(h, it.ino, $0.baseAddress, $0.count) }
+            if rc != 0 { throw posixError(-rc) }
+            return FSFileName(string: String(cString: buf))
+        }
+    }
 
     // MARK: create / remove / rename
     func createItem(named name: FSFileName, type: FSItem.ItemType, inDirectory directory: FSItem,
@@ -277,7 +286,14 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func createLink(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem) async throws -> FSFileName {
-        throw posixError(ENOTSUP)
+        try withLock {
+            guard let target = item as? ntfs3gItem, let dir = directory as? ntfs3gItem,
+                  let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
+            var err: Int32 = 0
+            let rc = nameStr.withCString { nfsk_link(h, target.ino, dir.ino, $0, &err) }
+            if rc != 0 { throw posixError(err) }
+            return FSFileName(string: nameStr)
+        }
     }
 
     func removeItem(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem) async throws {

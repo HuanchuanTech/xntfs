@@ -41,7 +41,15 @@ final class DiskArbitrationMonitor {
     // MARK: callback handlers
 
     fileprivate func handleAppearedOrChanged(_ disk: DADisk) {
-        guard let bsd = bsdName(disk), let dev = makeDevice(disk, bsd: bsd) else { return }
+        guard let bsd = bsdName(disk) else { return }
+        guard let dev = makeDevice(disk, bsd: bsd) else {
+            // A DA "changed" event left this device no longer matching (e.g. reformatted to a
+            // non-NTFS fs, or our module unmounted it) — drop any tracked entry so it leaves
+            // the list instead of lingering stale.
+            lock.lock(); let removed = devices.removeValue(forKey: bsd) != nil; lock.unlock()
+            if removed { publish() }
+            return
+        }
         lock.lock(); devices[bsd] = dev; lock.unlock()
         publish()
     }

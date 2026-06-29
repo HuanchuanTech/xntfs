@@ -195,6 +195,36 @@ static void test_parent_id(ntfs_fskit_volume *v) {
     nfsk_remove(v, NFSK_ROOT_INO, "t_rootfile.txt");
 }
 
+static void test_hardlink(ntfs_fskit_volume *v) {
+    printf("-- hard link: nfsk_link / nlink / remove-one-name --\n");
+    int e = 0;
+    uint64_t f = nfsk_create(v, NFSK_ROOT_INO, "t_hl.txt", NFSK_TYPE_FILE, &e);
+    CHECK(f != 0, "create t_hl.txt (ino=%llu)", U(f));
+    const char *msg = "hardlink-via-bridge";
+    nfsk_write(v, f, 0, msg, (int64_t)strlen(msg), &e);
+    int lrc = nfsk_link(v, f, NFSK_ROOT_INO, "t_hl-b.txt", &e);
+    CHECK(lrc == 0, "nfsk_link t_hl.txt -> t_hl-b.txt (rc=%d err=%d)", lrc, e);
+    uint64_t b = find_child(v, NFSK_ROOT_INO, "t_hl-b.txt");
+    CHECK(b == f, "2nd name is the same inode (%llu == %llu)", U(b), U(f));
+    nfsk_attr_t a;
+    CHECK(nfsk_getattr(v, f, &a) == 0 && a.nlink == 2, "nlink == 2 after link (got %u)", a.nlink);
+    /* Remove the first name; the inode lives on via the 2nd. Read via that name's ino. */
+    nfsk_remove(v, NFSK_ROOT_INO, "t_hl.txt");
+    char buf[64]; int re = 0;
+    int64_t n = nfsk_read(v, b, 0, buf, sizeof(buf) - 1, &re);
+    if (n > 0) buf[n] = 0; else buf[0] = 0;
+    CHECK(n == (int64_t)strlen(msg) && strcmp(buf, msg) == 0,
+          "survivor reads after unlinking 1st name (<<<%s>>>)", buf);
+    CHECK(nfsk_getattr(v, b, &a) == 0 && a.nlink == 1, "nlink == 1 after one unlink (got %u)", a.nlink);
+    /* POSIX: no hard links to directories. */
+    uint64_t d = nfsk_create(v, NFSK_ROOT_INO, "t_hl_dir", NFSK_TYPE_DIR, &e);
+    e = 0;
+    int drc = nfsk_link(v, d, NFSK_ROOT_INO, "t_hl_dir2", &e);
+    CHECK(drc != 0 && e == ENOTSUP, "hard link to a directory refused ENOTSUP (rc=%d err=%d)", drc, e);
+    nfsk_remove(v, NFSK_ROOT_INO, "t_hl-b.txt");
+    nfsk_remove(v, NFSK_ROOT_INO, "t_hl_dir");
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <writable-ntfs-image>\n"
@@ -282,6 +312,7 @@ int main(int argc, char **argv) {
     test_rename_errors(v);
     test_metadata_protection(v);
     test_parent_id(v);
+    test_hardlink(v);
 
     nfsk_sync(v);
     printf("== UNMOUNT ==\n");

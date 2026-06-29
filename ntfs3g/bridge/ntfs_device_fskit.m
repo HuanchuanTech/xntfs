@@ -39,12 +39,14 @@ static inline NFSKBackend *BK(void *backend) { return (__bridge NFSKBackend *)ba
 /* ------------------------------------------------------------------ */
 /* Backend lifecycle.                                                  */
 /* ------------------------------------------------------------------ */
-void *nfsk_backend_from_block(void *block_resource) {
+void *nfsk_backend_from_block(void *block_resource, int allow_write) {
     NFSKBackend *b = [NFSKBackend new];
     b->mode = NFSKModeBlock;
     b->block = (__bridge FSBlockDeviceResource *)block_resource;   /* strong ivar retains */
     b->fd = -1;
-    b->writable = b->block.isWritable;
+    /* Honor the caller's read-only intent at the backend: writes are gated unless the
+       operation allows writing AND the media is writable. */
+    b->writable = (allow_write && b->block.isWritable) ? YES : NO;
     return (void *)CFBridgingRetain(b);
 }
 

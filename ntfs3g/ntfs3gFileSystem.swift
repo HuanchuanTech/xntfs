@@ -121,7 +121,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
     func probeResource(resource: FSResource, replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void) {
         debugLog("probeResource resource=\(resourceTypeDescription(resource))")
         var e: Int32 = 0
-        guard let made = makeBackend(resource, out: &e) else {
+        guard let made = makeBackend(resource, allowWrite: false, out: &e) else {   // probe never writes
             debugLog("probeResource makeBackend failed errno=\(e)")
             replyHandler(.notRecognized, nil)
             return
@@ -148,7 +148,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
         debugLog("loadResource start resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
         let decision = Self.readOnlyDecision(options.taskOptions, resource: resource)
         var e: Int32 = 0
-        guard let made = makeBackend(resource, out: &e) else {
+        guard let made = makeBackend(resource, allowWrite: !decision.readOnly, out: &e) else {
             let error = posixError(e)
             containerStatus = .notReady(status: error)
             debugLog("loadResource makeBackend failed errno=\(e)")
@@ -193,18 +193,22 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
     }
 
     /// Build an I/O backend for either a block device or an image file
-    /// (`FSPathURLResource`, macOS 26+). Returns nil if the resource type is
-    /// unsupported or the backend couldn't be opened (`err` set).
-    private func makeBackend(_ resource: FSResource, out err: inout Int32) -> Backend? {
+    /// (`FSPathURLResource`, macOS 26+). `allowWrite` gates write access at the lowest
+    /// level: a probe (read-only) passes false, a load passes `!decision.readOnly`. The
+    /// backend is opened writable only when the operation allows it AND the resource itself
+    /// is writable — so a probe never holds a writable handle, and a read-only mount can't
+    /// write to the underlying file/device even if the media is writable. Returns nil if the
+    /// resource type is unsupported or the backend couldn't be opened (`err` set).
+    private func makeBackend(_ resource: FSResource, allowWrite: Bool, out err: inout Int32) -> Backend? {
         if let block = resource as? FSBlockDeviceResource {
-            guard let b = nfsk_backend_from_block(Unmanaged.passUnretained(block).toOpaque()) else {
+            guard let b = nfsk_backend_from_block(Unmanaged.passUnretained(block).toOpaque(), allowWrite ? 1 : 0) else {
                 err = ENOMEM; return nil
             }
-            return Backend(backend: b, retain: block, cleanup: {}, writable: block.isWritable)
+            return Backend(backend: b, retain: block, cleanup: {}, writable: allowWrite && block.isWritable)
         }
         if #available(macOS 26.0, *), let pathRes = resource as? FSPathURLResource {
             let url = pathRes.url
-            let writable = pathRes.isWritable
+            let writable = allowWrite && pathRes.isWritable   // O_RDONLY unless writing is allowed
             let access = url.startAccessingSecurityScopedResource()
             var e: Int32 = 0
             let b = url.path.withCString { nfsk_backend_from_file($0, writable ? 1 : 0, &e) }

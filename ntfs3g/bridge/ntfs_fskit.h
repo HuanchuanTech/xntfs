@@ -83,6 +83,7 @@ int      nfsk_readdir(ntfs_fskit_volume *v, uint64_t dir_ino, int64_t start_cook
 int64_t  nfsk_read(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, void *buf, int64_t len, int *out_errno);
 int64_t  nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const void *buf, int64_t len, int *out_errno);
 uint64_t nfsk_create(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8, uint32_t type, int *out_errno);
+int      nfsk_link(ntfs_fskit_volume *v, uint64_t target_ino, uint64_t dir_ino, const char *name_utf8, int *out_errno);
 int      nfsk_remove(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8);
 int      nfsk_truncate(ntfs_fskit_volume *v, uint64_t ino, uint64_t size);
 int      nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
@@ -97,7 +98,7 @@ int      nfsk_readlink(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t cap
  * opened image file, behind one I/O interface. Create one, pass the returned
  * opaque pointer to nfsk_mount / nfsk_probe (as the `resource` argument), and
  * release it with nfsk_backend_free after umount. */
-void *nfsk_backend_from_block(void *block_resource);              /* __bridge FSBlockDeviceResource* */
+void *nfsk_backend_from_block(void *block_resource, int allow_write);  /* __bridge FSBlockDeviceResource* */
 void *nfsk_backend_from_file(const char *path, int writable, int *out_err);
 void  nfsk_backend_free(void *backend);
 

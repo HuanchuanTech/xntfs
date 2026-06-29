@@ -33,6 +33,7 @@
 #include <ntfs-3g/ntfstime.h>
 #include <ntfs-3g/bootsect.h>
 #include <ntfs-3g/logging.h>
+#include <ntfs-3g/reparse.h>
 
 #include "ntfs_fskit.h"
 
@@ -243,8 +244,8 @@ static int nfsk_dir_contains(ntfs_volume *vol, u64 sref, uint64_t dst_dir) {
 static uint32_t map_dt(unsigned dt_type) {
     switch (dt_type) {
         case NTFS_DT_DIR:     return NFSK_TYPE_DIR;
-        /* We don't resolve symlinks/reparse points, so don't advertise them as
-           symlinks (the OS would then try, and fail, to read the link target). */
+        /* Default reparse/link entries to FILE here; bridge_filldir upgrades the ones
+           that are resolvable symlinks to SYMLINK (it has the inode to probe). */
         case NTFS_DT_LNK:     return NFSK_TYPE_FILE;
         case NTFS_DT_REPARSE: return NFSK_TYPE_FILE;
         case NTFS_DT_FIFO:    return NFSK_TYPE_FIFO;
@@ -283,6 +284,16 @@ ntfs_fskit_volume *nfsk_mount(void *resource, bool read_only, int *out_errno) {
         free(ctx);
         return NULL;
     }
+    /* ntfs_make_symlink/ntfs_get_abslink resolve an *absolute* reparse target relative to
+     * vol->abs_mnt_point (the `mnt_point` arg is ignored — it's __attribute__((unused))).
+     * ntfs_device_mount leaves abs_mnt_point NULL (only the FUSE layer sets it), so an
+     * absolute Windows symlink/junction would strlen(NULL) and crash. Anchor it at "/"
+     * (read-only literal; ntfs_get_abslink only reads it).
+     * LIMITATION: the bridge can't know the real /Volumes/<name> mount point (FSKit assigns
+     * it only after load), so an *absolute* Windows symlink/junction resolves best-effort
+     * under "/" (e.g. //target or //.NTFS-3G/...), not the true volume path. RELATIVE symlinks
+     * — the common POSIX case — are unaffected and resolve correctly. */
+    vol->abs_mnt_point = "/";
 
     ntfs_fskit_volume *w = calloc(1, sizeof(*w));
     if (!w) { if (out_errno) *out_errno = ENOMEM; ntfs_umount(vol, TRUE); free(ctx); return NULL; }
@@ -347,6 +358,19 @@ static void fill_times(nfsk_attr_t *out, ntfs_inode *ni) {
     ts = ntfs2timespec(ni->creation_time);         out->btime_sec = ts.tv_sec; out->btime_nsec = ts.tv_nsec;
 }
 
+/* A reparse point counts as a symlink for us only when ntfs_make_symlink can actually
+ * produce a target. ntfs_possible_symlink only checks the reparse tag, not the data, so a
+ * junction / corrupt reparse with a symlink-ish tag would otherwise be typed SYMLINK yet
+ * fail readlink afterwards; classifying by the real parse keeps the reported type in sync
+ * with what readSymbolicLink can resolve. */
+static int nfsk_is_readable_symlink(ntfs_inode *ni) {
+    if (!(ni->flags & FILE_ATTR_REPARSE_POINT)) return 0;
+    char *target = ntfs_make_symlink(ni, "/");
+    if (!target) return 0;
+    free(target);
+    return 1;
+}
+
 int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
     if (!v || !v->vol || !out) return -EINVAL;
     if (is_reserved_mft(to_mref(ino))) return -ENOENT;   /* metadata is not a file */
@@ -371,12 +395,22 @@ int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
         out->mode = 0777;
         if (out->nlink == 0) out->nlink = 1;
     } else if (ni->flags & FILE_ATTR_REPARSE_POINT) {
-        /* Reparse points (Windows symlinks/junctions): we can't resolve them, so
-           expose them as opaque regular files rather than unreadable symlinks. */
-        out->type = NFSK_TYPE_FILE;
-        out->size = (uint64_t)ni->data_size;
-        out->alloc_size = (uint64_t)ni->allocated_size;
-        out->mode = (ni->flags & FILE_ATTR_READONLY) ? 0444 : 0666;
+        /* Reparse points whose target actually parses are exposed as symlinks (so readlink
+           works) with the POSIX symlink size = target string length; other tags
+           (unresolvable junctions, dedup, ...) stay opaque regular files. */
+        char *target = ntfs_make_symlink(ni, "/");
+        if (target) {
+            out->type = NFSK_TYPE_SYMLINK;
+            out->size = (uint64_t)strlen(target);
+            out->alloc_size = out->size;
+            out->mode = 0777;
+            free(target);
+        } else {
+            out->type = NFSK_TYPE_FILE;
+            out->size = (uint64_t)ni->data_size;
+            out->alloc_size = (uint64_t)ni->allocated_size;
+            out->mode = (ni->flags & FILE_ATTR_READONLY) ? 0444 : 0666;
+        }
     } else {
         out->type = NFSK_TYPE_FILE;
         ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
@@ -406,7 +440,7 @@ uint64_t nfsk_lookup(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_ut
 }
 
 /* ---- Directory enumeration (robust ordinal cookies) ---- */
-struct fill_ctx { nfsk_dir_cb cb; void *ctx; int64_t skip; int64_t count; int stopped; };
+struct fill_ctx { ntfs_volume *vol; nfsk_dir_cb cb; void *ctx; int64_t skip; int64_t count; int stopped; };
 
 static int bridge_filldir(void *dirent, const ntfschar *name, const int name_len,
                           const int name_type, const s64 pos, const MFT_REF mref,
@@ -427,6 +461,15 @@ static int bridge_filldir(void *dirent, const ntfschar *name, const int name_len
     if (ordinal < fc->skip) { free(u); return 0; }
 
     uint32_t type = map_dt(dt_type);
+    if (dt_type == NTFS_DT_REPARSE || dt_type == NTFS_DT_LNK) {
+        /* Match getattr: a resolvable symlink lists as SYMLINK so FSKit offers readlink. */
+        ntfs_inode *eni = ntfs_inode_open(fc->vol, mref);
+        if (eni) {
+            if (nfsk_is_readable_symlink(eni))
+                type = NFSK_TYPE_SYMLINK;
+            ntfs_inode_close(eni);
+        }
+    }
     uint64_t ino = from_mft(MREF(mref));
     int r = fc->cb(fc->ctx, u, ino, type, ordinal + 1);
     free(u);
@@ -439,7 +482,7 @@ int nfsk_readdir(ntfs_fskit_volume *v, uint64_t dir_ino, int64_t start_cookie, v
     ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) return -errno;
 
-    struct fill_ctx fc = { cb, ctx, start_cookie < 0 ? 0 : start_cookie, 0, 0 };
+    struct fill_ctx fc = { v->vol, cb, ctx, start_cookie < 0 ? 0 : start_cookie, 0, 0 };
     s64 pos = 0;
     errno = 0;
     int rc = ntfs_readdir(dir, &pos, &fc, bridge_filldir);
@@ -776,7 +819,49 @@ out:
     return rc ? -e : 0;
 }
 
+/* Hard link: add `name` in dir_ino as another name for inode `target_ino`. NTFS keeps
+ * a link count + multiple FILE_NAME attributes, so this is a thin wrapper over ntfs_link
+ * (the bridge is inode-keyed — no path map to update). Directories can't be hard-linked. */
+int nfsk_link(ntfs_fskit_volume *v, uint64_t target_ino, uint64_t dir_ino,
+              const char *name_utf8, int *out_errno) {
+    if (!v || !v->vol || !name_utf8) { if (out_errno) *out_errno = EINVAL; return -1; }
+    if (v->read_only) { if (out_errno) *out_errno = EROFS; return -1; }
+    if (is_reserved_mft(to_mref(target_ino)) || is_reserved_mft(to_mref(dir_ino))) {
+        if (out_errno) *out_errno = EPERM; return -1;
+    }
+    int isdir = nfsk_isdir(v->vol, to_mref(target_ino), NULL);
+    if (isdir < 0) { if (out_errno) *out_errno = errno ? errno : EIO; return -1; }
+    /* FSKit expects ENOTSUP when hard links aren't supported for the object's type (a dir). */
+    if (isdir)     { if (out_errno) *out_errno = ENOTSUP; return -1; }
+
+    ntfschar *uname = NULL;
+    int ulen = ntfs_mbstoucs(name_utf8, &uname);
+    if (ulen < 0) { if (out_errno) *out_errno = errno; return -1; }
+    int r = nfsk_link_name(v->vol, dir_ino, to_mref(target_ino), uname, ulen);
+    int e = errno;
+    free(uname);
+    if (r) { if (out_errno) *out_errno = e ? e : EIO; return -1; }
+    return 0;
+}
+
 int nfsk_readlink(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t cap) {
-    (void)v; (void)ino; (void)buf; (void)cap;
-    return -EINVAL;   /* symlink/reparse resolution not yet implemented */
+    if (!v || !v->vol || !buf || cap == 0) return -EINVAL;
+    if (is_reserved_mft(to_mref(ino))) return -EINVAL;
+    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    if (!ni) return -errno;
+    if (!(ni->flags & FILE_ATTR_REPARSE_POINT) || !ntfs_possible_symlink(ni)) {
+        ntfs_inode_close(ni);
+        return -EINVAL;   /* not a symlink we can resolve */
+    }
+    /* "/" mount point: a Windows *absolute* target is rewritten relative to the mount
+       root (best effort); relative targets — the common POSIX case — pass through as-is. */
+    char *target = ntfs_make_symlink(ni, "/");
+    int saved = errno;
+    ntfs_inode_close(ni);
+    if (!target) return -(saved ? saved : EINVAL);
+    size_t tlen = strlen(target);
+    if (tlen >= cap) { free(target); return -ENAMETOOLONG; }   /* don't silently truncate the target */
+    memcpy(buf, target, tlen + 1);
+    free(target);
+    return 0;
 }
