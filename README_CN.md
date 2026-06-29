@@ -2,6 +2,8 @@
 
 > 📖 English version: [English](README.md)
 
+<a href="https://apps.apple.com/app/xntfs/id6782636021"><img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/zh-cn?size=250x83" alt="在 App Store 下载 xntfs" height="44"></a>
+
 一个 macOS 应用 + **FSKit 文件系统扩展**,使用 [ntfs-3g](https://github.com/tuxera/ntfs-3g)
 引擎读写 NTFS 卷。无需内核扩展,无需 macFUSE。
 
