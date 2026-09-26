@@ -59,7 +59,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         self.onContainerStatusChange = onContainerStatusChange
         self.rootItem = root
 
-        let vid = FSVolume.Identifier(uuid: NTFSVolumeSupport.stableUUID(label: volName, sizeBytes: totalBytes))
+        let vid = FSVolume.Identifier(uuid: NTFSVolumeSupport.volumeUUID(serial: st.volume_serial, label: volName, sizeBytes: totalBytes))
         super.init(volumeID: vid, volumeName: FSFileName(string: volName))
         self.items[NFSK_ROOT_INO] = root
     }
@@ -141,7 +141,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         caps.supports64BitObjectIDs = true
         caps.supports2TBFiles = true
         caps.supportsSparseFiles = true
-        caps.supportsHiddenFiles = true
+        caps.supportsHiddenFiles = false        // getattr never reports UF_HIDDEN and setAttributes ignores .flags
         caps.caseFormat = .insensitiveCasePreserving
         return caps
     }
@@ -215,9 +215,11 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem) async throws -> FSItem.Attributes {
         try withLock {
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
+            var consumed: FSItem.Attribute = []
             if newAttributes.isValid(.size) {
                 let rc = nfsk_truncate(h, it.ino, newAttributes.size)
                 if rc != 0 { throw posixError(-rc) }
+                consumed.insert(.size)
             }
             let wantM = newAttributes.isValid(.modifyTime)
             let wantA = newAttributes.isValid(.accessTime)
@@ -228,7 +230,12 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
                                         wantM ? Int64(m.tv_sec) : Int64.min, Int64(m.tv_nsec),
                                         wantA ? Int64(a.tv_sec) : Int64.min, Int64(a.tv_nsec))
                 if rc != 0 { throw posixError(-rc) }
+                if wantM { consumed.insert(.modifyTime) }
+                if wantA { consumed.insert(.accessTime) }
             }
+            // Report which attributes we actually applied: FSKit calls wasAttributeConsumed()
+            // on the request and treats anything not in consumedAttributes as not-honored.
+            newAttributes.consumedAttributes = consumed
             var a = nfsk_attr_t()
             let rc = nfsk_getattr(h, it.ino, &a)
             if rc != 0 { throw posixError(-rc) }
@@ -454,6 +461,24 @@ let enumTrampoline: @convention(c)
 // MARK: - Shared helpers
 
 enum NTFSVolumeSupport {
+    /// The volume's identity UUID: derived from the durable 64-bit NTFS boot-sector
+    /// serial when present, else a synthesized label+size fallback. The serial is immutable,
+    /// so identity survives relabels and stays distinct between independently-formatted
+    /// same-label/same-size volumes. (A block-level clone copies the serial, so clones share
+    /// identity.) Mirrors xlinuxfs's native-fs-UUID approach.
+    static func volumeUUID(serial: UInt64, label: String, sizeBytes: UInt64) -> UUID {
+        guard serial != 0 else { return stableUUID(label: label, sizeBytes: sizeBytes) }
+        var u = [UInt8](repeating: 0, count: 16)
+        for i in 0..<8 {
+            let byte = UInt8(truncatingIfNeeded: serial >> (8 * UInt64(i)))
+            u[i] = byte
+            u[8 + i] = byte ^ 0x4E          // 'N' — deterministic high half
+        }
+        u[6] = (u[6] & 0x0F) | 0x40         // version-4 shape
+        u[8] = (u[8] & 0x3F) | 0x80         // variant
+        return UUID(uuid: (u[0],u[1],u[2],u[3],u[4],u[5],u[6],u[7],u[8],u[9],u[10],u[11],u[12],u[13],u[14],u[15]))
+    }
+
     static func stableUUID(label: String, sizeBytes: UInt64) -> UUID {
         var bytes = Array("NTFS-3G:\(label):\(sizeBytes)".utf8)
         var u = [UInt8](repeating: 0, count: 16)

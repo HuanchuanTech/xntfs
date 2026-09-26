@@ -127,7 +127,8 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             return
         }
         var nameBuf = [CChar](repeating: 0, count: 260)
-        let recognized = nameBuf.withUnsafeMutableBufferPointer { nfsk_probe(made.backend, $0.baseAddress, $0.count) }
+        var serial: UInt64 = 0
+        let recognized = nameBuf.withUnsafeMutableBufferPointer { nfsk_probe(made.backend, $0.baseAddress, $0.count, &serial) }
         let totalBytes = nfsk_block_total_bytes(made.backend)
         made.cleanup()
         nfsk_backend_free(made.backend)
@@ -137,7 +138,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             return
         }
         let label = String(cString: nameBuf)
-        let uuid = NTFSVolumeSupport.stableUUID(label: label, sizeBytes: totalBytes)
+        let uuid = NTFSVolumeSupport.volumeUUID(serial: serial, label: label, sizeBytes: totalBytes)
         let container = FSContainerIdentifier(uuid: uuid)
         debugLog("probeResource usable label=\(label) totalBytes=\(totalBytes) uuid=\(uuid.uuidString)")
         replyHandler(.usable(name: label, containerID: container), nil)

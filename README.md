@@ -26,7 +26,7 @@ xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
         ntfs3gVolume.swift      every FSVolume operation → nfsk_* bridge
         bridge/ntfs_fskit.c     libntfs logic (mount, getattr, readdir, read, write, create…)
         bridge/ntfs_device_fskit.m  block I/O over FSBlockDeviceResource (sector-aligned RMW)
-        + libntfs-3g.a (arm64, statically linked)
+        + libntfs-3g.a (arm64 + x86_64, statically linked)
 ```
 
 ## Status
@@ -70,22 +70,18 @@ depends on code-signing/provisioning that's tied to your Apple Developer account
 
 The repo is a normal Xcode project — open `xntfs.xcodeproj` and build the `xntfs` scheme.
 Build settings for the extension (bridging header, `libntfs-3g.a` link, header search paths,
-`HAVE_CONFIG_H`, arm64) and the app (entitlements, zh-Hans region) are already committed; they
+`HAVE_CONFIG_H`) and the app (entitlements, zh-Hans region) are already committed; they
 were applied with `scripts/wire_project.rb` (re-runnable, idempotent, needs the `xcodeproj` gem).
 
-`libntfs-3g.a` is prebuilt at `ntfs-3g/libntfs-3g/.libs/`. To rebuild it (arm64):
+Before building in Xcode, generate the universal static library and shared `config.h`
+(requires Autotools and GNU libtool):
 ```sh
-cd ntfs-3g
-glibtoolize --force --copy --install
-LIBTOOLIZE=glibtoolize autoreconf -fi -I m4
-./configure --disable-shared --enable-static --disable-ntfs-3g --disable-ntfsprogs \
-            --disable-crypto --disable-nls \
-            CC=clang CFLAGS="-arch arm64 -isysroot $(xcrun --show-sdk-path) -mmacosx-version-min=13.0 -O2"
-make -C libntfs-3g
+./scripts/build-libntfs.sh
+lipo -archs build/libntfs-universal/libntfs-3g.a
 ```
-> Currently **arm64 only** (that's what `libntfs-3g.a` is built for; the `ntfs3g` target is
-> pinned to `arm64`). For Intel/universal, build libntfs-3g for `x86_64` too and `lipo` them,
-> then drop the `ARCHS=arm64` pin.
+The script builds arm64 and x86_64 separately, then combines them under
+`build/libntfs-universal/`. That directory is ignored by Git; run the script again after a clean
+checkout or when updating the ntfs-3g submodule.
 
 ## Provisioning (required to actually run the extension)
 

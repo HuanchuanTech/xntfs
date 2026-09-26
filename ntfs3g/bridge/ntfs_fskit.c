@@ -268,6 +268,20 @@ static struct ntfs_device *make_device(void *resource, nfsk_devctx **out_ctx) {
     return dev;
 }
 
+/* The durable NTFS volume serial: a 64-bit value in the boot sector at offset 0x48
+ * (le64). ntfs-3g treats it as "Irrelevant" and doesn't cache it, so read it straight
+ * from the backend. Used to give the volume a stable identity instead of a weak label+size
+ * hash: the serial is immutable, so identity survives relabels and stays distinct between
+ * independently-formatted same-label/same-size volumes. (A block-level clone copies the
+ * serial, so clones intentionally share identity — inherent to any on-disk id.) */
+static uint64_t read_boot_serial(void *resource) {
+    unsigned char b[8];
+    if (nfsk_block_pread(resource, b, 0x48, (int64_t)sizeof b) != (int64_t)sizeof b) return 0;
+    uint64_t s = 0;
+    for (int i = 0; i < 8; i++) s |= (uint64_t)b[i] << (8 * i);
+    return s;
+}
+
 /* ---- Lifecycle ---- */
 ntfs_fskit_volume *nfsk_mount(void *resource, bool read_only, int *out_errno) {
     nfsk_devctx *ctx = NULL;
@@ -303,7 +317,7 @@ ntfs_fskit_volume *nfsk_mount(void *resource, bool read_only, int *out_errno) {
     return w;
 }
 
-int nfsk_probe(void *resource, char *name_out, size_t name_cap) {
+int nfsk_probe(void *resource, char *name_out, size_t name_cap, uint64_t *serial_out) {
     nfsk_devctx *ctx = NULL;
     struct ntfs_device *dev = make_device(resource, &ctx);
     if (!dev) return 0;
@@ -314,6 +328,8 @@ int nfsk_probe(void *resource, char *name_out, size_t name_cap) {
         if (vol->vol_name) { strncpy(name_out, vol->vol_name, name_cap - 1); name_out[name_cap - 1] = '\0'; }
     }
     ntfs_umount(vol, TRUE);
+    /* Read the serial after umount so only this code touches the backend. */
+    if (serial_out) *serial_out = read_boot_serial(resource);
     free(ctx);
     return 1;
 }
@@ -346,6 +362,7 @@ int nfsk_statfs(ntfs_fskit_volume *v, nfsk_statfs_t *out) {
     out->read_only = v->read_only ? 1 : 0;
     if (vol->vol_name) { strncpy(out->volume_name, vol->vol_name, sizeof(out->volume_name) - 1);
                          out->volume_name[sizeof(out->volume_name) - 1] = '\0'; }
+    out->volume_serial = v->devctx ? read_boot_serial(v->devctx->resource) : 0;
     return 0;
 }
 

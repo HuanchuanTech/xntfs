@@ -46,6 +46,7 @@ typedef struct {
     uint64_t free_clusters;
     uint64_t total_files;
     uint64_t free_files;
+    uint64_t volume_serial;      /* NTFS 64-bit boot-sector serial; 0 if unreadable */
     uint8_t  read_only;
     char     volume_name[260];   /* UTF-8, NUL-terminated */
 } nfsk_statfs_t;
@@ -71,7 +72,7 @@ typedef int (*nfsk_dir_cb)(void *ctx, const char *name_utf8,
 
 /* --- lifecycle --- */
 ntfs_fskit_volume *nfsk_mount(void *resource, bool read_only, int *out_errno);
-int  nfsk_probe(void *resource, char *name_out, size_t name_cap);
+int  nfsk_probe(void *resource, char *name_out, size_t name_cap, uint64_t *serial_out);
 void nfsk_umount(ntfs_fskit_volume *v);
 int  nfsk_sync(ntfs_fskit_volume *v);
 int  nfsk_statfs(ntfs_fskit_volume *v, nfsk_statfs_t *out);

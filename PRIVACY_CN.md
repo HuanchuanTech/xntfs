@@ -68,7 +68,6 @@ xntfs 是一个通用工具，不会有意收集儿童数据。
 源代码可在这里查看：
 
 https://github.com/HuanchuanTech/xntfs
-
 ## 政策更新
 
 如果应用功能发生变化，我们可能会更新这份隐私政策。最新版本会随应用和项目仓库一起发布。
@@ -78,4 +77,3 @@ https://github.com/HuanchuanTech/xntfs
 如果你有隐私相关问题或请求，请通过项目仓库联系：
 
 https://github.com/HuanchuanTech/xntfs
-

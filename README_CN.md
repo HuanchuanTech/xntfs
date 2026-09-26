@@ -25,7 +25,7 @@ xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
         ntfs3gVolume.swift      每个 FSVolume 操作 → nfsk_* 桥接
         bridge/ntfs_fskit.c     libntfs 逻辑(mount、getattr、readdir、read、write、create…)
         bridge/ntfs_device_fskit.m  基于 FSBlockDeviceResource 的块 I/O(按扇区对齐的 RMW)
-        + libntfs-3g.a(arm64,静态链接)
+        + libntfs-3g.a(arm64 + x86_64,静态链接)
 ```
 
 ## 状态
@@ -64,23 +64,17 @@ NTFS 引擎本身已独立验证正确(挂载 / 枚举 / 读 / 写 / 创建,并�
 ## 构建
 
 这是个普通的 Xcode 工程——打开 `xntfs.xcodeproj`,构建 `xntfs` scheme。扩展的构建设置
-(桥接头、`libntfs-3g.a` 链接、头搜索路径、`HAVE_CONFIG_H`、arm64)与应用的构建设置
+(桥接头、`libntfs-3g.a` 链接、头搜索路径、`HAVE_CONFIG_H`)与应用的构建设置
 (权限、zh-Hans 区域)都已提交;它们由 `scripts/wire_project.rb` 应用(可重复运行、幂等,
 需要 `xcodeproj` gem)。
 
-`libntfs-3g.a` 已预构建于 `ntfs-3g/libntfs-3g/.libs/`。要重新构建(arm64):
+在 Xcode 中构建前,先生成通用静态库和共享的 `config.h`(需要 Autotools 和 GNU libtool):
 ```sh
-cd ntfs-3g
-glibtoolize --force --copy --install
-LIBTOOLIZE=glibtoolize autoreconf -fi -I m4
-./configure --disable-shared --enable-static --disable-ntfs-3g --disable-ntfsprogs \
-            --disable-crypto --disable-nls \
-            CC=clang CFLAGS="-arch arm64 -isysroot $(xcrun --show-sdk-path) -mmacosx-version-min=13.0 -O2"
-make -C libntfs-3g
+./scripts/build-libntfs.sh
+lipo -archs build/libntfs-universal/libntfs-3g.a
 ```
-> 目前**仅 arm64**(`libntfs-3g.a` 就是按这个架构构建的;`ntfs3g` target 也固定为
-> `arm64`)。要支持 Intel/通用二进制,需另外为 `x86_64` 构建 libntfs-3g 并用 `lipo`
-> 合并,再去掉 `ARCHS=arm64` 的固定。
+脚本分别构建 arm64 和 x86_64,再合并到 `build/libntfs-universal/`。该目录不提交到 Git;
+全新检出或更新 ntfs-3g 子模块后需要重新运行脚本。
 
 ## 配置签名(实际运行扩展所必需)
 

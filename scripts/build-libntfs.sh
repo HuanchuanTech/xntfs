@@ -1,26 +1,81 @@
-#!/bin/sh
-# Build libntfs-3g.a (static, arm64 macOS) for the FSKit extension.
-#
-# Run this ON macOS — it uses xcrun + clang to produce an arm64 Mach-O archive.
-# (Do NOT run it in a Linux container; you'd get a Linux ELF .a that won't link.)
-#
-# ntfs-3g/ is a pristine git submodule (tuxera/ntfs-3g, tag 2026.2.25). The
-# upstream tree has no m4/libgcrypt.m4, so we drop in our no-op stub before
-# autoreconf to resolve AM_PATH_LIBGCRYPT. We build --disable-crypto, so the
-# real libgcrypt is never used.
-set -e
+#!/bin/bash
+# Build a universal macOS libntfs-3g archive for the FSKit extension.
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT/ntfs-3g"
+SOURCE="$ROOT/ntfs-3g"
+OUTPUT="$ROOT/build/libntfs-universal"
 
-cp "$ROOT/scripts/ntfs3g/libgcrypt.m4" m4/libgcrypt.m4
+if ! git -C "$SOURCE" diff --quiet || ! git -C "$SOURCE" diff --cached --quiet; then
+  echo 'ntfs-3g has tracked changes; the clean source copy would omit them.' >&2
+  exit 1
+fi
 
-glibtoolize --force --copy --install
-LIBTOOLIZE=glibtoolize autoreconf -fi -I m4
-./configure --disable-shared --enable-static \
-  --disable-ntfs-3g --disable-ntfsprogs --disable-crypto --disable-nls \
-  CC=clang \
-  CFLAGS="-arch arm64 -isysroot $(xcrun --show-sdk-path) -mmacosx-version-min=13.0 -O2"
-make -C libntfs-3g
+mkdir -p "$ROOT/_tmp"
+WORK="$(mktemp -d "$ROOT/_tmp/libntfs-build.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/source"
 
-echo "Built: $ROOT/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a"
+git -C "$SOURCE" archive HEAD | tar -xf - -C "$WORK/source"
+cp "$ROOT/scripts/ntfs3g/libgcrypt.m4" "$WORK/source/m4/libgcrypt.m4"
+(
+  cd "$WORK/source"
+  glibtoolize --force --copy --install
+  LIBTOOLIZE=glibtoolize autoreconf -fi -I m4
+)
+
+SDK="$(xcrun --sdk macosx --show-sdk-path)"
+BUILD_TRIPLET="$("$WORK/source/config.guess")"
+NATIVE_ARCH="$(uname -m)"
+if [[ "$NATIVE_ARCH" == aarch64 ]]; then
+  NATIVE_ARCH=arm64
+fi
+for ARCH in arm64 x86_64; do
+  case "$ARCH" in
+    arm64) HOST_TRIPLET=aarch64-apple-darwin ;;
+    x86_64) HOST_TRIPLET=x86_64-apple-darwin ;;
+  esac
+  CONFIGURE_CACHE=(CC=clang)
+  if [[ "$ARCH" == "$NATIVE_ARCH" ]]; then
+    HOST_TRIPLET="$BUILD_TRIPLET"
+  else
+    # These runtime checks default to incorrect guesses during a cross-build.
+    CONFIGURE_CACHE+=(
+      ac_cv_func_memcmp_working=yes
+      ac_cv_func_lstat_dereferences_slashed_symlink=yes
+      ac_cv_func_stat_empty_string_bug=no
+    )
+  fi
+  mkdir -p "$WORK/$ARCH"
+  (
+    cd "$WORK/$ARCH"
+    env "${CONFIGURE_CACHE[@]}" \
+      CFLAGS="-arch $ARCH -isysroot $SDK -mmacosx-version-min=15.4 -O2" \
+      "$WORK/source/configure" \
+        --build="$BUILD_TRIPLET" --host="$HOST_TRIPLET" \
+        --disable-shared --enable-static \
+        --disable-ntfs-3g --disable-ntfsprogs --disable-crypto --disable-nls
+    make -C libntfs-3g
+  )
+done
+
+if ! cmp -s "$WORK/arm64/config.h" "$WORK/x86_64/config.h"; then
+  echo 'The two architectures produced different config.h files; refusing to publish one shared header.' >&2
+  diff -u "$WORK/arm64/config.h" "$WORK/x86_64/config.h" >&2 || true
+  exit 1
+fi
+
+lipo -create \
+  "$WORK/arm64/libntfs-3g/.libs/libntfs-3g.a" \
+  "$WORK/x86_64/libntfs-3g/.libs/libntfs-3g.a" \
+  -output "$WORK/libntfs-3g.a"
+lipo "$WORK/libntfs-3g.a" -verify_arch arm64
+lipo "$WORK/libntfs-3g.a" -verify_arch x86_64
+
+mkdir -p "$OUTPUT"
+cp "$WORK/arm64/config.h" "$OUTPUT/config.h.tmp.$$"
+cp "$WORK/libntfs-3g.a" "$OUTPUT/libntfs-3g.a.tmp.$$"
+mv "$OUTPUT/config.h.tmp.$$" "$OUTPUT/config.h"
+mv "$OUTPUT/libntfs-3g.a.tmp.$$" "$OUTPUT/libntfs-3g.a"
+
+echo "Built: $OUTPUT/libntfs-3g.a ($(lipo -archs "$OUTPUT/libntfs-3g.a"))"

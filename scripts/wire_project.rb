@@ -20,12 +20,15 @@ ext.build_configurations.each do |cfg|
   s['SWIFT_OBJC_BRIDGING_HEADER'] = 'ntfs3g/ntfs3g-Bridging-Header.h'
   s['SWIFT_VERSION'] = '5.0'
   s['CLANG_ENABLE_MODULES'] = 'YES'
-  # libntfs-3g.a is built for arm64 only; constrain the extension accordingly.
-  s['ARCHS'] = 'arm64'
-  s['VALID_ARCHS'] = 'arm64'
+  s.delete('ARCHS')
+  s.delete('VALID_ARCHS')
   merge(s, 'HEADER_SEARCH_PATHS', ['$(SRCROOT)/ntfs-3g', '$(SRCROOT)/ntfs-3g/include'])
+  generated_headers = '$(SRCROOT)/build/libntfs-universal'
+  s['HEADER_SEARCH_PATHS'] = [generated_headers] + Array(s['HEADER_SEARCH_PATHS']).reject { |path| path == generated_headers }
   merge(s, 'GCC_PREPROCESSOR_DEFINITIONS', ['HAVE_CONFIG_H=1'])
-  merge(s, 'OTHER_LDFLAGS', ['$(SRCROOT)/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a', '-framework', 'CoreFoundation'])
+  old_library = '$(SRCROOT)/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a'
+  s['OTHER_LDFLAGS'] = Array(s['OTHER_LDFLAGS']).reject { |flag| flag == old_library }
+  merge(s, 'OTHER_LDFLAGS', ['$(SRCROOT)/build/libntfs-universal/libntfs-3g.a', '-framework', 'CoreFoundation'])
 end
 
 app = proj.targets.find { |t| t.name == 'xntfs' }

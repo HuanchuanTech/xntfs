@@ -68,7 +68,6 @@ xntfs is a general-purpose utility and does not knowingly collect data from chil
 The source code is available at:
 
 https://github.com/HuanchuanTech/xntfs
-
 ## Changes
 
 We may update this policy when the app changes. The latest version will be published with the app and in the project repository.
@@ -78,4 +77,3 @@ We may update this policy when the app changes. The latest version will be publi
 For questions or privacy-related requests, please use the project repository:
 
 https://github.com/HuanchuanTech/xntfs
-
