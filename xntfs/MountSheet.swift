@@ -22,7 +22,7 @@ struct MountSheet: View {
             Text("Mounts under /Volumes.").font(.callout).foregroundStyle(.secondary)
 
             Toggle("Mount read-only", isOn: $readOnly)
-                .disabled(!device.mediaWritable)
+                .disabled(busy || !device.mediaWritable)
             if !device.mediaWritable {
                 Text("This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -39,13 +39,16 @@ struct MountSheet: View {
             HStack {
                 Spacer()
                 Button("Close") { dismiss() }
+                    .disabled(busy)
                 Button("Mount") { Task { await doMount() } }
                     .keyboardShortcut(.defaultAction)
                     .disabled(busy)
             }
         }
         .padding(20)
-        .frame(width: 520, height: errorText == nil ? 230 : 320)
+        .frame(width: 520)
+        .frame(minHeight: errorText == nil ? 230 : 320)
+        .interactiveDismissDisabled(busy)
         .onAppear {
             readOnly = !device.mediaWritable ? true
                 : (device.kind == .diskImage ? model.settings.imageReadOnly : model.settings.deviceReadOnly)
@@ -53,6 +56,8 @@ struct MountSheet: View {
     }
 
     private func doMount() async {
+        guard !busy else { return }
+        errorText = nil
         busy = true
         defer { busy = false }
         switch await model.mount(device, readOnly: readOnly) {

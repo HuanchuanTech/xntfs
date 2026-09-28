@@ -14,30 +14,37 @@ func posixError(_ code: Int32) -> NSError {
     NSError(domain: NSPOSIXErrorDomain, code: Int(code == 0 ? EIO : code))
 }
 
+struct NTFSBackend {
+    let backend: UnsafeMutableRawPointer
+    let retain: AnyObject?
+    let cleanup: () -> Void
+    let writable: Bool
+}
+
 @available(macOS 15.4, *)
 final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperations,
                           FSVolume.ReadWriteOperations, FSVolume.OpenCloseOperations {
 
     private var handle: OpaquePointer?
-    private var backend: UnsafeMutableRawPointer?
-    private let resourceRetain: AnyObject?       // keeps the FSResource alive
-    private let onTeardown: () -> Void           // e.g. stop security-scoped access
+    private var backend: NTFSBackend?
+    private let activationBackend: ([String], Bool) throws -> NTFSBackend?
     private let onContainerStatusChange: (FSContainerStatus) -> Void
     private var tornDown = false
-    private let readOnly: Bool
+    private var readOnly: Bool
+    private var activated = false
     private let lock = NSLock()
     private var items: [UInt64: ntfs3gItem] = [:]
     private let rootItem: ntfs3gItem
 
     /// `backend` comes from `nfsk_backend_from_block` / `nfsk_backend_from_file`.
     /// Ownership of `backend` transfers to this volume (freed in `teardown`).
-    init(backend: UnsafeMutableRawPointer, readOnly ro: Bool,
-         resourceRetain: AnyObject?, onTeardown: @escaping () -> Void,
+    init(backend: NTFSBackend,
+         activationBackend: @escaping ([String], Bool) throws -> NTFSBackend?,
          onContainerStatusChange: @escaping (FSContainerStatus) -> Void) throws {
         var err: Int32 = 0
-        guard let h = nfsk_mount(backend, ro, &err) else {
-            onTeardown()
-            nfsk_backend_free(backend)
+        guard let h = nfsk_mount(backend.backend, !backend.writable, &err) else {
+            backend.cleanup()
+            nfsk_backend_free(backend.backend)
             throw posixError(err)
         }
         var st = nfsk_statfs_t()
@@ -53,9 +60,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
         self.handle = h
         self.backend = backend
-        self.readOnly = ro
-        self.resourceRetain = resourceRetain
-        self.onTeardown = onTeardown
+        self.readOnly = !backend.writable
+        self.activationBackend = activationBackend
         self.onContainerStatusChange = onContainerStatusChange
         self.rootItem = root
 
@@ -69,9 +75,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
             if tornDown { return }
             tornDown = true
             if let h = handle { nfsk_umount(h); handle = nil }
-            if let b = backend { nfsk_backend_free(b); backend = nil }
+            if let b = backend { nfsk_backend_free(b.backend); b.cleanup(); backend = nil }
             items.removeAll()
-            onTeardown()
         }
     }
 
@@ -170,17 +175,34 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     @available(macOS 26.4, *)
     var requestedMountOptions: FSVolume.MountOptions {
-        get { readOnly ? [.readOnly] : [] }
+        get { withLock { readOnly ? [.readOnly] : [] } }
         set { }
     }
 
     // MARK: lifecycle
     func activate(options: FSTaskOptions) async throws -> FSItem {
+        try withLock {
+            guard !tornDown, handle != nil else { throw posixError(ENXIO) }
+            guard !activated else { throw posixError(EBUSY) }
+            // Disk Arbitration supplies ro/rw here, after loadResource. Reopen before
+            // exposing any items; loading metadata itself must never require writes.
+            if let replacement = try activationBackend(options.taskOptions, readOnly) {
+                if let h = handle { nfsk_umount(h); handle = nil }
+                if let b = backend { nfsk_backend_free(b.backend); b.cleanup() }
+                backend = replacement
+                readOnly = !replacement.writable
+                var err: Int32 = 0
+                guard let h = nfsk_mount(replacement.backend, readOnly, &err) else { throw posixError(err) }
+                handle = h
+            }
+            activated = true
+        }
         onContainerStatusChange(.active)
         return rootItem
     }
 
     func deactivate(options: FSDeactivateOptions = []) async throws {
+        withLock { activated = false }
         onContainerStatusChange(.ready)
     }
 

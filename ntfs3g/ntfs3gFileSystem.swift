@@ -121,7 +121,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
     func probeResource(resource: FSResource, replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void) {
         debugLog("probeResource resource=\(resourceTypeDescription(resource))")
         var e: Int32 = 0
-        guard let made = makeBackend(resource, allowWrite: false, out: &e) else {   // probe never writes
+        guard let made = Self.makeBackend(resource, allowWrite: false, out: &e) else {   // probe never writes
             debugLog("probeResource makeBackend failed errno=\(e)")
             replyHandler(.notRecognized, nil)
             return
@@ -149,7 +149,9 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
         debugLog("loadResource start resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
         let decision = Self.readOnlyDecision(options.taskOptions, resource: resource)
         var e: Int32 = 0
-        guard let made = makeBackend(resource, allowWrite: !decision.readOnly, out: &e) else {
+        // Block-device mount options arrive at activate, not load. Inspect metadata
+        // read-only first, including when the user's default is read/write.
+        guard let made = Self.makeBackend(resource, allowWrite: false, out: &e) else {
             let error = posixError(e)
             containerStatus = .notReady(status: error)
             debugLog("loadResource makeBackend failed errno=\(e)")
@@ -159,16 +161,24 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
         do {
             // ntfs3gVolume takes ownership of the backend; on failure its init frees
             // the backend and runs cleanup itself.
-            let vol = try ntfs3gVolume(backend: made.backend,
-                                       readOnly: decision.readOnly || !made.writable,
-                                       resourceRetain: made.retain,
-                                       onTeardown: made.cleanup,
+            let vol = try ntfs3gVolume(backend: made,
+                                       activationBackend: { activationOptions, currentReadOnly in
+                                           let explicitOptions = options.taskOptions + activationOptions
+                                           let readOnly = Self.requestsReadOnly(explicitOptions) ? true
+                                               : Self.requestsReadWrite(explicitOptions) ? false : decision.readOnly
+                                           guard readOnly != currentReadOnly else { return nil }
+                                           var error: Int32 = 0
+                                           guard let backend = Self.makeBackend(resource, allowWrite: !readOnly, out: &error) else {
+                                               throw posixError(error)
+                                           }
+                                           return backend
+                                       },
                                        onContainerStatusChange: { [weak self] status in
                                            self?.containerStatus = status
                                        })
             self.volume = vol
             containerStatus = .ready
-            debugLog("loadResource success name=\(vol.name.string ?? "") uuid=\(vol.volumeID.uuid.uuidString) readOnly=\(decision.readOnly || !made.writable) decisionSource=\(decision.source) isImage=\(decision.isImage) key=\(decision.key ?? "none") storedPreference=\(String(describing: decision.storedPreference)) backendWritable=\(made.writable)")
+            debugLog("loadResource success name=\(vol.name.string ?? "") uuid=\(vol.volumeID.uuid.uuidString) initialReadOnly=true defaultReadOnly=\(decision.readOnly) decisionSource=\(decision.source) isImage=\(decision.isImage) key=\(decision.key ?? "none") storedPreference=\(String(describing: decision.storedPreference))")
             replyHandler(vol, nil)
         } catch {
             containerStatus = .notReady(status: error as NSError)
@@ -186,26 +196,19 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
 
     // MARK: backend construction
 
-    private struct Backend {
-        let backend: UnsafeMutableRawPointer
-        let retain: AnyObject?
-        let cleanup: () -> Void
-        let writable: Bool
-    }
-
     /// Build an I/O backend for either a block device or an image file
     /// (`FSPathURLResource`, macOS 26+). `allowWrite` gates write access at the lowest
-    /// level: a probe (read-only) passes false, a load passes `!decision.readOnly`. The
+    /// level: probe/load pass false, activation passes the resolved write policy. The
     /// backend is opened writable only when the operation allows it AND the resource itself
     /// is writable — so a probe never holds a writable handle, and a read-only mount can't
     /// write to the underlying file/device even if the media is writable. Returns nil if the
     /// resource type is unsupported or the backend couldn't be opened (`err` set).
-    private func makeBackend(_ resource: FSResource, allowWrite: Bool, out err: inout Int32) -> Backend? {
+    private static func makeBackend(_ resource: FSResource, allowWrite: Bool, out err: inout Int32) -> NTFSBackend? {
         if let block = resource as? FSBlockDeviceResource {
             guard let b = nfsk_backend_from_block(Unmanaged.passUnretained(block).toOpaque(), allowWrite ? 1 : 0) else {
                 err = ENOMEM; return nil
             }
-            return Backend(backend: b, retain: block, cleanup: {}, writable: allowWrite && block.isWritable)
+            return NTFSBackend(backend: b, retain: block, cleanup: {}, writable: allowWrite && block.isWritable)
         }
         if #available(macOS 26.0, *), let pathRes = resource as? FSPathURLResource {
             let url = pathRes.url
@@ -217,7 +220,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                 if access { url.stopAccessingSecurityScopedResource() }
                 err = (e != 0 ? e : EIO); return nil
             }
-            return Backend(backend: b, retain: pathRes,
+            return NTFSBackend(backend: b, retain: pathRes,
                            cleanup: { if access { url.stopAccessingSecurityScopedResource() } },
                            writable: writable)
         }

@@ -7,12 +7,18 @@
 
 import Foundation
 import DiskArbitration
+import FSKit
+import IOKit
 
 enum MountError: LocalizedError {
     case daUnavailable
     case diskNotFound(String)
     case dissented(status: DAReturn, message: String?)
     case cannotCreateMountPoint(String)
+    case alreadyMounted
+    case extensionUnavailable
+    case unexpectedMount
+    case accessModeMismatch
 
     var errorDescription: String? {
         switch self {
@@ -20,6 +26,14 @@ enum MountError: LocalizedError {
         case .diskNotFound(let b): return "Device \(b) was not found."
         case .dissented(let status, let message): return "Mount was refused: \(message ?? "status \(status)")"
         case .cannotCreateMountPoint(let p): return "Couldn't create the mount folder at \(p)."
+        case .alreadyMounted:
+            return String(localized: "This volume is already mounted. Eject it before changing its access mode.")
+        case .extensionUnavailable:
+            return String(localized: "Enable ntfs3g in File System Extensions before mounting this volume.")
+        case .unexpectedMount:
+            return String(localized: "The system did not return an xntfs mount. Refresh the volume list and check Diagnostics.")
+        case .accessModeMismatch:
+            return String(localized: "The volume mounted with a different access mode than requested. Check its current status before using it.")
         }
     }
 
@@ -31,32 +45,48 @@ enum MountOutcome {
     case failed(String)
 }
 
+@MainActor
 final class MountService {
     private let monitor: DiskArbitrationMonitor
     init(monitor: DiskArbitrationMonitor) { self.monitor = monitor }
 
     // MARK: mount
-    //
-    // In-app mounting needs the macOS 27 FSKit Mounter, which can only be built against the
-    // (still beta) macOS 27 SDK — disabled for now; the UI routes the user to Disk Utility.
-    // Re-enable the body below (and `mount(_:at:readOnly:)`) when the 27 SDK is out of beta.
-
     func unifiedMount(_ device: NTFSDevice, readOnly: Bool) async -> MountOutcome {
-        // guard #available(macOS 27.0, *) else { … }
-        // do { return .mounted(try await mount(device, at: nil, readOnly: readOnly)) }
-        // catch { return .failed(error.localizedDescription) }
-        return .failed(String(localized: "Mounting in the app isn't available — use Disk Utility to mount this volume."))
+        guard #available(macOS 27.0, *) else {
+            return .failed(String(localized: "Mounting in the app isn't available — use Disk Utility to mount this volume."))
+        }
+        do {
+            let modules = try await FSClient.shared.installedExtensions
+            guard modules.contains(where: { $0.bundleIdentifier == ExtensionStatus.bundleID && $0.isEnabled }) else {
+                throw MountError.extensionUnavailable
+            }
+            return .mounted(try await mount(device, readOnly: readOnly))
+        } catch { return .failed(error.localizedDescription) }
     }
 
-    func mount(_ device: NTFSDevice, at mountPoint: URL?, readOnly: Bool) async throws -> URL {
+    private func mount(_ device: NTFSDevice, readOnly: Bool) async throws -> URL {
         let session = monitor.sessionRef()
         guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device.id) else {
             throw MountError.diskNotFound(device.id)
         }
+        if let expectedID = device.registryEntryID {
+            let media = DADiskCopyIOMedia(disk)
+            guard media != IO_OBJECT_NULL else { throw MountError.diskNotFound(device.id) }
+            defer { IOObjectRelease(media) }
+            var actualID: UInt64 = 0
+            guard IORegistryEntryGetRegistryEntryID(media, &actualID) == KERN_SUCCESS,
+                  actualID == expectedID else { throw MountError.diskNotFound(device.id) }
+        }
+        guard let description = DADiskCopyDescription(disk) as? [String: Any] else {
+            throw MountError.diskNotFound(device.id)
+        }
+        guard description[kDADiskDescriptionVolumePathKey as String] == nil else { throw MountError.alreadyMounted }
+        let mediaWritable = description[kDADiskDescriptionMediaWritableKey as String] as? Bool ?? device.mediaWritable
+        let effectiveReadOnly = readOnly || !mediaWritable
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             // Pass an explicit ro/rw so the extension can tell a deliberate in-app mount
             // from a system auto-mount (which carries no ro/rw and honors the app setting).
-            let args = readOnly ? ["rdonly"] : ["rw"]
+            let args = effectiveReadOnly ? ["rdonly"] : ["rw"]
             withMountArguments(args) { argv in
                 let box = DACallbackBox { dissenter in
                     if let dissenter {
@@ -67,17 +97,19 @@ final class MountService {
                         cont.resume(returning: ())
                     }
                 }
-                DADiskMountWithArguments(disk, mountPoint as CFURL?, DADiskMountOptions(kDADiskMountOptionDefault),
+                DADiskMountWithArguments(disk, nil, DADiskMountOptions(kDADiskMountOptionDefault),
                                          { _, dissenter, ctx in daInvokeBox(dissenter, ctx) },
                                          Unmanaged.passRetained(box).toOpaque(), argv)
             }
         }
-        if let mountPoint { return mountPoint }
-        if let desc = DADiskCopyDescription(disk) as? [String: Any],
-           let url = desc[kDADiskDescriptionVolumePathKey as String] as? URL {
-            return url
+        guard let desc = DADiskCopyDescription(disk) as? [String: Any],
+              let url = desc[kDADiskDescriptionVolumePathKey as String] as? URL,
+              let info = DiskArbitrationMonitor.mountInfo(url),
+              info.fsType == DiskArbitrationMonitor.moduleFSType else {
+            throw MountError.unexpectedMount
         }
-        return URL(fileURLWithPath: "/Volumes/\(device.volumeName)")
+        guard info.readOnly == effectiveReadOnly else { throw MountError.accessModeMismatch }
+        return url
     }
 
     func unmount(_ device: NTFSDevice, force: Bool = false) async throws {

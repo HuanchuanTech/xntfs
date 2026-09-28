@@ -44,6 +44,8 @@ struct NTFSDevice: Identifiable, Equatable {
     /// For image-backed devices (kind == .diskImage): the whole-disk node (e.g. "disk6"),
     /// used to detach the image via `hdiutil detach`.
     var wholeDiskBSD: String = ""
+    /// Changes on reconnect, even when Disk Arbitration reuses the BSD name.
+    var registryEntryID: UInt64?
 
     var displayName: String { volumeName.isEmpty ? id : volumeName }
 
@@ -51,7 +53,7 @@ struct NTFSDevice: Identifiable, Equatable {
         lhs.id == rhs.id && lhs.volumeName == rhs.volumeName &&
         lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes &&
         lhs.mountedByXntfs == rhs.mountedByXntfs && lhs.readOnly == rhs.readOnly &&
-        lhs.mediaWritable == rhs.mediaWritable
+        lhs.mediaWritable == rhs.mediaWritable && lhs.registryEntryID == rhs.registryEntryID
     }
 }
 

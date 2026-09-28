@@ -7,6 +7,7 @@
 
 import Foundation
 import DiskArbitration
+import IOKit
 
 final class DiskArbitrationMonitor {
 
@@ -15,6 +16,7 @@ final class DiskArbitrationMonitor {
 
     private let session: DASession
     private let queue = DispatchQueue(label: "com.huanchuan.xntfs.diskarb")
+    private let callbackContext = MonitorCallbackContext()
     private var devices: [String: NTFSDevice] = [:]
     private let lock = NSLock()
 
@@ -22,16 +24,46 @@ final class DiskArbitrationMonitor {
         guard let s = DASessionCreate(kCFAllocatorDefault) else { return nil }
         session = s
         DASessionSetDispatchQueue(session, queue)
+        callbackContext.monitor = self
     }
 
     func start() {
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        DARegisterDiskAppearedCallback(session, nil, daAppeared, ctx)
-        DARegisterDiskDisappearedCallback(session, nil, daDisappeared, ctx)
-        DARegisterDiskDescriptionChangedCallback(session, nil, nil, daChanged, ctx)
+        queue.async { [weak self] in
+            guard let self else { return }
+            let ctx = Unmanaged.passUnretained(self.callbackContext).toOpaque()
+            DARegisterDiskAppearedCallback(self.session, nil, daAppeared, ctx)
+            DARegisterDiskDisappearedCallback(self.session, nil, daDisappeared, ctx)
+            DARegisterDiskDescriptionChangedCallback(self.session, nil, nil, daChanged, ctx)
+        }
+    }
+
+    deinit {
+        // Keep the weak context alive until earlier callbacks have drained. A DA
+        // session can outlive its owner while its dispatch source is scheduled.
+        let session = session, context = callbackContext
+        queue.async {
+            withExtendedLifetime(context) {
+                let ctx = Unmanaged.passUnretained(context).toOpaque()
+                DAUnregisterCallback(session, unsafeBitCast(daAppeared as DADiskAppearedCallback, to: UnsafeMutableRawPointer.self), ctx)
+                DAUnregisterCallback(session, unsafeBitCast(daDisappeared as DADiskDisappearedCallback, to: UnsafeMutableRawPointer.self), ctx)
+                DAUnregisterCallback(session, unsafeBitCast(daChanged as DADiskDescriptionChangedCallback, to: UnsafeMutableRawPointer.self), ctx)
+                DASessionSetDispatchQueue(session, nil)
+            }
+        }
     }
 
     func sessionRef() -> DASession { session }
+
+    func refresh() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            for device in self.currentDevices {
+                if let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, self.session, device.id) {
+                    self.handleAppearedOrChanged(disk)
+                }
+            }
+        }
+    }
 
     var currentDevices: [NTFSDevice] {
         lock.lock(); defer { lock.unlock() }
@@ -121,6 +153,14 @@ final class DiskArbitrationMonitor {
         dev.mountedByXntfs = byModule
         dev.readOnly = info?.readOnly ?? false
         dev.mediaWritable = (d[kDADiskDescriptionMediaWritableKey as String] as? Bool) ?? true
+        let media = DADiskCopyIOMedia(disk)
+        if media != IO_OBJECT_NULL {
+            var entryID: UInt64 = 0
+            if IORegistryEntryGetRegistryEntryID(media, &entryID) == KERN_SUCCESS, entryID != 0 {
+                dev.registryEntryID = entryID
+            }
+            IOObjectRelease(media)
+        }
         // The whole-disk node for detach — straight from DiskArbitration, not inferred from
         // the BSD unit number (DADiskCopyWholeDisk returns the parent disk of a partition,
         // or the disk itself if it is already whole).
@@ -138,7 +178,7 @@ final class DiskArbitrationMonitor {
     }
 
     /// `(f_fstypename, read-only)` of the filesystem mounted at `url`, or nil if not mounted.
-    private static func mountInfo(_ url: URL) -> (fsType: String, readOnly: Bool)? {
+    static func mountInfo(_ url: URL) -> (fsType: String, readOnly: Bool)? {
         guard url.isFileURL else { return nil }
         var s = statfs()
         guard statfs(url.path, &s) == 0 else { return nil }
@@ -151,9 +191,13 @@ final class DiskArbitrationMonitor {
 
 // MARK: - C trampolines
 
+private final class MonitorCallbackContext {
+    weak var monitor: DiskArbitrationMonitor?
+}
+
 private func monitor(_ ctx: UnsafeMutableRawPointer?) -> DiskArbitrationMonitor? {
     guard let ctx else { return nil }
-    return Unmanaged<DiskArbitrationMonitor>.fromOpaque(ctx).takeUnretainedValue()
+    return Unmanaged<MonitorCallbackContext>.fromOpaque(ctx).takeUnretainedValue().monitor
 }
 
 private func daAppeared(_ disk: DADisk, _ ctx: UnsafeMutableRawPointer?) {

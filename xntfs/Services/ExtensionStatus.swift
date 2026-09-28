@@ -15,21 +15,39 @@ import Observation
 @MainActor
 @Observable
 final class ExtensionStatus {
-    enum State: Equatable { case unknown, notInstalled, disabled, enabled }
+    enum State: Equatable { case unknown, bundled, notInstalled, disabled, enabled }
+
+    static var needsLegacyCompatibility: Bool {
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 15
+    }
+
+    static var supportsEnableWorkaround: Bool {
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+    }
 
     private(set) var state: State = .unknown
+    private(set) var queryError: NSError?
     /// Resolved filesystem paths of ALL matching registrations (FSModuleIdentity.url).
     /// More than one means duplicate registrations — a known cause of the greyed-out toggle.
     private(set) var moduleURLs: [URL] = []
     /// Count of installed identities matching our bundle id, tracked separately so a
     /// duplicate is detectable even when a url can't be read.
     private(set) var installedCount = 0
+    /// Bundle presence is not proof of registration or enablement on macOS 15.
+    private(set) var bundledExtensionURL: URL?
 
     /// Must match the extension target's bundle identifier.
-    private let bundleID = "com.huanchuan.xntfs.ntfs3g"
+    static let bundleID = "com.huanchuan.xntfs.ntfs3g"
 
     var isInstalled: Bool { installedCount > 0 }
     var isDuplicated: Bool { installedCount > 1 }
+    var isEnabled: Bool? {
+        switch state {
+        case .enabled: return true
+        case .disabled: return false
+        default: return nil
+        }
+    }
 
     /// Registration health: nil = unknown (no readable paths), false = a problem (duplicate
     /// registrations, or a copy served from a dev build), true = a single /Applications copy.
@@ -45,7 +63,28 @@ final class ExtensionStatus {
     }
 
     /// Copyable command to inspect ALL registrations + their resolved paths by hand.
-    var pluginkitCommand: String { "pluginkit -mAvvv -i \(bundleID)" }
+    var pluginkitCommand: String { "pluginkit -mAvvv -i \(Self.bundleID)" }
+
+    var diagnosticReport: String {
+        let app = Bundle.main
+        let version = app.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = app.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        let count = state == .unknown || Self.needsLegacyCompatibility ? "unknown" : String(installedCount)
+        var lines = [
+            "xntfs \(version) (\(build))",
+            "OS: \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "App: \(app.bundleURL.path)",
+            "Module: \(Self.bundleID)",
+            "State: \(state)",
+            "Bundled extension: \(bundledExtensionURL?.path ?? "not found")",
+            "Registered copies: \(count)"
+        ]
+        lines.append(contentsOf: moduleURLs.map { "Registration: \($0.path)" })
+        if let queryError {
+            lines.append("FSClient.installedExtensions: \(queryError.domain) (\(queryError.code)): \(queryError.localizedDescription)")
+        }
+        return lines.joined(separator: "\n")
+    }
 
     /// Last-resort, UNSUPPORTED workaround for the pre-27 bug where the System Settings
     /// toggle is a no-op. enabledModules.plist has an ARRAY root (a list of enabled bundle
@@ -57,7 +96,7 @@ final class ExtensionStatus {
     var enableFallbackScript: String {
         """
         PLIST="$HOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
-        BID="\(bundleID)"
+        BID="\(Self.bundleID)"
         if [ ! -f "$PLIST" ]; then echo "enabledModules.plist not found — toggle a File System Extension once in System Settings to create it, then re-run."; exit 1; fi
         if ! /usr/libexec/PlistBuddy -c "Print" "$PLIST" | head -1 | grep -q "Array"; then echo "Root is not an array (likely written by an older script); refusing to modify to avoid corrupting it. Repair it or restore a backup, then re-run."; exit 1; fi
         /usr/libexec/PlistBuddy -c "Print" "$PLIST" | grep -qF "$BID" || /usr/libexec/PlistBuddy -c "Add :0 string $BID" "$PLIST"
@@ -65,15 +104,20 @@ final class ExtensionStatus {
         """
     }
 
-    func refresh() async {
+    func refresh(appURL: URL = Bundle.main.bundleURL) async {
+        queryError = nil
+        bundledExtensionURL = Self.embeddedExtension(in: appURL)
+        if Self.needsLegacyCompatibility {
+            installedCount = 0
+            moduleURLs = []
+            state = bundledExtensionURL == nil ? .notInstalled : .bundled
+            return
+        }
         do {
             let modules = try await FSClient.shared.installedExtensions
             // filter (not first) so duplicate registrations are all surfaced.
-            let mine = modules.filter { $0.bundleIdentifier == bundleID }
+            let mine = modules.filter { $0.bundleIdentifier == Self.bundleID }
             installedCount = mine.count
-            // FSModuleIdentity.url — used only to flag stale/dev-build registrations.
-            // VERIFY ON DEVICE: confirm this property exists/populates in your SDK; if not,
-            // drop this line (moduleURLs stays empty → the pluginkit command fallback shows).
             moduleURLs = mine.compactMap { $0.url }
             if mine.isEmpty {
                 state = .notInstalled
@@ -81,25 +125,31 @@ final class ExtensionStatus {
                 state = mine.contains { $0.isEnabled } ? .enabled : .disabled
             }
         } catch {
+            queryError = error as NSError
             state = .unknown
             installedCount = 0
             moduleURLs = []
         }
     }
 
-    /// Opens System Settings at "Login Items & Extensions", where the
-    /// "File System Extensions" toggle lives. Returns whether a pane opened.
+    static func embeddedExtension(in appURL: URL) -> URL? {
+        let url = appURL.appendingPathComponent("Contents/Extensions/ntfs3g.appex", isDirectory: true)
+        guard let data = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              info["CFBundleIdentifier"] as? String == bundleID,
+              let executable = info["CFBundleExecutable"] as? String,
+              !executable.isEmpty, !executable.contains("/"), executable != ".", executable != "..",
+              FileManager.default.isExecutableFile(atPath: url.appendingPathComponent("Contents/MacOS/\(executable)").path)
+        else { return nil }
+        return url
+    }
+
+    /// Opens File System Extensions on macOS 27, or its parent settings pane.
     @discardableResult
     static func openSettings() -> Bool {
-        // macOS 27 ships an official jump straight to File System Extensions, but
-        // FSClient.openFileSystemExtensionsSettings() isn't in the stable SDK. Re-enable when
-        // building against the macOS 27 SDK (out of beta):
-        // if #available(macOS 27.0, *) {
-        //     if FSClient.shared.openFileSystemExtensionsSettings() { return true }
-        // }
-        // Without that anchor for the File System Extensions detail (the pane only
-        // exposes "ExtensionItems"/"startupItemsPref"), so just open the Login Items &
-        // Extensions page; the banner covers the remaining steps.
+        if #available(macOS 27.0, *) {
+            if FSClient.shared.openFileSystemExtensionsSettings() { return true }
+        }
         if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
             return NSWorkspace.shared.open(url)
         }

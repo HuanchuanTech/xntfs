@@ -1,11 +1,11 @@
 //
 //  ContentView.swift
-//  Disk Utility-style tree (Devices + Disk Images, both monitor-detected) with a detail
-//  pane. Attaching/detaching images and mounting (on <27 or to a folder) are copyable
-//  Terminal commands, since a sandboxed app can't run hdiutil/mount itself.
+//  Devices and attached images come from Disk Arbitration. Direct image mounts on
+//  macOS 27 come from the mount table because they have no BSD device.
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
@@ -14,17 +14,40 @@ struct ContentView: View {
     @State private var selection: NTFSDevice.ID?
     @State private var showDiagnostics = false
     @State private var showError = false
+    @State private var showAddImage = false
+    @State private var pendingImage: PendingImage?
 
     var body: some View {
         VStack(spacing: 0) {
             if extStatus.state == .disabled || extStatus.state == .notInstalled {
                 ExtensionBanner(status: extStatus, onDiagnostics: { showDiagnostics = true })
+            } else if extStatus.state == .bundled {
+                HStack(spacing: 12) {
+                    Label("On macOS 15, enable ntfs3g in Settings, then select a volume to mount it with xntfs.",
+                          systemImage: "info.circle")
+                        .font(.callout)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("Open Settings…") { ExtensionStatus.openSettings() }
+                    Button("Diagnostics…") { showDiagnostics = true }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .overlay(alignment: .bottom) { Divider() }
             }
             mainContent
         }
         .task { await extStatus.refresh() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            model.refreshDevices()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            model.refreshDevices()
+        }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await extStatus.refresh() } }
+            if phase == .active {
+                model.refreshDevices()
+                Task { await extStatus.refresh() }
+            }
         }
     }
 
@@ -48,24 +71,49 @@ struct ContentView: View {
                     ForEach(imageDevices) { device in
                         DeviceRow(device: device, byXntfs: device.mountedByXntfs, isSelected: selection == device.id).tag(device.id)
                     }
+                    ForEach(model.mountedImages) { image in
+                        HStack(spacing: 10) {
+                            Image(systemName: "opticaldiscdrive.fill").font(.title2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(image.name)
+                                Text(image.readOnly ? LocalizedStringKey("Mounted · read-only") : "Mounted")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("xntfs").font(.caption2).fontWeight(.semibold)
+                        }
+                        .padding(.vertical, 2)
+                        .tag(image.id)
+                    }
                 }
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 280)
             .overlay {
-                if model.devices.isEmpty {
+                if model.devices.isEmpty && model.mountedImages.isEmpty {
                     ContentUnavailableView("No NTFS volumes",
                                            systemImage: "externaldrive.badge.questionmark",
-                                           description: Text("Plug in an NTFS drive, or attach a disk image in Disk Utility."))
+                                           description: Text(emptyDescription))
                 }
             }
         } detail: {
             if let device = selectedDevice {
                 DeviceDetailView(device: device)
+            } else if let image = model.mountedImages.first(where: { $0.id == selection }) {
+                ImageDetailView(image: image)
             } else {
                 ContentUnavailableView("Select a volume", systemImage: "externaldrive")
             }
         }
         .toolbar {
+            if #available(macOS 27.0, *) {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showAddImage = true } label: {
+                        Label("Add Disk Image…", systemImage: "plus")
+                    }
+                    .help("Add Disk Image…")
+                    .disabled(model.mountingImage)
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button { DiskUtility.open() } label: {
                     Label("Open Disk Utility", systemImage: "externaldrive")
@@ -77,6 +125,17 @@ struct ContentView: View {
                 }
             }
         }
+        .fileImporter(isPresented: $showAddImage, allowedContentTypes: [.diskImage, .data]) { result in
+            switch result {
+            case .success(let url): pendingImage = PendingImage(url: url)
+            case .failure(let error): model.lastError = ImageMountService.diagnosticMessage(error)
+            }
+        }
+        .sheet(item: $pendingImage) { image in
+            ImageMountSheet(source: image.url) { url in
+                selection = "image:" + url.path
+            }
+        }
         .sheet(isPresented: $showDiagnostics) {
             DiagnosticsView(status: extStatus)
         }
@@ -86,6 +145,11 @@ struct ContentView: View {
         } message: {
             Text(model.lastError ?? "")
         }
+    }
+
+    private var emptyDescription: LocalizedStringKey {
+        if #available(macOS 27.0, *) { return "Plug in an NTFS drive, or add a disk image." }
+        return "Plug in an NTFS drive, or attach a disk image in Disk Utility."
     }
 
 }
@@ -128,14 +192,10 @@ struct ExtensionBanner: View {
         status.state == .notInstalled ? "NTFS extension not installed" : "NTFS extension not enabled"
     }
 
-    /// The Settings button can only open the Login Items & Extensions pane (no deep-link to the
-    /// File System Extensions detail), so spell out the remaining steps.
     private var instruction: LocalizedStringKey {
-        // macOS 27: FSClient deep-links straight onto the File System Extensions list — disabled
-        // until the macOS 27 SDK is out of beta. Re-enable then:
-        // if #available(macOS 27.0, *) {
-        //     return "Turn on “ntfs3g” in the File System Extensions list."
-        // }
+        if #available(macOS 27.0, *) {
+            return "Turn on “ntfs3g” in the File System Extensions list."
+        }
         return "In Settings, scroll to Extensions → open “File System Extensions” → turn on “ntfs3g”."
     }
 }
@@ -202,6 +262,7 @@ struct DeviceDetailView: View {
     @Environment(AppModel.self) private var model
     let device: NTFSDevice
     @State private var showMountSheet = false
+    @State private var showLegacyMountSheet = false
 
     var body: some View {
         Form {
@@ -217,6 +278,14 @@ struct DeviceDetailView: View {
             }
 
             Section {
+                if ExtensionStatus.needsLegacyCompatibility {
+                    Button { showLegacyMountSheet = true } label: {
+                        Label("Mount with xntfs…", systemImage: "externaldrive.badge.plus")
+                    }
+                    .disabled(device.state == .mounting || device.state == .unmounting)
+                    Text("macOS 15 uses Apple's NTFS driver by default. Mount with xntfs requires a one-time command in Terminal, also for images attached in Disk Utility.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if device.state.isMounted {
                     Button {
                         Task { await model.unmount(device) }
@@ -227,17 +296,19 @@ struct DeviceDetailView: View {
                             NSWorkspace.shared.activateFileViewerSelecting([url])
                         } label: { Label("Reveal in Finder", systemImage: "folder") }
                     }
-                } else {
-                    // macOS 27+ in-app mount (FSKit Mounter) — disabled until the macOS 27 SDK
-                    // is out of beta (beta builds can't be submitted). Re-enable this branch then:
-                    // if #available(macOS 27.0, *) {
-                    //     Button { showMountSheet = true } label: { Label("Mount…", systemImage: "play.fill") }
-                    // } else { …the Disk Utility branch below… }
-                    Button {
-                        DiskUtility.open()
-                    } label: { Label("Mount in Disk Utility…", systemImage: "externaldrive") }
-                    Text("Select this volume in Disk Utility and click Mount.")
-                        .font(.caption).foregroundStyle(.secondary)
+                } else if !ExtensionStatus.needsLegacyCompatibility {
+                    if #available(macOS 27.0, *) {
+                        Button { showMountSheet = true } label: {
+                            Label("Mount…", systemImage: "play.fill")
+                        }
+                        .disabled(device.state == .mounting || device.state == .unmounting)
+                    } else {
+                        Button {
+                            DiskUtility.open()
+                        } label: { Label("Mount in Disk Utility…", systemImage: "externaldrive") }
+                        Text("Select this volume in Disk Utility and click Mount.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -249,6 +320,9 @@ struct DeviceDetailView: View {
         .navigationTitle(device.displayName)
         .sheet(isPresented: $showMountSheet) {
             MountSheet(device: device).environment(model)
+        }
+        .sheet(isPresented: $showLegacyMountSheet) {
+            LegacyMountSheet(device: device).environment(model)
         }
     }
 }

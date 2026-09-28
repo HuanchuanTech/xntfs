@@ -28,5 +28,6 @@ struct CopyableCommand: View {
                 Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
             }
         }
+        .onChange(of: command) { _, _ in copied = false }
     }
 }

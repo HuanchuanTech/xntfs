@@ -53,8 +53,17 @@
         }
       }
     },
+    "Access follows your read-only preferences. An image attached read-only stays read-only." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "访问方式遵循你的只读偏好设置。以只读方式附加的镜像仍然只能只读挂载。"
+          }
+        }
+      }
+    },
     "Add Disk Image…" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -106,6 +115,9 @@
         }
       }
     },
+    "Cancel" : {
+
+    },
     "Capacity" : {
       "localizations" : {
         "zh-Hans" : {
@@ -138,6 +150,16 @@
         }
       }
     },
+    "Cleanup after an interrupted attempt" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清理异常中断后的临时项"
+          }
+        }
+      }
+    },
     "Close" : {
       "localizations" : {
         "zh-Hans" : {
@@ -164,6 +186,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "复制"
+          }
+        }
+      }
+    },
+    "Copy Diagnostics" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制诊断信息"
           }
         }
       }
@@ -290,6 +322,26 @@
         }
       }
     },
+    "Enable ntfs3g in File System Extensions before mounting an image." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先在「文件系统扩展」中开启 ntfs3g，再挂载镜像。"
+          }
+        }
+      }
+    },
+    "Enable ntfs3g in File System Extensions before mounting this volume." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先在「文件系统扩展」中开启 ntfs3g，再挂载此卷。"
+          }
+        }
+      }
+    },
     "Extension Diagnostics" : {
       "localizations" : {
         "zh-Hans" : {
@@ -310,6 +362,16 @@
         }
       }
     },
+    "Extension in this app" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用内的扩展"
+          }
+        }
+      }
+    },
     "Extension installed" : {
       "localizations" : {
         "zh-Hans" : {
@@ -326,6 +388,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "失败"
+          }
+        }
+      }
+    },
+    "First enable ntfs3g in System Settings. Close files on this volume before continuing. A mounted volume will be unmounted normally; busy volumes will not be forced." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先在系统设置中开启 ntfs3g，并关闭此卷上正在使用的文件。已挂载的卷会先正常卸载；如果正在被占用，不会强制卸载。"
           }
         }
       }
@@ -351,6 +423,16 @@
         }
       }
     },
+    "FSKit reports a copy outside /Applications. Check which app is registered." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "FSKit 报告的扩展位于 /Applications 之外。请检查注册的应用副本。"
+          }
+        }
+      }
+    },
     "Image" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -363,7 +445,6 @@
       }
     },
     "Image file" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -405,11 +486,32 @@
       }
     },
     "Loaded from a dev build (DerivedData) — install the release app to /Applications." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "从开发构建(DerivedData)加载——请将正式版应用安装到 /Applications。"
+          }
+        }
+      }
+    },
+    "macOS 15 prefers Apple's NTFS driver. This one-time compatibility command switches only the selected volume to xntfs." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS 15 优先使用苹果内置的 NTFS 驱动。这个一次性兼容命令只将所选卷切换为 xntfs 挂载。"
+          }
+        }
+      }
+    },
+    "macOS 15 uses Apple's NTFS driver by default. Mount with xntfs requires a one-time command in Terminal, also for images attached in Disk Utility." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS 15 默认使用苹果内置的 NTFS 驱动。使用 xntfs 挂载需要在终端执行一次命令，通过磁盘工具附加的镜像也适用。"
           }
         }
       }
@@ -467,7 +569,6 @@
       }
     },
     "Mount Disk Image" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -541,8 +642,27 @@
         }
       }
     },
+    "Mount with xntfs" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用 xntfs 挂载"
+          }
+        }
+      }
+    },
+    "Mount with xntfs…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用 xntfs 挂载…"
+          }
+        }
+      }
+    },
     "Mount…" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -727,11 +847,32 @@
       }
     },
     "ntfs3g is enabled and available to mount NTFS volumes." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "ntfs3g 已启用,可用于挂载 NTFS 卷。"
+          }
+        }
+      }
+    },
+    "ntfs3g is enabled in System Settings." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ntfs3g 已在系统设置中启用。"
+          }
+        }
+      }
+    },
+    "ntfs3g is included in this app. macOS 15 cannot reliably report third-party FSKit registration or enablement to the app." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用内已包含 ntfs3g。macOS 15 无法向应用可靠地报告第三方 FSKit 扩展的注册和启用状态。"
           }
         }
       }
@@ -752,6 +893,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "好"
+          }
+        }
+      }
+    },
+    "On macOS 15, enable ntfs3g in Settings, then select a volume to mount it with xntfs." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS 15 用户请先在系统设置中开启 ntfs3g，再选择一个卷，使用 xntfs 挂载。"
           }
         }
       }
@@ -798,7 +949,6 @@
       }
     },
     "Plug in an NTFS drive, or add a disk image." : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -840,7 +990,6 @@
       }
     },
     "Read-only" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -870,8 +1019,17 @@
         }
       }
     },
+    "Read-only preferences" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只读偏好设置"
+          }
+        }
+      }
+    },
     "Read/write" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -912,6 +1070,16 @@
         }
       }
     },
+    "Run the command yourself in Terminal. It asks for confirmation and an administrator password. The app does not run it or request administrator access." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请自行在终端执行命令。命令会请你确认操作并输入管理员密码。应用不会代为执行，也不会请求管理员权限。"
+          }
+        }
+      }
+    },
     "Run this in Terminal — a sandboxed app can't do it for you:" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -919,6 +1087,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在终端运行——沙盒应用无法替你执行:"
+          }
+        }
+      }
+    },
+    "Select a raw NTFS volume image. Open partitioned or compressed disk images in Disk Utility." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请选择原始 NTFS 卷镜像。包含分区表或压缩格式的磁盘镜像，请在磁盘工具中打开。"
           }
         }
       }
@@ -939,6 +1117,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "请在磁盘工具中选中此卷并点「挂载」。"
+          }
+        }
+      }
+    },
+    "Status unavailable on macOS 15. Check the ntfs3g switch in System Settings; an unknown status does not mean it is disabled." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS 15 上无法查询此状态。请到系统设置中检查 ntfs3g 开关；状态未知不代表未启用。"
           }
         }
       }
@@ -974,6 +1162,16 @@
         }
       }
     },
+    "The device identity or command resource is unavailable. Reconnect the volume and reopen this panel; do not reuse an old command." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法获取设备身份或命令资源。请重新连接设备并打开此面板，不要继续使用旧命令。"
+          }
+        }
+      }
+    },
     "The image will mount read-only (recommended)." : {
       "extractionState" : "stale",
       "localizations" : {
@@ -996,12 +1194,92 @@
         }
       }
     },
+    "The system did not return an xntfs image mount. Refresh the volume list and check Diagnostics." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "系统未返回由 xntfs 挂载的镜像。请刷新卷列表并查看诊断信息。"
+          }
+        }
+      }
+    },
+    "The system did not return an xntfs mount. Refresh the volume list and check Diagnostics." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "系统未返回由 xntfs 挂载的卷。请刷新卷列表并查看诊断信息。"
+          }
+        }
+      }
+    },
+    "The temporary routing entry is removed after the attempt, including on failure or cancellation. Reconnecting the drive may require running a new command." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "挂载尝试结束后会清理临时路由项，失败或取消时也会清理。重新连接设备后，可能需要再次生成并执行命令。"
+          }
+        }
+      }
+    },
+    "The volume mounted with a different access mode than requested. Check its current status before using it." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "卷已挂载，但实际读写模式与请求不一致。请先确认卷的当前状态。"
+          }
+        }
+      }
+    },
     "This appends ntfs3g to the enabled-modules list only if it's missing, then restarts fskit_agent. It edits files outside the sandbox, so the app can't run it for you." : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "仅在缺失时把 ntfs3g 追加到已启用模块列表,然后重启 fskit_agent。它会修改沙盒之外的文件,所以应用无法替你执行。"
+          }
+        }
+      }
+    },
+    "This image is already mounted. Eject it before changing its access mode." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此镜像已经挂载。如需更改读写模式，请先推出。"
+          }
+        }
+      }
+    },
+    "This removes only xntfs's inactive compatibility entry. It does not unmount volumes, change extension enablement, or remove other filesystem drivers." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只清理 xntfs 已停止使用的兼容项，不会卸载卷、更改扩展启用状态或删除其他文件系统驱动。"
+          }
+        }
+      }
+    },
+    "This volume is already mounted. Eject it before changing its access mode." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此卷已经挂载。如需更改读写模式，请先推出。"
+          }
+        }
+      }
+    },
+    "This volume is mounted with xntfs." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此卷已由 xntfs 挂载。"
           }
         }
       }
@@ -1017,7 +1295,6 @@
       }
     },
     "Turn on “ntfs3g” in the File System Extensions list." : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {

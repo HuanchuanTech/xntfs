@@ -37,3 +37,14 @@ xcuserdata/
 # ───────── Local working docs (kept out of the repo) ─────────
 /CLAUDE.md
 /HANDOFF.md
+
+# Local diagnostics and release scratch
+/_tmp/
+/install-backups.*.tar.gz
+/*.zip
+/*.tar.gz
+*.provisionprofile
+*.mobileprovision
+*.p12
+*.pem
+*.key

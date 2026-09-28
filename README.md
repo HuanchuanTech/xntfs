@@ -2,6 +2,8 @@
 
 > 📖 Also available in [Simplified Chinese](README_CN.md).
 
+<a href="https://apps.apple.com/app/xntfs/id6782636021"><img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download xntfs on the App Store" height="44"></a>
+
 A macOS app + **FSKit file-system extension** that reads and writes NTFS volumes using the
 [ntfs-3g](https://github.com/tuxera/ntfs-3g) engine. No kernel extension, no macFUSE.
 
@@ -9,12 +11,9 @@ The `ntfs3g` app-extension reuses the portable **`libntfs-3g`** core (all the NT
 runlists, compression, security descriptors, `$LogFile`) behind a thin FSKit `FSVolume` mapping
 layer, the same way ntfs-3g's own `src/ntfs-3g.c` maps FUSE onto libntfs.
 
-NTFS drives **auto-mount under `/Volumes` by the system** (DiskArbitration probes the extension's
-registered `FSMediaTypes` — no app process needed, exactly like the built-in exFAT/MSDOS modules).
-The `xntfs` app is a **control panel**: it lists NTFS drives and attached disk images, ejects and
-reveals mounted volumes, and shows an extension-status diagnostics page. A sandboxed app can't
-mount a third-party FSKit volume or attach a disk image itself, so for those the app opens **Disk
-Utility**; everyday drives auto-mount via the system.
+The extension lets macOS mount supported NTFS drives under `/Volumes` without a background app.
+The app lists drives and disk images, shows their actual mount and read-only status, and helps
+diagnose extension setup. Mounting controls depend on the macOS version; see below.
 
 ```
 xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
@@ -37,11 +36,10 @@ xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
 | `xntfs` app (UI, monitor, mount service, settings) | ✅ builds |
 | English + Simplified Chinese localization | ✅ `Localizable.xcstrings` (en, zh-Hans) |
 | App icon | ✅ generated, full AppIcon set |
-| End-to-end mount on a Mac | ⛔ requires the FSKit entitlement to be provisioned for your team — see below |
+| End-to-end mount on a Mac | Verified on macOS 15.8 and 27.0; the extension still needs FSKit provisioning and user enablement |
 
-The NTFS engine itself is independently proven correct (mount / enumerate / read / write /
-create, cross-checked with upstream `ntfsls`/`ntfsfix`); only the OS *loading* of the extension
-depends on code-signing/provisioning that's tied to your Apple Developer account.
+The extension uses a restricted FSKit entitlement. A locally built copy requires a signing team
+whose provisioning profile authorizes it; building alone does not enable the extension.
 
 ## The six features
 
@@ -49,22 +47,20 @@ depends on code-signing/provisioning that's tied to your Apple Developer account
    languages by adding `localizations` entries.
 2. **Auto-mount removable NTFS** — handled by the **system**, not the app: the extension's
    `Info.plist` registers NTFS `FSMediaTypes` (`Windows_NTFS`, MS Basic-Data GUID, partitionless),
-   so DiskArbitration auto-mounts NTFS drives read-write under `/Volumes` using our module — with
-   no app process running (same model as the built-in exFAT/MSDOS modules). `FSProbeOrder` governs
-   priority over the legacy read-only NTFS driver. The app only *detects/lists* drives for the UI.
+   so DiskArbitration can auto-mount supported NTFS drives under `/Volumes` without the app
+   running. On macOS 15, the built-in NTFS driver may take priority; see the manual workaround.
 3. **Mount location** — drives mount under `/Volumes/<name>`; the system picks the path and
    de-duplicates names. Mounting to a **custom folder is not possible** for a sandboxed FSKit
    volume (the extension can only reach `/Volumes` and its own sandbox temp paths), so
    `/Volumes` is the only target.
 4. **Multiple drives at once** — devices are tracked by BSD name and mounted independently.
-5. **Manual mount / unmount** — per-device *Eject* and *Reveal in Finder*. A sandboxed app can't
-   mount a third-party FSKit volume itself, so to (re)mount an unmounted NTFS volume the app
-   offers an *Open Disk Utility* button — mount it there (Disk Utility mounts via
-   `diskarbitrationd`, the same path the system auto-mounts with).
-6. **Disk images** — attach a raw NTFS image in **Disk Utility** (*File ▸ Open Disk Image…*, or
-   double-click it); xntfs then auto-mounts the NTFS volume on the attached device and lists it
-   under *Disk Images*. The app links to Disk Utility rather than running `hdiutil` itself (the
-   sandbox blocks `Process`).
+5. **Manual mount / unmount** — on macOS 27, the app offers in-app mounting with a read-only
+   choice. On macOS 15, it shows a copyable Terminal command to mount a selected volume with
+   xntfs, including volumes already attached by Disk Utility. On macOS 26, use Disk Utility.
+   Mounted volumes can be revealed in Finder or ejected from the app.
+6. **Disk images** — on macOS 27, the app can select and mount a raw, single-volume NTFS image.
+   Partitioned or compressed images are opened in Disk Utility. On older systems, attach images
+   in Disk Utility; a selected NTFS partition can then use the macOS 15 manual workaround.
 
 ## Build
 
@@ -83,27 +79,30 @@ The script builds arm64 and x86_64 separately, then combines them under
 `build/libntfs-universal/`. That directory is ignored by Git; run the script again after a clean
 checkout or when updating the ntfs-3g submodule.
 
+The project uses the maintainer's signing team by default. Choose your own team in Xcode and
+configure the FSKit capability before running a local build.
+
 ## Provisioning (required to actually run the extension)
 
 The extension declares the **restricted** entitlement `com.apple.developer.fskit.fsmodule`
 (`ntfs3g/ntfs3g.entitlements`). macOS (AMFI) refuses to load the extension unless that entitlement
 is authorized by a provisioning profile. With **automatic signing** and team `529LJDH392`, this
 works only if that team's App ID has the **FSKit File System Module** capability enabled in the
-Apple Developer portal. Once provisioned, enable the module under **System Settings → General →
+Apple Developer portal. Replace the project team with your own before signing. Once provisioned,
+enable the module under **System Settings → General →
 Login Items & Extensions → File System Extensions**.
 
 ## Sandbox & mounting
 
-Verified on macOS 26.5 with the sandboxed build:
+The mounting paths differ by operating system:
 
-- **Auto-mount is the main path.** The system mounts NTFS drives read-write under `/Volumes` via
-  the extension's `FSMediaTypes` — no app process, no extra entitlement. Fully working.
-- **A sandboxed app can't mount a third-party FSKit volume itself.** A DiskArbitration mount is
-  refused (`kDAReturnNotPrivileged`) and `mount -F -t xntfs …` is denied at the FSKit probe
-  ("Permission denied"). So manual (re)mounting and attaching disk images are delegated to
-  **Disk Utility**, which mounts via `diskarbitrationd` — the same path auto-mount uses.
-- **The app never shells out.** The sandbox blocks `Process` (`hdiutil`, `mount`, …); the app's
-  role is detection, listing, and a one-click jump to Disk Utility.
+- **macOS 27:** the app uses FSKit and Disk Arbitration APIs for in-app volume and image mounts.
+- **macOS 26:** automatic mounting works when the extension is enabled; Disk Utility handles
+  manual mounts and image attachment.
+- **macOS 15:** the built-in NTFS driver can win automatic selection. The app provides a
+  copyable, per-volume Terminal command that temporarily selects xntfs. It asks for confirmation
+  and administrator authentication, then removes its temporary `.fs` entry. The app does not
+  execute this command itself. See [the compatibility details](docs/macos15-compatibility.md).
 
 > This is a *technical* capability result; App Review is a separate policy gate.
 
@@ -112,10 +111,11 @@ Verified on macOS 26.5 with the sandboxed build:
 ```
 xntfs/                     app target (SwiftUI)
   xntfsApp.swift           @main App + Settings scene
-  ContentView.swift        device/image list + detail; opens Disk Utility for mount/attach
+  ContentView.swift        device/image list + OS-specific mount controls
   DiskUtility.swift        opens Apple's Disk Utility (mount / attach images)
-  MountSheet.swift         in-app mount sheet (currently disabled)
-  CopyableCommand.swift    copyable-command control (used by the diagnostics page)
+  MountSheet.swift         in-app mount sheet on macOS 27
+  LegacyMountSheet.swift   manual mount guidance on macOS 15
+  CopyableCommand.swift    copyable-command control
   DiagnosticsView.swift    extension-status diagnostics page
   SettingsView.swift       read-only-by-default preference
   Model/NTFSDevice.swift

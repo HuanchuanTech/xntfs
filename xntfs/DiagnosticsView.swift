@@ -2,8 +2,8 @@
 //  DiagnosticsView.swift
 //  Explains why the FSKit extension may not be working and how to fix it.
 //
-//  Everything here is sandbox-safe: extension state comes from FSClient
-//  (FSModuleIdentity), and anything the sandbox can't do — the pre-27 force-enable
+//  Everything here is sandbox-safe: registration comes from FSClient on macOS 26+;
+//  macOS 15 can only confirm the bundled extension. Anything the sandbox can't do — the pre-27 force-enable
 //  workaround, inspecting the resolved install path — is offered as a copyable
 //  Terminal command for the user to run, never executed by the app.
 //
@@ -39,7 +39,7 @@ struct DiagnosticsView: View {
                     installedCheck
                     Divider()
                     enabledCheck
-                    if status.isInstalled {
+                    if status.isInstalled || status.bundledExtensionURL != nil {
                         Divider()
                         registrationCheck
                     }
@@ -51,6 +51,12 @@ struct DiagnosticsView: View {
             Divider()
 
             HStack {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(status.diagnosticReport, forType: .string)
+                } label: {
+                    Label("Copy Diagnostics", systemImage: "doc.on.doc")
+                }
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
@@ -67,30 +73,36 @@ struct DiagnosticsView: View {
     // MARK: checks
 
     private var installedCheck: some View {
-        CheckRow(ok: status.state == .unknown ? nil : status.isInstalled,
-                 title: "Extension installed",
-                 detail: status.isInstalled
-                    ? "ntfs3g is registered with the system."
-                    : (status.state == .unknown
-                       ? "Couldn't query FSKit — try Re-check."
-                       : "Not found. Run the app from Xcode once, or install it to /Applications.")) {
-            EmptyView()
+        CheckRow(ok: status.state == .bundled ? true : (status.state == .unknown ? nil : status.isInstalled),
+                 title: ExtensionStatus.needsLegacyCompatibility ? "Extension in this app" : "Extension installed",
+                 detail: installationDetail) {
+            if let error = status.queryError {
+                Text(verbatim: "\(error.domain) (\(error.code)): \(error.localizedDescription)")
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+            }
         }
     }
 
+    private var installationDetail: LocalizedStringKey {
+        if status.state == .bundled {
+            return "ntfs3g is included in this app. macOS 15 cannot reliably report third-party FSKit registration or enablement to the app."
+        }
+        if status.isInstalled { return "ntfs3g is registered with the system." }
+        if status.state == .unknown { return "Couldn't query FSKit — try Re-check." }
+        return "Not found. Run the app from Xcode once, or install it to /Applications."
+    }
+
     private var enabledCheck: some View {
-        CheckRow(ok: status.state == .enabled ? true : (status.isInstalled ? false : nil),
+        CheckRow(ok: status.isEnabled,
                  title: "Extension enabled",
-                 detail: status.state == .enabled
-                    ? "ntfs3g is enabled and available to mount NTFS volumes."
-                    : "Turn on ntfs3g under File System Extensions.") {
-            if status.state == .disabled {
+                 detail: enablementDetail) {
+            if status.state == .disabled || status.state == .bundled {
                 VStack(alignment: .leading, spacing: 12) {
                     Button("Open Settings…") {
-                        ExtensionStatus.openSettings()
-                        visitedSettings = true
+                        visitedSettings = ExtensionStatus.openSettings()
                     }
-                    if visitedSettings {
+                    if ExtensionStatus.supportsEnableWorkaround && visitedSettings && status.state == .disabled {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Still off after toggling? On macOS 26 the File System Extensions switch can be a no-op (a known system bug). As a last resort — unsupported — inspect the FSKit settings, force-enable, and restart its agent:")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -101,6 +113,19 @@ struct DiagnosticsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var enablementDetail: LocalizedStringKey {
+        switch status.state {
+        case .enabled:
+            return "ntfs3g is enabled in System Settings."
+        case .unknown:
+            return "Couldn't query FSKit — try Re-check."
+        case .bundled:
+            return "Status unavailable on macOS 15. Check the ntfs3g switch in System Settings; an unknown status does not mean it is disabled."
+        case .disabled, .notInstalled:
+            return "Turn on ntfs3g under File System Extensions."
         }
     }
 
@@ -132,7 +157,7 @@ struct DiagnosticsView: View {
         if status.isDuplicated { return "More than one registration found — this can grey out the toggle." }
         switch status.registrationOK {
         case true?:  return "A single copy under /Applications."
-        case false?: return "Loaded from a dev build (DerivedData) — install the release app to /Applications."
+        case false?: return "FSKit reports a copy outside /Applications. Check which app is registered."
         default:     return "Install path unknown."
         }
     }
