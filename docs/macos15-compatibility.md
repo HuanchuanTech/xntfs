@@ -1,5 +1,13 @@
 # macOS 15 compatibility
 
+## Known filesystem defect
+
+Deleting an open file, or replacing an open destination by rename, can invalidate
+its existing handles on macOS 15. Later reads or metadata queries may fail with
+`ENOENT`. This remains unresolved and its fix is deferred. Close files in all apps
+before deleting or replacing them; the mounting workaround below does not address
+this defect. See [the scope and validation details](issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime).
+
 ## Behavior
 
 - On macOS 15, the app checks its embedded `ntfs3g.appex` instead of treating an

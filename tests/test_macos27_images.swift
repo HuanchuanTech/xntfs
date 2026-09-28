@@ -45,8 +45,9 @@ struct NativeImageTests {
             }
             try ImageMountService.validateImage(source)
             let initialHash = try hash(source)
-            for phase in ["ro", "rw", "remount-ro"] {
-                let readOnly = phase != "rw"
+            for phase in ["ro", "rw", "remount-ro", "prepare-hibernation", "fallback-ro"] {
+                let readOnly = phase == "ro" || phase == "remount-ro"
+                let expectedReadOnly = readOnly || phase == "fallback-ro"
                 let model = AppModel()
                 let url = try await model.mountImage(source, readOnly: readOnly)
                 guard let image = model.mountedImages.first(where: { $0.mountPoint == url }) else {
@@ -54,7 +55,7 @@ struct NativeImageTests {
                 }
                 active = image
                 print("MOUNT mode=\(phase) readOnly=\(image.readOnly) bytes=\(image.sizeBytes) source=\(image.source.absoluteString) expected=\(source.absoluteString)")
-                guard image.readOnly == readOnly,
+                guard image.readOnly == expectedReadOnly,
                       image.source.standardizedFileURL == source.standardizedFileURL,
                       image.sizeBytes > 0 else { throw TestFailure("Incorrect image identity/access/capacity") }
                 let reopenedModel = AppModel()

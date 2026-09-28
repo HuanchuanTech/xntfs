@@ -41,6 +41,17 @@ xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
 The extension uses a restricted FSKit entitlement. A locally built copy requires a signing team
 whose provisioning profile authorizes it; building alone does not enable the extension.
 
+## Known issues
+
+- **macOS 15: deleting or replacing an open file can invalidate its existing handles.**
+  If a file is deleted, or replaced by renaming another file over it, while an app still
+  has it open, subsequent reads or metadata queries through the old handle may fail
+  with `ENOENT` (file not found). This remains unfixed on macOS 15; a fix is deferred.
+  Close files in all apps before deleting or replacing them. The current source enables
+  FSKit's open-unlink emulation on macOS 26+, with mounted tests passing on macOS 27;
+  that API is unavailable on macOS 15. See [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
+  and [validation details](docs/issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime).
+
 ## The six features
 
 1. **Localization (English + Simplified Chinese)** — `xntfs/Localizable.xcstrings` (String Catalog). Add more

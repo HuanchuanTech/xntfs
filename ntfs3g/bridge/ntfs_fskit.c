@@ -38,9 +38,17 @@
 #include "ntfs_fskit.h"
 
 /* ---- Device context + operations backed by FSBlockDeviceResource ---- */
+typedef struct nfsk_inode_ref {
+    ntfs_inode *inode;
+    struct nfsk_inode_ref *next;
+} nfsk_inode_ref;
+
 typedef struct {
     void    *resource;   /* __bridge FSBlockDeviceResource* (owned by Swift) */
     int64_t  pos;
+    nfsk_inode_ref *inodes;
+    int writeback_error;
+    int fatal_writeback_error;
 } nfsk_devctx;
 
 static int dev_open(struct ntfs_device *dev, int flags) {
@@ -154,6 +162,70 @@ struct ntfs_fskit_volume {
     int          read_only;
 };
 
+static nfsk_devctx *volume_context(ntfs_volume *vol) { return vol->dev->d_private; }
+
+/* Reserve ownership before opening: failed closes must retain their dirty inode.
+ * Block new operations until synchronize retries it, avoiding duplicate live inodes. */
+static ntfs_inode *nfsk_inode_open(ntfs_volume *vol, MFT_REF ref) {
+    nfsk_devctx *ctx = volume_context(vol);
+    if (ctx->writeback_error) { errno = ctx->writeback_error; return NULL; }
+    nfsk_inode_ref *entry = calloc(1, sizeof(*entry));
+    if (!entry) return NULL;
+    ntfs_inode *ni = ntfs_inode_open(vol, ref);
+    if (!ni) { int saved = errno; free(entry); errno = saved; return NULL; }
+    entry->inode = ni;
+    entry->next = ctx->inodes;
+    ctx->inodes = entry;
+    return ni;
+}
+
+static void nfsk_forget_inode(ntfs_inode *ni) {
+    nfsk_inode_ref **entry = &volume_context(ni->vol)->inodes;
+    while (*entry && (*entry)->inode != ni) entry = &(*entry)->next;
+    if (*entry) { nfsk_inode_ref *old = *entry; *entry = old->next; free(old); }
+}
+
+static int nfsk_real_close(ntfs_inode *ni) {
+#if CACHE_NIDATA_SIZE
+    // The caching close can retry/free an inode while still returning its first error.
+    return ntfs_inode_real_close(ni);
+#else
+    return ntfs_inode_close(ni);
+#endif
+}
+
+static int nfsk_inode_close(ntfs_inode *ni) {
+    if (!ni) return 0;
+    int saved = errno;
+    nfsk_devctx *ctx = volume_context(ni->vol);
+    nfsk_inode_ref **entry = &ctx->inodes;
+    while (*entry && (*entry)->inode != ni) entry = &(*entry)->next;
+    if (nfsk_real_close(ni)) {
+        int error = errno ? errno : EIO;
+        if (!ctx->writeback_error) ctx->writeback_error = error;
+        errno = error;
+        return -1;
+    }
+    if (*entry) { nfsk_inode_ref *old = *entry; *entry = old->next; free(old); }
+    errno = saved;
+    return 0;
+}
+
+static int nfsk_delete(ntfs_volume *vol, ntfs_inode *ni, ntfs_inode *dir,
+                       const ntfschar *name, int length) {
+    // ntfs_delete consumes both pointers, including on failure.
+    nfsk_forget_inode(ni);
+    nfsk_forget_inode(dir);
+    int rc = ntfs_delete(vol, NULL, ni, dir, name, length);
+    if (rc && (errno == EIO || errno == EBUSY || errno == ENOSPC)) {
+        nfsk_devctx *ctx = volume_context(vol);
+        // The namespace may already have changed. Never run a destructive rollback
+        // or acknowledge a successful sync after an unrecoverable internal writeback.
+        ctx->fatal_writeback_error = ctx->writeback_error = errno;
+    }
+    return rc;
+}
+
 static inline u64 to_mref(uint64_t ino) {
     return (ino == NFSK_ROOT_INO) ? (u64)FILE_root : (u64)ino;
 }
@@ -175,7 +247,7 @@ static inline int is_reserved_mft(u64 mft_no) {
  * A real emptiness-probe failure (EIO/corruption — NOT "directory not empty") is
  * reported as -1 with errno, so it is never silently turned into ENOTEMPTY. */
 static int nfsk_isdir(ntfs_volume *vol, u64 ref, int *empty_out) {
-    ntfs_inode *ni = ntfs_inode_open(vol, ref);
+    ntfs_inode *ni = nfsk_inode_open(vol, ref);
     if (!ni) return -1;
     int isdir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) ? 1 : 0;
     int ret = isdir, saved = 0;
@@ -189,7 +261,7 @@ static int nfsk_isdir(ntfs_volume *vol, u64 ref, int *empty_out) {
             }
         }
     }
-    ntfs_inode_close(ni);
+    nfsk_inode_close(ni);
     if (ret == -1 && saved) errno = saved;
     return ret;
 }
@@ -230,10 +302,10 @@ static int nfsk_dir_contains(ntfs_volume *vol, u64 sref, uint64_t dst_dir) {
     for (int guard = 0; guard < 65536; guard++) {
         if (MREF(cur) == MREF(sref)) return 1;
         if (MREF(cur) == (u64)FILE_root) return 0;
-        ntfs_inode *ni = ntfs_inode_open(vol, cur);
+        ntfs_inode *ni = nfsk_inode_open(vol, cur);
         if (!ni) return -1;                                /* errno from ntfs_inode_open */
         u64 par = nfsk_parent_mft_raw(ni);
-        ntfs_inode_close(ni);                              /* clobbers errno, so set it below */
+        nfsk_inode_close(ni);                              /* clobbers errno, so set it below */
         if (par == (u64)-1) { errno = EIO; return -1; }    /* unreadable parent chain */
         cur = par;
     }
@@ -298,6 +370,13 @@ ntfs_fskit_volume *nfsk_mount(void *resource, bool read_only, int *out_errno) {
         free(ctx);
         return NULL;
     }
+    if (ntfs_volume_get_free_space(vol) || ntfs_set_ignore_case(vol)) {
+        int saved = errno ? errno : EIO;
+        ntfs_umount(vol, TRUE);
+        free(ctx);
+        if (out_errno) *out_errno = saved;
+        return NULL;
+    }
     /* ntfs_make_symlink/ntfs_get_abslink resolve an *absolute* reparse target relative to
      * vol->abs_mnt_point (the `mnt_point` arg is ignored — it's __attribute__((unused))).
      * ntfs_device_mount leaves abs_mnt_point NULL (only the FUSE layer sets it), so an
@@ -336,6 +415,22 @@ int nfsk_probe(void *resource, char *name_out, size_t name_cap, uint64_t *serial
 
 void nfsk_umount(ntfs_fskit_volume *v) {
     if (!v) return;
+    if (v->vol && nfsk_sync(v)) ntfs_log_error("xntfs: unmount after a writeback error\n");
+    // A forced teardown cannot keep retrying an unavailable device. Report the
+    // failure, then discard only the in-memory copies after the failed sync.
+    while (v->devctx && v->devctx->inodes) {
+        nfsk_inode_ref *entry = v->devctx->inodes;
+        ntfs_inode *ni = entry->inode;
+        NInoClearDirty(ni);
+        NInoAttrListClearDirty(ni);
+        for (int i = 0; i < ni->nr_extents; i++) {
+            NInoClearDirty(ni->extent_nis[i]);
+            NInoAttrListClearDirty(ni->extent_nis[i]);
+        }
+        (void)nfsk_real_close(ni);
+        v->devctx->inodes = entry->next;
+        free(entry);
+    }
     if (v->vol) ntfs_umount(v->vol, TRUE);
     free(v->devctx);
     free(v);
@@ -344,8 +439,27 @@ void nfsk_umount(ntfs_fskit_volume *v) {
 int nfsk_sync(ntfs_fskit_volume *v) {
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return 0;
-    if (ntfs_device_sync(v->vol->dev)) return -errno;
-    return 0;
+    nfsk_devctx *ctx = v->devctx;
+    int saved = ctx->writeback_error, current = ctx->fatal_writeback_error;
+    nfsk_inode_ref **entry = &ctx->inodes;
+    while (*entry) {
+        nfsk_inode_ref *pending = *entry;
+        if (nfsk_real_close(pending->inode)) {
+            if (!current) current = errno ? errno : EIO;
+            entry = &pending->next;
+        } else {
+            *entry = pending->next;
+            free(pending);
+        }
+    }
+    ntfs_inode *metadata[] = { v->vol->lcnbmp_ni, v->vol->mft_ni,
+                              v->vol->mftmirr_ni, v->vol->vol_ni, v->vol->secure_ni };
+    for (size_t i = 0; i < sizeof(metadata) / sizeof(metadata[0]); i++) {
+        if (metadata[i] && ntfs_inode_sync(metadata[i]) && !current) current = errno ? errno : EIO;
+    }
+    if (ntfs_device_sync(v->vol->dev) && !current) current = errno ? errno : EIO;
+    ctx->writeback_error = current;
+    return -(current ? current : saved);
 }
 
 int nfsk_statfs(ntfs_fskit_volume *v, nfsk_statfs_t *out) {
@@ -391,7 +505,7 @@ static int nfsk_is_readable_symlink(ntfs_inode *ni) {
 int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
     if (!v || !v->vol || !out) return -EINVAL;
     if (is_reserved_mft(to_mref(ino))) return -ENOENT;   /* metadata is not a file */
-    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
 
     memset(out, 0, sizeof(*out));
@@ -436,23 +550,61 @@ int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
         out->mode = (ni->flags & FILE_ATTR_READONLY) ? 0444 : 0666;
     }
     fill_times(out, ni);
-    ntfs_inode_close(ni);
+    nfsk_inode_close(ni);
     return 0;
 }
 
 uint64_t nfsk_lookup(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8, int *out_errno) {
-    if (!v || !v->vol) { if (out_errno) *out_errno = EINVAL; return 0; }
-    ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
+    return nfsk_lookup_name(v, dir_ino, name_utf8, NULL, 0, out_errno);
+}
+
+uint64_t nfsk_lookup_name(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8,
+                          char *canonical_name, size_t capacity, int *out_errno) {
+    if (!v || !v->vol || !name_utf8 || (canonical_name && !capacity)) {
+        if (out_errno) *out_errno = EINVAL; return 0;
+    }
+    if (out_errno) *out_errno = 0;
+    ntfs_inode *dir = nfsk_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) { if (out_errno) *out_errno = errno; return 0; }
 
     ntfschar *uname = NULL;
     int ulen = ntfs_mbstoucs(name_utf8, &uname);
-    if (ulen < 0) { if (out_errno) *out_errno = errno; ntfs_inode_close(dir); return 0; }
+    if (ulen < 0) { if (out_errno) *out_errno = errno; nfsk_inode_close(dir); return 0; }
     u64 mref = ntfs_inode_lookup_by_name(dir, uname, ulen);
+    int saved = mref == (u64)-1 ? (errno ? errno : ENOENT) : 0;
+    nfsk_inode_close(dir);
+    if (!saved && is_reserved_mft(MREF(mref))) saved = ENOENT;
+    if (!saved && canonical_name) {
+        ntfs_inode *ni = nfsk_inode_open(v->vol, mref);
+        if (!ni) saved = errno ? errno : EIO;
+        else {
+            ntfs_attr_search_ctx *search = ntfs_attr_get_search_ctx(ni, NULL);
+            if (!search) saved = errno ? errno : ENOMEM;
+            else {
+                saved = ENOENT;
+                while (!ntfs_attr_lookup(AT_FILE_NAME, AT_UNNAMED, 0, CASE_SENSITIVE, 0, NULL, 0, search)) {
+                    const FILE_NAME_ATTR *fn = (const FILE_NAME_ATTR *)
+                        ((const u8 *)search->attr + le16_to_cpu(search->attr->value_offset));
+                    if (MREF(le64_to_cpu(fn->parent_directory)) != to_mref(dir_ino) ||
+                        !ntfs_names_are_equal(fn->file_name, fn->file_name_length, uname, ulen,
+                                              IGNORE_CASE, v->vol->upcase, v->vol->upcase_len)) continue;
+                    char *text = NULL;
+                    int length = ntfs_ucstombs(fn->file_name, fn->file_name_length, &text, 0);
+                    if (length < 0) saved = errno ? errno : EILSEQ;
+                    else if ((size_t)length >= capacity) saved = ENAMETOOLONG;
+                    else { memcpy(canonical_name, text, length + 1); saved = 0; }
+                    free(text);
+                    if (saved || ntfs_names_are_equal(fn->file_name, fn->file_name_length, uname, ulen,
+                                                      CASE_SENSITIVE, NULL, 0)) break;
+                }
+                if (errno != ENOENT && errno != 0 && saved == ENOENT) saved = errno;
+                ntfs_attr_put_search_ctx(search);
+            }
+            nfsk_inode_close(ni);
+        }
+    }
     free(uname);
-    ntfs_inode_close(dir);
-    if (mref == (u64)-1) { if (out_errno) *out_errno = errno ? errno : ENOENT; return 0; }
-    if (is_reserved_mft(MREF(mref))) { if (out_errno) *out_errno = ENOENT; return 0; }  /* don't expose metadata */
+    if (saved) { if (out_errno) *out_errno = saved; return 0; }
     return from_mft(MREF(mref));
 }
 
@@ -480,11 +632,11 @@ static int bridge_filldir(void *dirent, const ntfschar *name, const int name_len
     uint32_t type = map_dt(dt_type);
     if (dt_type == NTFS_DT_REPARSE || dt_type == NTFS_DT_LNK) {
         /* Match getattr: a resolvable symlink lists as SYMLINK so FSKit offers readlink. */
-        ntfs_inode *eni = ntfs_inode_open(fc->vol, mref);
+        ntfs_inode *eni = nfsk_inode_open(fc->vol, mref);
         if (eni) {
             if (nfsk_is_readable_symlink(eni))
                 type = NFSK_TYPE_SYMLINK;
-            ntfs_inode_close(eni);
+            nfsk_inode_close(eni);
         }
     }
     uint64_t ino = from_mft(MREF(mref));
@@ -496,14 +648,14 @@ static int bridge_filldir(void *dirent, const ntfschar *name, const int name_len
 
 int nfsk_readdir(ntfs_fskit_volume *v, uint64_t dir_ino, int64_t start_cookie, void *ctx, nfsk_dir_cb cb) {
     if (!v || !v->vol || !cb) return -EINVAL;
-    ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
+    ntfs_inode *dir = nfsk_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) return -errno;
 
     struct fill_ctx fc = { v->vol, cb, ctx, start_cookie < 0 ? 0 : start_cookie, 0, 0 };
     s64 pos = 0;
     errno = 0;
     int rc = ntfs_readdir(dir, &pos, &fc, bridge_filldir);
-    ntfs_inode_close(dir);
+    nfsk_inode_close(dir);
     if (rc && !fc.stopped) return -(errno ? errno : EIO);
     return 0;
 }
@@ -513,10 +665,10 @@ int64_t nfsk_read(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, void *buf,
     if (!v || !v->vol || len < 0) { if (out_errno) *out_errno = EINVAL; return -1; }
     if (is_reserved_mft(to_mref(ino))) { if (out_errno) *out_errno = EPERM; return -1; }
     if (len == 0) return 0;
-    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) { if (out_errno) *out_errno = errno; return -1; }
     ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-    if (!na) { if (out_errno) *out_errno = errno; ntfs_inode_close(ni); return -1; }
+    if (!na) { if (out_errno) *out_errno = errno; nfsk_inode_close(ni); return -1; }
 
     int64_t result;
     s64 max = na->data_size;
@@ -533,7 +685,7 @@ int64_t nfsk_read(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, void *buf,
 done:
     ntfs_attr_close(na);
     if (!v->read_only && result >= 0) ntfs_inode_update_times(ni, NTFS_UPDATE_ATIME);
-    ntfs_inode_close(ni);
+    nfsk_inode_close(ni);
     return result;
 }
 
@@ -542,10 +694,10 @@ int64_t nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const voi
     if (v->read_only) { if (out_errno) *out_errno = EROFS; return -1; }
     if (is_reserved_mft(to_mref(ino))) { if (out_errno) *out_errno = EPERM; return -1; }
     if (len == 0) return 0;
-    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) { if (out_errno) *out_errno = errno; return -1; }
     ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-    if (!na) { if (out_errno) *out_errno = errno; ntfs_inode_close(ni); return -1; }
+    if (!na) { if (out_errno) *out_errno = errno; nfsk_inode_close(ni); return -1; }
 
     int64_t total = 0;
     while (len > 0) {
@@ -555,7 +707,10 @@ int64_t nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const voi
     }
     ntfs_attr_close(na);
     if (total > 0) { ni->flags |= FILE_ATTR_ARCHIVE; ntfs_inode_update_times(ni, NTFS_UPDATE_MCTIME); }
-    ntfs_inode_close(ni);
+    if (nfsk_inode_close(ni) && total >= 0) {
+        if (out_errno) *out_errno = errno ? errno : EIO;
+        return -1;
+    }
     return total;
 }
 
@@ -564,20 +719,32 @@ uint64_t nfsk_create(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_ut
     if (!v || !v->vol) { if (out_errno) *out_errno = EINVAL; return 0; }
     if (v->read_only) { if (out_errno) *out_errno = EROFS; return 0; }
     if (is_reserved_mft(to_mref(dir_ino))) { if (out_errno) *out_errno = EPERM; return 0; }
-    ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
+    ntfs_inode *dir = nfsk_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) { if (out_errno) *out_errno = errno; return 0; }
 
     ntfschar *uname = NULL;
     int ulen = ntfs_mbstoucs(name_utf8, &uname);
-    if (ulen < 0) { if (out_errno) *out_errno = errno; ntfs_inode_close(dir); return 0; }
+    if (ulen < 0) { if (out_errno) *out_errno = errno; nfsk_inode_close(dir); return 0; }
 
+    errno = 0;
+    u64 existing = ntfs_inode_lookup_by_name(dir, uname, ulen);
+    if (existing != (u64)-1 || errno != ENOENT) {
+        int saved = existing != (u64)-1 ? EEXIST : (errno ? errno : EIO);
+        free(uname); nfsk_inode_close(dir);
+        if (out_errno) *out_errno = saved;
+        return 0;
+    }
+    nfsk_inode_ref *owned = calloc(1, sizeof(*owned));
+    if (!owned) { free(uname); nfsk_inode_close(dir); if (out_errno) *out_errno = ENOMEM; return 0; }
     mode_t kind = (type == NFSK_TYPE_DIR) ? S_IFDIR : S_IFREG;
     ntfs_inode *ni = ntfs_create(dir, const_cpu_to_le32(0), uname, ulen, kind);
     free(uname);
-    if (!ni) { if (out_errno) *out_errno = errno ? errno : EIO; ntfs_inode_close(dir); return 0; }
+    if (!ni) { if (out_errno) *out_errno = errno ? errno : EIO; free(owned); nfsk_inode_close(dir); return 0; }
+    owned->inode = ni; owned->next = v->devctx->inodes; v->devctx->inodes = owned;
     uint64_t new_ino = from_mft(ni->mft_no);
-    ntfs_inode_close(ni);
-    ntfs_inode_close(dir);
+    nfsk_inode_close(ni);
+    nfsk_inode_close(dir);
+    if (v->devctx->writeback_error) { if (out_errno) *out_errno = v->devctx->writeback_error; return 0; }
     return new_ino;
 }
 
@@ -585,19 +752,19 @@ int nfsk_remove(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8) {
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return -EROFS;
     if (is_reserved_mft(to_mref(dir_ino))) return -EPERM;
-    ntfs_inode *dir = ntfs_inode_open(v->vol, to_mref(dir_ino));
+    ntfs_inode *dir = nfsk_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) return -errno;
 
     ntfschar *uname = NULL;
     int ulen = ntfs_mbstoucs(name_utf8, &uname);
-    if (ulen < 0) { int e = errno; ntfs_inode_close(dir); return -e; }
+    if (ulen < 0) { int e = errno; nfsk_inode_close(dir); return -e; }
 
     u64 mref = ntfs_inode_lookup_by_name(dir, uname, ulen);
-    if (mref == (u64)-1) { int e = errno ? errno : ENOENT; free(uname); ntfs_inode_close(dir); return -e; }
-    if (is_reserved_mft(MREF(mref))) { free(uname); ntfs_inode_close(dir); return -EPERM; }  /* don't remove metadata */
-    ntfs_inode *ni = ntfs_inode_open(v->vol, mref);
-    if (!ni) { int e = errno; free(uname); ntfs_inode_close(dir); return -e; }
-    int rc = ntfs_delete(v->vol, NULL, ni, dir, uname, ulen);   /* always closes ni and dir */
+    if (mref == (u64)-1) { int e = errno ? errno : ENOENT; free(uname); nfsk_inode_close(dir); return -e; }
+    if (is_reserved_mft(MREF(mref))) { free(uname); nfsk_inode_close(dir); return -EPERM; }  /* don't remove metadata */
+    ntfs_inode *ni = nfsk_inode_open(v->vol, mref);
+    if (!ni) { int e = errno; free(uname); nfsk_inode_close(dir); return -e; }
+    int rc = nfsk_delete(v->vol, ni, dir, uname, ulen);
     int e = rc ? (errno ? errno : EIO) : 0;
     free(uname);
     return rc ? -e : 0;
@@ -607,16 +774,16 @@ int nfsk_truncate(ntfs_fskit_volume *v, uint64_t ino, uint64_t size) {
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return -EROFS;
     if (is_reserved_mft(to_mref(ino))) return -EPERM;
-    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
     ntfs_attr *na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-    if (!na) { int e = errno; ntfs_inode_close(ni); return -e; }
+    if (!na) { int e = errno; nfsk_inode_close(ni); return -e; }
     int rc = ntfs_attr_truncate(na, (s64)size);
     int e = rc ? (errno ? errno : EIO) : 0;
     ntfs_attr_close(na);
     if (!rc) { ni->flags |= FILE_ATTR_ARCHIVE; ntfs_inode_update_times(ni, NTFS_UPDATE_MCTIME); }
-    ntfs_inode_close(ni);
-    return rc ? -e : 0;
+    if (nfsk_inode_close(ni) && !e) e = errno ? errno : EIO;
+    return e ? -e : 0;
 }
 
 int nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
@@ -624,13 +791,13 @@ int nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
     if (!v || !v->vol) return -EINVAL;
     if (v->read_only) return -EROFS;
     if (is_reserved_mft(to_mref(ino))) return -EPERM;
-    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
     if (mtime_sec != INT64_MIN) { struct timespec ts = { (time_t)mtime_sec, (long)mtime_nsec }; ni->last_data_change_time = timespec2ntfs(ts); }
     if (atime_sec != INT64_MIN) { struct timespec ts = { (time_t)atime_sec, (long)atime_nsec }; ni->last_access_time = timespec2ntfs(ts); }
     ni->last_mft_change_time = ntfs_current_time();
     ntfs_inode_mark_dirty(ni);
-    int rc = ntfs_inode_close(ni);
+    int rc = nfsk_inode_close(ni);
     return rc ? -errno : 0;
 }
 
@@ -645,14 +812,20 @@ int nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
 /* Add directory entry `name` in directory #dir_no pointing at inode `ref`. */
 static int nfsk_link_name(ntfs_volume *vol, uint64_t dir_no, u64 ref,
                           const ntfschar *name, int name_len) {
-    ntfs_inode *dir = ntfs_inode_open(vol, to_mref(dir_no));
+    ntfs_inode *dir = nfsk_inode_open(vol, to_mref(dir_no));
     if (!dir) return -1;
-    ntfs_inode *ni = ntfs_inode_open(vol, ref);
-    if (!ni) { int e = errno; ntfs_inode_close(dir); errno = e; return -1; }
+    ntfs_inode *ni = nfsk_inode_open(vol, ref);
+    if (!ni) { int e = errno; nfsk_inode_close(dir); errno = e; return -1; }
+    errno = 0;
+    u64 existing = ntfs_inode_lookup_by_name(dir, name, name_len);
+    if (existing != (u64)-1 || errno != ENOENT) {
+        int e = existing != (u64)-1 ? EEXIST : (errno ? errno : EIO);
+        nfsk_inode_close(ni); nfsk_inode_close(dir); errno = e; return -1;
+    }
     int r = ntfs_link(ni, dir, name, name_len);   /* closes neither inode */
     int e = errno;
-    ntfs_inode_close(ni);
-    ntfs_inode_close(dir);
+    nfsk_inode_close(ni);
+    nfsk_inode_close(dir);
     if (r) { errno = e; return -1; }
     return 0;
 }
@@ -660,14 +833,14 @@ static int nfsk_link_name(ntfs_volume *vol, uint64_t dir_no, u64 ref,
 /* Remove directory entry `name` from directory #dir_no. */
 static int nfsk_unlink_name(ntfs_volume *vol, uint64_t dir_no,
                             const ntfschar *name, int name_len) {
-    ntfs_inode *dir = ntfs_inode_open(vol, to_mref(dir_no));
+    ntfs_inode *dir = nfsk_inode_open(vol, to_mref(dir_no));
     if (!dir) return -1;
     u64 ref = ntfs_inode_lookup_by_name(dir, name, name_len);
-    if (ref == (u64)-1) { int e = errno; ntfs_inode_close(dir); errno = e ? e : ENOENT; return -1; }
-    ntfs_inode *ni = ntfs_inode_open(vol, ref);
-    if (!ni) { int e = errno; ntfs_inode_close(dir); errno = e; return -1; }
+    if (ref == (u64)-1) { int e = errno; nfsk_inode_close(dir); errno = e ? e : ENOENT; return -1; }
+    ntfs_inode *ni = nfsk_inode_open(vol, ref);
+    if (!ni) { int e = errno; nfsk_inode_close(dir); errno = e; return -1; }
     /* ntfs_delete closes BOTH ni and dir, even on failure. */
-    return ntfs_delete(vol, NULL, ni, dir, name, name_len) ? -1 : 0;
+    return nfsk_delete(vol, ni, dir, name, name_len) ? -1 : 0;
 }
 
 /* Unique temp-name disambiguator; all bridge calls run under the volume lock. */
@@ -688,7 +861,7 @@ static int nfsk_safe_overwrite(ntfs_volume *vol,
     int tmplen = 0, e;
     /* Pick a temp name that does not already exist in the destination directory. */
     {
-        ntfs_inode *ddir = ntfs_inode_open(vol, to_mref(dst_dir));
+        ntfs_inode *ddir = nfsk_inode_open(vol, to_mref(dst_dir));
         if (!ddir) return -1;
         int found = 0;
         for (int tries = 0; tries < 4096; tries++) {
@@ -697,15 +870,15 @@ static int nfsk_safe_overwrite(ntfs_volume *vol,
                      (unsigned long long)MREF(dref), ++nfsk_rename_seq);
             free(utmp); utmp = NULL;
             tmplen = ntfs_mbstoucs(tmpname, &utmp);
-            if (tmplen < 0) { ntfs_inode_close(ddir); free(utmp); return -1; }
+            if (tmplen < 0) { nfsk_inode_close(ddir); free(utmp); return -1; }
             errno = 0;
             u64 ex = ntfs_inode_lookup_by_name(ddir, utmp, tmplen);
             if (ex == (u64)-1) {
                 if (errno == 0 || errno == ENOENT) { found = 1; break; }   /* name is free */
-                int le = errno; ntfs_inode_close(ddir); free(utmp); errno = le; return -1;
+                int le = errno; nfsk_inode_close(ddir); free(utmp); errno = le; return -1;
             }
         }
-        ntfs_inode_close(ddir);
+        nfsk_inode_close(ddir);
         if (!found) { free(utmp); errno = EEXIST; return -1; }
     }
 
@@ -772,11 +945,11 @@ int nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_name,
 
     /* Resolve the source inode. */
     {
-        ntfs_inode *sdir = ntfs_inode_open(vol, to_mref(src_dir));
+        ntfs_inode *sdir = nfsk_inode_open(vol, to_mref(src_dir));
         if (!sdir) { e = errno; rc = -1; goto out; }
         sref = ntfs_inode_lookup_by_name(sdir, usrc, slen);
         e = errno;
-        ntfs_inode_close(sdir);
+        nfsk_inode_close(sdir);
         if (sref == (u64)-1) { e = e ? e : ENOENT; rc = -1; goto out; }
     }
     if (is_reserved_mft(MREF(sref))) { e = EPERM; rc = -1; goto out; }  /* can't move metadata */
@@ -794,12 +967,12 @@ int nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_name,
        only when errno is ENOENT/unset; any other errno is a real error (corruption or
        I/O) and must abort rather than fall through to the "no destination" path. */
     {
-        ntfs_inode *ddir = ntfs_inode_open(vol, to_mref(dst_dir));
+        ntfs_inode *ddir = nfsk_inode_open(vol, to_mref(dst_dir));
         if (!ddir) { e = errno; rc = -1; goto out; }
         errno = 0;
         dref = ntfs_inode_lookup_by_name(ddir, udst, dlen);
         int le = errno;
-        ntfs_inode_close(ddir);
+        nfsk_inode_close(ddir);
         if (dref == (u64)-1 && le != 0 && le != ENOENT) { e = le; rc = -1; goto out; }
     }
 
@@ -833,6 +1006,7 @@ int nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_name,
 
 out:
     free(usrc); free(udst);
+    if (!rc && v->devctx->writeback_error) return -v->devctx->writeback_error;
     return rc ? -e : 0;
 }
 
@@ -857,6 +1031,7 @@ int nfsk_link(ntfs_fskit_volume *v, uint64_t target_ino, uint64_t dir_ino,
     int r = nfsk_link_name(v->vol, dir_ino, to_mref(target_ino), uname, ulen);
     int e = errno;
     free(uname);
+    if (!r && v->devctx->writeback_error) { r = -1; e = v->devctx->writeback_error; }
     if (r) { if (out_errno) *out_errno = e ? e : EIO; return -1; }
     return 0;
 }
@@ -864,17 +1039,17 @@ int nfsk_link(ntfs_fskit_volume *v, uint64_t target_ino, uint64_t dir_ino,
 int nfsk_readlink(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t cap) {
     if (!v || !v->vol || !buf || cap == 0) return -EINVAL;
     if (is_reserved_mft(to_mref(ino))) return -EINVAL;
-    ntfs_inode *ni = ntfs_inode_open(v->vol, to_mref(ino));
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
     if (!(ni->flags & FILE_ATTR_REPARSE_POINT) || !ntfs_possible_symlink(ni)) {
-        ntfs_inode_close(ni);
+        nfsk_inode_close(ni);
         return -EINVAL;   /* not a symlink we can resolve */
     }
     /* "/" mount point: a Windows *absolute* target is rewritten relative to the mount
        root (best effort); relative targets — the common POSIX case — pass through as-is. */
     char *target = ntfs_make_symlink(ni, "/");
     int saved = errno;
-    ntfs_inode_close(ni);
+    nfsk_inode_close(ni);
     if (!target) return -(saved ? saved : EINVAL);
     size_t tlen = strlen(target);
     if (tlen >= cap) { free(target); return -ENAMETOOLONG; }   /* don't silently truncate the target */

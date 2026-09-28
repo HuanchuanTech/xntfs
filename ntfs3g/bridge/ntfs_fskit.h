@@ -80,6 +80,8 @@ int  nfsk_statfs(ntfs_fskit_volume *v, nfsk_statfs_t *out);
 /* --- item operations --- */
 int      nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out);
 uint64_t nfsk_lookup(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8, int *out_errno);
+uint64_t nfsk_lookup_name(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8,
+                          char *canonical_name, size_t capacity, int *out_errno);
 int      nfsk_readdir(ntfs_fskit_volume *v, uint64_t dir_ino, int64_t start_cookie, void *ctx, nfsk_dir_cb cb);
 int64_t  nfsk_read(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, void *buf, int64_t len, int *out_errno);
 int64_t  nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const void *buf, int64_t len, int *out_errno);

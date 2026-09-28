@@ -48,7 +48,13 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
             throw posixError(err)
         }
         var st = nfsk_statfs_t()
-        _ = nfsk_statfs(h, &st)
+        let statResult = nfsk_statfs(h, &st)
+        guard statResult == 0 else {
+            nfsk_umount(h)
+            nfsk_backend_free(backend.backend)
+            backend.cleanup()
+            throw posixError(-statResult)
+        }
         let label = withUnsafeBytes(of: st.volume_name) { raw -> String in
             String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
         }
@@ -60,7 +66,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
         self.handle = h
         self.backend = backend
-        self.readOnly = !backend.writable
+        self.readOnly = st.read_only != 0
         self.activationBackend = activationBackend
         self.onContainerStatusChange = onContainerStatusChange
         self.rootItem = root
@@ -173,6 +179,10 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
 
+    // FSKit retains unlinked/overwritten open files until their last reference closes.
+    @available(macOS 26.0, *)
+    var enableOpenUnlinkEmulation: Bool { true }
+
     @available(macOS 26.4, *)
     var requestedMountOptions: FSVolume.MountOptions {
         get { withLock { readOnly ? [.readOnly] : [] } }
@@ -194,6 +204,10 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
                 var err: Int32 = 0
                 guard let h = nfsk_mount(replacement.backend, readOnly, &err) else { throw posixError(err) }
                 handle = h
+                var st = nfsk_statfs_t()
+                let rc = nfsk_statfs(h, &st)
+                guard rc == 0 else { throw posixError(-rc) }
+                readOnly = st.read_only != 0
             }
             activated = true
         }
@@ -206,7 +220,15 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         onContainerStatusChange(.ready)
     }
 
-    func mount(options: FSTaskOptions) async throws {}
+    func mount(options: FSTaskOptions) async throws {
+        try withLock {
+            // Older FSKit cannot request MNT_RDONLY after a writable activation.
+            // Require an explicit read-only retry instead of exposing a writable mount.
+            if #unavailable(macOS 26.4), readOnly && backend?.writable == true {
+                throw posixError(EROFS)
+            }
+        }
+    }
     func unmount() async {
         withLock {
             guard let h = handle else { return }
@@ -266,13 +288,22 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     // MARK: lookup / reclaim
+    private func resolvedName(_ name: String, in directory: UInt64, handle: OpaquePointer) throws -> (UInt64, FSFileName) {
+        var error: Int32 = 0
+        var canonical = [CChar](repeating: 0, count: 1024)
+        let ino = name.withCString { requested in
+            canonical.withUnsafeMutableBufferPointer { buffer in
+                nfsk_lookup_name(handle, directory, requested, buffer.baseAddress, buffer.count, &error)
+            }
+        }
+        guard ino != 0 else { throw posixError(error == 0 ? ENOENT : error) }
+        return (ino, FSFileName(string: String(cString: canonical)))
+    }
+
     func lookupItem(named name: FSFileName, inDirectory directory: FSItem) async throws -> (FSItem, FSFileName) {
         try withLock {
             guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
-            var err: Int32 = 0
-            let ino = nameStr.withCString { nfsk_lookup(h, dir.ino, $0, &err) }
-            if ino == 0 { throw posixError(err == 0 ? ENOENT : err) }
-            let fsName = FSFileName(string: nameStr)
+            let (ino, fsName) = try resolvedName(nameStr, in: dir.ino, handle: h)
             return (item(for: ino, parentIno: dir.ino, name: fsName), fsName)
         }
     }
@@ -280,7 +311,25 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     func reclaimItem(_ item: FSItem) async throws {
         withLock {
             guard let it = item as? ntfs3gItem else { return }
-            if it.ino != NFSK_ROOT_INO { items.removeValue(forKey: it.ino) }
+            guard it.ino != NFSK_ROOT_INO else { return }
+            let removeCachedItem = {
+                if self.items[it.ino] === it { self.items.removeValue(forKey: it.ino) }
+            }
+            if #available(macOS 27.0, *) {
+                _ = it.tryReclaim(removeCachedItem)
+            } else {
+                removeCachedItem()
+            }
+        }
+    }
+
+    private func evictDeletedItem(_ item: FSItem, handle: OpaquePointer) {
+        guard let it = item as? ntfs3gItem, items[it.ino] === it else { return }
+        var attributes = nfsk_attr_t()
+        // NTFS may immediately reuse the record. A later create must get a new
+        // FSItem, even if FSKit has not delivered the deleted object's reclaim yet.
+        if nfsk_getattr(handle, it.ino, &attributes) == -ENOENT {
+            items.removeValue(forKey: it.ino)
         }
     }
 
@@ -330,6 +379,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
             guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
             let rc = nameStr.withCString { nfsk_remove(h, dir.ino, $0) }
             if rc != 0 { throw posixError(-rc) }
+            evictDeletedItem(item, handle: h)
         }
     }
 
@@ -341,11 +391,13 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
                   let h = handle, let src = sourceName.string, let dst = destinationName.string else { throw posixError(EINVAL) }
             let rc = src.withCString { sp in dst.withCString { dp in nfsk_rename(h, sdir.ino, sp, ddir.ino, dp) } }
             if rc != 0 { throw posixError(-rc) }
+            if let overItem { evictDeletedItem(overItem, handle: h) }
+            let (_, actualName) = try resolvedName(dst, in: ddir.ino, handle: h)
             if let it = item as? ntfs3gItem {
                 it.parentIno = ddir.ino
-                it.name = destinationName
+                it.name = actualName
             }
-            return FSFileName(string: dst)
+            return actualName
         }
     }
 

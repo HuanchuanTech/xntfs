@@ -40,6 +40,16 @@ xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
 
 扩展使用受限的 FSKit 权限。本地构建需要签名团队的描述文件授权该权限；编译成功不代表扩展已启用。
 
+## 已知缺陷
+
+- **macOS 15：删除或覆盖仍被打开的文件，可能使已有文件句柄失效。**
+  当应用仍打开着某个文件时，删除该文件，或通过重命名另一文件覆盖它，可能导致应用
+  通过旧句柄读取内容或查询属性时收到 `ENOENT`（文件不存在）。此问题在 macOS 15
+  上仍未修复，暂缓处理。删除或覆盖前，请先在所有应用中关闭该文件。当前源码在
+  macOS 26+ 启用了 FSKit 的打开文件删除模拟机制，并已在 macOS 27 挂载测试中验证；
+  macOS 15 不提供该 API。见 [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
+  和[验证说明](docs/issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime)。
+
 ## 六大功能
 
 1. **本地化(英文 + 简体中文)** —— `xntfs/Localizable.xcstrings`(String Catalog)。

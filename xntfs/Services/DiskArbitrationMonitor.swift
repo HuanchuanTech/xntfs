@@ -128,8 +128,8 @@ final class DiskArbitrationMonitor {
         // seen to mislabel NTFS as MS-DOS/exFAT — so check the real mount fs-type.
         let info = mountURL.flatMap { Self.mountInfo($0) }
         let byModule = info?.fsType == Self.moduleFSType
-        let isNTFSMedia = content == "Windows_NTFS" || kind == "ntfs" || kind == Self.moduleFSType
-        guard byModule || (isNTFSMedia && leaf) else { return nil }
+        guard Self.isNTFSVolume(mountedType: info?.fsType, volumeKind: kind,
+                                contentHint: content, leaf: leaf) else { return nil }
 
         let name = d[kDADiskDescriptionVolumeNameKey as String] as? String
             ?? (d[kDADiskDescriptionMediaNameKey as String] as? String) ?? bsd
@@ -177,11 +177,33 @@ final class DiskArbitrationMonitor {
         return dev
     }
 
+    /// A partition type is only a fallback: MBR type 0x07 also contains exFAT.
+    static func isNTFSVolume(mountedType: String?, volumeKind: String, contentHint: String, leaf: Bool) -> Bool {
+        let mounted = mountedType?.lowercased() ?? ""
+        let kind = volumeKind.lowercased()
+        let ntfsTypes: Set<String> = ["ntfs", moduleFSType, "tuxera_ntfs", "fusefs_txantfs"]
+        if !mounted.isEmpty {
+            // Generic third-party driver names can serve several filesystem formats.
+            if mounted == "ufsd" || mounted == "macfuse" || mounted == "osxfuse" {
+                return leaf && ntfsTypes.contains(kind)
+            }
+            return ntfsTypes.contains(mounted) && (leaf || mounted == moduleFSType)
+        }
+        guard leaf else { return false }
+        if !kind.isEmpty { return ntfsTypes.contains(kind) }
+        return contentHint == "Windows_NTFS"
+    }
+
     /// `(f_fstypename, read-only)` of the filesystem mounted at `url`, or nil if not mounted.
     static func mountInfo(_ url: URL) -> (fsType: String, readOnly: Bool)? {
         guard url.isFileURL else { return nil }
         var s = statfs()
         guard statfs(url.path, &s) == 0 else { return nil }
+        let mountedAt = withUnsafeBytes(of: &s.f_mntonname) { raw in
+            String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+        }
+        // A stale DA path may still exist as a directory on the parent APFS volume.
+        guard URL(fileURLWithPath: mountedAt).standardizedFileURL == url.standardizedFileURL else { return nil }
         let fsType = withUnsafeBytes(of: &s.f_fstypename) { raw in
             String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
         }
