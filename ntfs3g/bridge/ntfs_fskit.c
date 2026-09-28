@@ -28,6 +28,7 @@
 #include <ntfs-3g/volume.h>
 #include <ntfs-3g/inode.h>
 #include <ntfs-3g/dir.h>
+#include <ntfs-3g/index.h>
 #include <ntfs-3g/attrib.h>
 #include <ntfs-3g/unistr.h>
 #include <ntfs-3g/ntfstime.h>
@@ -316,8 +317,7 @@ static int nfsk_dir_contains(ntfs_volume *vol, u64 sref, uint64_t dst_dir) {
 static uint32_t map_dt(unsigned dt_type) {
     switch (dt_type) {
         case NTFS_DT_DIR:     return NFSK_TYPE_DIR;
-        /* Default reparse/link entries to FILE here; bridge_filldir upgrades the ones
-           that are resolvable symlinks to SYMLINK (it has the inode to probe). */
+        /* Reparse links are classified separately after checking their target. */
         case NTFS_DT_LNK:     return NFSK_TYPE_FILE;
         case NTFS_DT_REPARSE: return NFSK_TYPE_FILE;
         case NTFS_DT_FIFO:    return NFSK_TYPE_FIFO;
@@ -609,40 +609,19 @@ uint64_t nfsk_lookup_name(ntfs_fskit_volume *v, uint64_t dir_ino, const char *na
 }
 
 /* ---- Directory enumeration (robust ordinal cookies) ---- */
-struct fill_ctx { ntfs_volume *vol; nfsk_dir_cb cb; void *ctx; int64_t skip; int64_t count; int stopped; };
-
-static int bridge_filldir(void *dirent, const ntfschar *name, const int name_len,
-                          const int name_type, const s64 pos, const MFT_REF mref,
-                          const unsigned dt_type) {
-    (void)pos;
-    struct fill_ctx *fc = dirent;
-    if (fc->stopped) return 1;
-    if (name_type == FILE_NAME_DOS) return 0;
-    if (MREF(mref) < FILE_first_user) return 0;   /* hide NTFS metadata ($MFT, $Boot, ...) */
-
-    char *u = NULL;
-    int l = ntfs_ucstombs(name, name_len, &u, 0);
-    if (l < 0) return 0;
-    if (!strcmp(u, ".") || !strcmp(u, "..")) { free(u); return 0; }
-
-    int64_t ordinal = fc->count;
-    fc->count++;
-    if (ordinal < fc->skip) { free(u); return 0; }
-
-    uint32_t type = map_dt(dt_type);
-    if (dt_type == NTFS_DT_REPARSE || dt_type == NTFS_DT_LNK) {
-        /* Match getattr: a resolvable symlink lists as SYMLINK so FSKit offers readlink. */
-        ntfs_inode *eni = nfsk_inode_open(fc->vol, mref);
-        if (eni) {
-            if (nfsk_is_readable_symlink(eni))
-                type = NFSK_TYPE_SYMLINK;
-            nfsk_inode_close(eni);
-        }
+static int nfsk_directory_entry_type(ntfs_volume *vol, MFT_REF ref,
+                                     FILE_ATTR_FLAGS flags, uint32_t *type) {
+    *type = (flags & FILE_ATTR_I30_INDEX_PRESENT) ? NFSK_TYPE_DIR : NFSK_TYPE_FILE;
+    if ((flags & FILE_ATTR_REPARSE_POINT) ||
+        ((flags & FILE_ATTR_SYSTEM) && !(flags & FILE_ATTR_I30_INDEX_PRESENT))) {
+        ntfs_inode *ni = nfsk_inode_open(vol, ref);
+        if (!ni) return -(errno ? errno : EIO);
+        if (flags & FILE_ATTR_REPARSE_POINT)
+            *type = nfsk_is_readable_symlink(ni) ? NFSK_TYPE_SYMLINK : NFSK_TYPE_FILE;
+        else
+            *type = map_dt(ntfs_interix_types(ni));
+        if (nfsk_inode_close(ni)) return -(errno ? errno : EIO);
     }
-    uint64_t ino = from_mft(MREF(mref));
-    int r = fc->cb(fc->ctx, u, ino, type, ordinal + 1);
-    free(u);
-    if (r != 0) { fc->stopped = 1; return 1; }
     return 0;
 }
 
@@ -651,13 +630,83 @@ int nfsk_readdir(ntfs_fskit_volume *v, uint64_t dir_ino, int64_t start_cookie, v
     ntfs_inode *dir = nfsk_inode_open(v->vol, to_mref(dir_ino));
     if (!dir) return -errno;
 
-    struct fill_ctx fc = { v->vol, cb, ctx, start_cookie < 0 ? 0 : start_cookie, 0, 0 };
-    s64 pos = 0;
+    int saved = 0;
+    ntfs_index_context *index = NULL;
+    if (!(dir->mrec->flags & MFT_RECORD_IS_DIRECTORY)) { saved = ENOTDIR; goto out; }
+    index = ntfs_index_ctx_get(dir, NTFS_INDEX_I30, 4);
+    if (!index) { saved = errno ? errno : ENOMEM; goto out; }
+
+    /* An empty filename sorts before all entries. ENOENT still returns its
+     * insertion position. Read stored names from $I30: ntfs_readdir lowercases
+     * them in ignore-case mode, which must stay enabled for all other operations. */
+    FILE_NAME_ATTR first = {0};
     errno = 0;
-    int rc = ntfs_readdir(dir, &pos, &fc, bridge_filldir);
-    nfsk_inode_close(dir);
-    if (rc && !fc.stopped) return -(errno ? errno : EIO);
-    return 0;
+    if (ntfs_index_lookup(&first, sizeof first, index) && errno != ENOENT) {
+        saved = errno ? errno : EIO;
+        goto out;
+    }
+    if (index->bad_index || !index->entry || !index->ir ||
+        index->ir->type != AT_FILE_NAME || index->ir->collation_rule != COLLATION_FILE_NAME) {
+        saved = EIO;
+        goto out;
+    }
+
+    int64_t ordinal = 0, skip = start_cookie < 0 ? 0 : start_cookie;
+    INDEX_ENTRY *entry = index->entry;
+    while (entry) {
+        if (!(entry->ie_flags & INDEX_ENTRY_END)) {
+            size_t length = le16_to_cpu(entry->length), key_length = le16_to_cpu(entry->key_length);
+            size_t overhead = offsetof(INDEX_ENTRY, key) +
+                ((entry->ie_flags & INDEX_ENTRY_NODE) ? sizeof(VCN) : 0);
+            if (length < overhead || key_length < offsetof(FILE_NAME_ATTR, file_name) ||
+                key_length > length - overhead ||
+                ntfs_index_entry_inconsistent(entry, COLLATION_FILE_NAME, dir->mft_no)) {
+                saved = EIO;
+                break;
+            }
+            const FILE_NAME_ATTR *fn = &entry->key.file_name;
+            if (!fn->file_name_length || fn->file_name_type > FILE_NAME_WIN32_AND_DOS ||
+                offsetof(FILE_NAME_ATTR, file_name) + fn->file_name_length * sizeof(ntfschar) > key_length) {
+                saved = EIO;
+                break;
+            }
+            MFT_REF ref = le64_to_cpu(entry->indexed_file);
+            FILE_ATTR_FLAGS flags = fn->file_attributes;
+            if (fn->file_name_type == FILE_NAME_DOS || MREF(ref) < FILE_first_user ||
+                ((flags & FILE_ATTR_HIDDEN) && !NVolShowHidFiles(v->vol))) goto next_entry;
+
+            char *name = NULL;
+            if (ntfs_ucstombs(fn->file_name, fn->file_name_length, &name, 0) < 0) {
+                saved = errno ? errno : EILSEQ;
+                free(name);
+                break;
+            }
+            if (!strcmp(name, ".") || !strcmp(name, "..")) { free(name); goto next_entry; }
+            if (ordinal == INT64_MAX) { free(name); saved = EOVERFLOW; break; }
+            ordinal++;
+            if (ordinal <= skip) { free(name); goto next_entry; }
+
+            uint32_t type;
+            int rc = nfsk_directory_entry_type(v->vol, ref, flags, &type);
+            if (rc) { free(name); saved = -rc; break; }
+            int stopped = cb(ctx, name, from_mft(MREF(ref)), type, ordinal);
+            free(name);
+            if (stopped) break;
+        }
+next_entry:
+        /* Callbacks and name conversions may leave errno set on success. */
+        errno = 0;
+        entry = ntfs_index_next(entry, index);
+        if (!entry && errno) saved = errno;
+    }
+out:
+    if (index) {
+        /* A failed walk can clear entry while still owning index buffers. */
+        if (saved) index->bad_index = TRUE;
+        ntfs_index_ctx_put(index);
+    }
+    if (nfsk_inode_close(dir) && !saved) saved = errno ? errno : EIO;
+    return -saved;
 }
 
 /* ---- File I/O ---- */

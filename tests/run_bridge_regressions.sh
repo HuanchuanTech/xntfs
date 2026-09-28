@@ -22,3 +22,10 @@ xcrun clang "${flags[@]}" "$root/tests/test_bridge.c" "$root/ntfs3g/bridge/ntfs_
     "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/existing-tests"
 cp "$fixture" "$work/test.img"
 "$work/existing-tests" "$work/test.img" 2>&1 | tee "$work/existing-results.log"
+xcrun clang "${flags[@]}" -Dntfs_index_lookup=nfsk_test_index_lookup \
+    -Dntfs_index_next=nfsk_test_index_next \
+    -c "$root/ntfs3g/bridge/ntfs_fskit.c" -o "$work/enumeration-bridge.o"
+xcrun clang "${flags[@]}" "$root/tests/test_directory_enumeration.c" "$work/enumeration-bridge.o" \
+    "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/enumeration-tests"
+cp "$fixture" "$work/test.img"
+"$work/enumeration-tests" "$work/test.img" 2>&1 | tee "$work/enumeration-results.log"

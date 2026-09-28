@@ -19,6 +19,7 @@ struct VolumeRegressionTests {
         precondition(stats.availableBlocks > stats.totalBlocks / 2)
         precondition(!normal.requestedMountOptions.contains(.readOnly))
         precondition(normal.enableOpenUnlinkEmulation)
+        precondition(normal.supportedVolumeCapabilities.caseFormat == .insensitiveCasePreserving)
         normal.teardown()
         print("PASS: FSKit free-space fields, writable flags, and open-unlink emulation opt-in")
 
