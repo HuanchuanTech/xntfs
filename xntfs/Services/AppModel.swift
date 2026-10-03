@@ -3,6 +3,8 @@
 //  Central coordinator: owns settings, the DiskArbitration monitor and the mount service,
 //  exposes detected devices, direct image mounts, and the actions the UI calls.
 //
+//  Copyright (C) 2026 Aïssa BELKOUSSA — modified 2026-10-03: sandbox-denied mount fallback.
+//
 
 import Foundation
 import Observation
@@ -106,7 +108,7 @@ final class AppModel {
                     devices[index].readOnly = info.readOnly
                     devices[index].mountedByXntfs = info.fsType == DiskArbitrationMonitor.moduleFSType
                 }
-            case .failed(let msg): devices[index].state = .failed(msg)
+            case .failed(let msg), .needsSystemMount(let msg, _): devices[index].state = .failed(msg)
             }
         }
         refreshDevices()
