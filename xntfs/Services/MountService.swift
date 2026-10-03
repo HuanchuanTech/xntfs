@@ -4,6 +4,8 @@
 //  attempted on macOS 27+ (FSKit Mounter); on earlier systems the user mounts via Disk
 //  Utility instead.
 //
+//  Copyright (C) 2026 Aïssa BELKOUSSA — modified 2026-10-03: sandbox-denied mount fallback.
+//
 
 import Foundation
 import DiskArbitration
@@ -19,6 +21,9 @@ enum MountError: LocalizedError {
     case extensionUnavailable
     case unexpectedMount
     case accessModeMismatch
+    /// App Sandbox denies the `system.volume.<class>.mount` authorization right DiskArbitration
+    /// requests for physical disks, so DADiskMount* returns kDAReturnNotPrivileged.
+    case sandboxDenied
 
     var errorDescription: String? {
         switch self {
@@ -34,6 +39,8 @@ enum MountError: LocalizedError {
             return String(localized: "The system did not return an xntfs mount. Refresh the volume list and check Diagnostics.")
         case .accessModeMismatch:
             return String(localized: "The volume mounted with a different access mode than requested. Check its current status before using it.")
+        case .sandboxDenied:
+            return String(localized: "macOS doesn't let sandboxed apps mount physical disks. Mount it with the command below, with Disk Utility, or by reconnecting the drive — it will still use xntfs.")
         }
     }
 
@@ -43,6 +50,17 @@ enum MountError: LocalizedError {
 enum MountOutcome {
     case mounted(URL)
     case failed(String)
+    /// The app can't mount this volume itself; `command` mounts it through the system.
+    case needsSystemMount(message: String, command: String)
+}
+
+/// Generates text only — the sandboxed app never runs it. `diskutil` goes through storagekitd,
+/// which holds the mount authorization, and DiskArbitration still selects the xntfs module.
+enum SystemMountCommand {
+    static func diskutil(bsdName: String, readOnly: Bool) -> String? {
+        guard bsdName.range(of: #"^disk[0-9]+(?:s[0-9]+)*$"#, options: .regularExpression) != nil else { return nil }
+        return readOnly ? "diskutil mount readOnly \(bsdName)" : "diskutil mount -mountOptions rw \(bsdName)"
+    }
 }
 
 @MainActor
@@ -61,6 +79,12 @@ final class MountService {
                 throw MountError.extensionUnavailable
             }
             return .mounted(try await mount(device, readOnly: readOnly))
+        } catch MountError.sandboxDenied {
+            let message = MountError.sandboxDenied.localizedDescription
+            guard let command = SystemMountCommand.diskutil(bsdName: device.id, readOnly: readOnly || !device.mediaWritable) else {
+                return .failed(message)
+            }
+            return .needsSystemMount(message: message, command: command)
         } catch { return .failed(error.localizedDescription) }
     }
 
@@ -91,6 +115,10 @@ final class MountService {
                 let box = DACallbackBox { dissenter in
                     if let dissenter {
                         let status = DADissenterGetStatus(dissenter)
+                        if status == DAReturn(kDAReturnNotPrivileged), device.kind != .diskImage {
+                            cont.resume(throwing: MountError.sandboxDenied)
+                            return
+                        }
                         let msg = DADissenterGetStatusString(dissenter).map { $0 as String }
                         cont.resume(throwing: MountError.dissented(status: status, message: msg))
                     } else {
