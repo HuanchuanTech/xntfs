@@ -43,6 +43,16 @@
         }
       }
     },
+    "About xntfs" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关于 xntfs"
+          }
+        }
+      }
+    },
     "Access" : {
       "localizations" : {
         "zh-Hans" : {
@@ -433,6 +443,26 @@
         }
       }
     },
+    "GitHub" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub 项目主页"
+          }
+        }
+      }
+    },
+    "GitHub Issues" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub 问题反馈"
+          }
+        }
+      }
+    },
     "Image" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -515,6 +545,9 @@
           }
         }
       }
+    },
+    "macOS doesn't let sandboxed apps mount physical disks. Mount it with the command below, with Disk Utility, or by reconnecting the drive — it will still use xntfs." : {
+
     },
     "Manual mounting" : {
       "extractionState" : "stale",
@@ -985,6 +1018,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "重新检测"
+          }
+        }
+      }
+    },
+    "Read and write NTFS drives on your Mac with Apple FSKit and ntfs-3g. No macFUSE or kernel extension required." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "通过 Apple FSKit 和 ntfs-3g，在 Mac 上读写 NTFS 磁盘，无需 macFUSE 或内核扩展。"
           }
         }
       }
