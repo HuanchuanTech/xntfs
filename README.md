@@ -41,6 +41,10 @@ xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
 The extension uses a restricted FSKit entitlement. A locally built copy requires a signing team
 whose provisioning profile authorizes it; building alone does not enable the extension.
 
+The bundled engine is pinned to [ntfs-3g 2026.9.28](https://github.com/tuxera/ntfs-3g/releases/tag/2026.9.28),
+which fixes the 2026.9.18 regression that could reject new files and directories with
+`EINVAL`. See [issue #7 validation](docs/issue-7-validation.md).
+
 ## Known issues
 
 - **macOS 15: deleting or replacing an open file can invalidate its existing handles.**

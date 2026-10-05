@@ -1,6 +1,39 @@
 import Foundation
 import CryptoKit
 
+func checkCaseVariants(_ volume: URL, payload: Data, writable: Bool) throws {
+    func failed(_ operation: String) -> NSError {
+        NSError(domain: "CaseSemantics", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: operation])
+    }
+    let exact = volume.appendingPathComponent("MiXeD-integration.txt")
+    var original = stat()
+    guard stat(exact.path, &original) == 0 else { throw failed("stat original") }
+    for name in ["mixed-integration.txt", "MIXED-INTEGRATION.TXT"] {
+        let variant = volume.appendingPathComponent(name)
+        var attributes = stat()
+        guard stat(variant.path, &attributes) == 0 else { throw failed("stat \(name)") }
+        guard attributes.st_ino == original.st_ino,
+              try Data(contentsOf: variant) == payload else { throw failed("inode/payload mismatch: \(name)") }
+        if writable {
+            let fd = open(variant.path, O_WRONLY | O_CREAT, mode_t(0600))
+            guard fd >= 0 else { throw failed("O_CREAT \(name)") }
+            let result = fstat(fd, &attributes)
+            close(fd)
+            guard result == 0, attributes.st_ino == original.st_ino else { throw failed("O_CREAT inode mismatch: \(name)") }
+            let duplicate = open(variant.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0600))
+            let error = errno
+            if duplicate >= 0 { close(duplicate) }
+            guard duplicate == -1, error == EEXIST else { throw failed("O_EXCL \(name): fd=\(duplicate), errno=\(error)") }
+            guard mkdir(variant.path, mode_t(0700)) == -1, errno == EEXIST else { throw failed("mkdir collision: \(name)") }
+            guard link(exact.path, variant.path) == -1, errno == EEXIST else { throw failed("link collision: \(name)") }
+        }
+    }
+    let names = try FileManager.default.contentsOfDirectory(atPath: volume.path)
+        .filter { $0.lowercased() == exact.lastPathComponent.lowercased() }
+    guard names == [exact.lastPathComponent], try Data(contentsOf: exact) == payload else { throw failed("stored names: \(names)") }
+    print("PASS: case variants share an inode, spelling is preserved, and duplicate names are rejected")
+}
+
 func checkOpenFileLifetime(_ volume: URL) throws {
     let directory = volume.appendingPathComponent("open-lifetime-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -102,6 +135,7 @@ while true {
                 guard try Data(contentsOf: file) == payload else { throw POSIXError(.EIO) }
                 try checkOpenFileLifetime(url)
                 try payload.write(to: url.appendingPathComponent("MiXeD-integration.txt"))
+                try checkCaseVariants(url, payload: payload, writable: true)
             } else {
                 guard info.f_flags & UInt32(MNT_RDONLY) != 0 else { throw POSIXError(.EINVAL) }
                 if phase == "remount-ro", try Data(contentsOf: file) != payload { throw POSIXError(.EIO) }
@@ -111,6 +145,7 @@ while true {
                         throw POSIXError(.EIO)
                     }
                     print("PASS: mounted case-insensitive lookup after remount")
+                    try checkCaseVariants(url, payload: payload, writable: false)
                 }
                 do {
                     try payload.write(to: url.appendingPathComponent("must-not-write.txt"))

@@ -47,6 +47,16 @@ static uint64_t lookup(ntfs_fskit_volume *v, const char *name) {
     return nfsk_lookup(v, NFSK_ROOT_INO, name, &error);
 }
 
+typedef struct { ntfs_fskit_volume *volume; uint64_t inode; int found, valid, stop; } case_listing;
+static int check_case_listing(void *opaque, const char *name, uint64_t inode, uint32_t type, int64_t cookie) {
+    (void)type; (void)cookie;
+    case_listing *check = opaque;
+    if (inode != check->inode) return 0;
+    check->found++;
+    check->valid = !strcmp(name, "MiXeDCaSe.txt") && lookup(check->volume, "mixedcase.txt") == inode;
+    return check->stop;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) { fprintf(stderr, "Usage: %s <disposable-NTFS-image>\n", argv[0]); return 2; }
     test_device device = { .fd = open(argv[1], O_RDWR) };
@@ -92,6 +102,27 @@ int main(int argc, char **argv) {
           "case-only rename retains a valid name");
     CHECK(nfsk_lookup_name(v, NFSK_ROOT_INO, "mixedcase.txt", canonical, sizeof canonical, &error) == ino &&
           !strcmp(canonical, "MiXeDCaSe.txt"), "case-only no-op reports its actual stored spelling");
+
+    case_listing listing = { .volume = v, .inode = ino };
+    CHECK(nfsk_readdir(v, NFSK_ROOT_INO, 0, &listing, check_case_listing) == 0 &&
+          listing.found == 1 && listing.valid && lookup(v, "mixedcase.txt") == ino,
+          "enumeration preserves spelling and case-insensitive lookup inside and after callbacks");
+    listing.found = 0; listing.valid = 0; listing.stop = 1;
+    CHECK(nfsk_readdir(v, NFSK_ROOT_INO, 0, &listing, check_case_listing) == 0 &&
+          listing.found == 1 && listing.valid && lookup(v, "MIXEDCASE.TXT") == ino,
+          "early enumeration stop preserves the normal lookup mode");
+
+    uint64_t unicode = nfsk_create(v, NFSK_ROOT_INO, "\xc3\x89" "cole.txt", NFSK_TYPE_FILE, &error);
+    CHECK(unicode && lookup(v, "\xc3\xa9" "cole.txt") == unicode,
+          "non-ASCII case variants resolve to the same inode");
+    CHECK(!nfsk_create(v, NFSK_ROOT_INO, "\xc3\xa9" "cole.txt", NFSK_TYPE_FILE, &error) && error == EEXIST,
+          "non-ASCII duplicate creation uses the NTFS case table");
+    CHECK(!nfsk_create(v, NFSK_ROOT_INO, "mixedcase.txt", NFSK_TYPE_DIR, &error) && error == EEXIST,
+          "a directory cannot duplicate an existing file's case-folded name");
+    uint64_t subdir = nfsk_create(v, NFSK_ROOT_INO, "CaseDirectory", NFSK_TYPE_DIR, &error);
+    CHECK(subdir && lookup(v, "casedirectory") == subdir &&
+          nfsk_create(v, subdir, "mixedcase.txt", NFSK_TYPE_FILE, &error),
+          "directory lookup ignores case; name uniqueness is per directory");
 
     uint64_t write_ino = nfsk_create(v, NFSK_ROOT_INO, "IssueWriteback.bin", NFSK_TYPE_FILE, &error);
     CHECK(write_ino && nfsk_write(v, write_ino, 0, data, sizeof data, &error) == sizeof data,

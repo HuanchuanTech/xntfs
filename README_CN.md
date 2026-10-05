@@ -40,6 +40,9 @@ xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
 
 扩展使用受限的 FSKit 权限。本地构建需要签名团队的描述文件授权该权限；编译成功不代表扩展已启用。
 
+当前引擎固定为 [ntfs-3g 2026.9.28](https://github.com/tuxera/ntfs-3g/releases/tag/2026.9.28)，
+修复了 2026.9.18 中新建文件和目录可能返回 `EINVAL` 的回归问题。详见 [issue #7 验证记录](docs/issue-7-validation.md)。
+
 ## 已知缺陷
 
 - **macOS 15：删除或覆盖仍被打开的文件，可能使已有文件句柄失效。**
