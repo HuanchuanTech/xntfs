@@ -57,6 +57,12 @@ struct MountSheet: View {
             readOnly = !device.mediaWritable ? true
                 : (device.kind == .diskImage ? model.settings.imageReadOnly : model.settings.deviceReadOnly)
         }
+        // The sandbox denial doesn't depend on the access mode, so keep the shown command in
+        // sync with the toggle instead of leaving a stale rw/readOnly command to be copied.
+        .onChange(of: readOnly) { _, newValue in
+            guard systemCommand != nil else { return }
+            systemCommand = SystemMountCommand.diskutil(bsdName: device.id, readOnly: newValue || !device.mediaWritable)
+        }
     }
 
     private func doMount() async {
