@@ -99,6 +99,7 @@ struct DiagnosticsView: View {
                  detail: enablementDetail) {
             if status.state == .disabled || status.state == .bundled {
                 VStack(alignment: .leading, spacing: 12) {
+                    ExtensionEnablementInstructions()
                     Button("Open Settings…") {
                         visitedSettings = ExtensionStatus.openSettings()
                     }

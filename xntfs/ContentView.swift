@@ -23,10 +23,16 @@ struct ContentView: View {
                 ExtensionBanner(status: extStatus, onDiagnostics: { showDiagnostics = true })
             } else if extStatus.state == .bundled {
                 HStack(spacing: 12) {
-                    Label("On macOS 15, enable ntfs3g in Settings, then select a volume to mount it with xntfs.",
-                          systemImage: "info.circle")
-                        .font(.callout)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Label {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("On macOS 15, enable ntfs3g in Settings, then select a volume to mount it with xntfs.")
+                                .font(.callout)
+                            ExtensionEnablementInstructions()
+                        }
+                    } icon: {
+                        Image(systemName: "info.circle")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     Button("Open Settings…") { ExtensionStatus.openSettings() }
                     Button("Diagnostics…") { showDiagnostics = true }
                 }
@@ -165,8 +171,7 @@ struct ExtensionBanner: View {
                 .font(.title3)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.callout).fontWeight(.semibold)
-                Text(instruction)
-                    .font(.caption).foregroundStyle(.secondary)
+                ExtensionEnablementInstructions()
                 Text("Can't enable it? Open Diagnostics to troubleshoot.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -190,13 +195,6 @@ struct ExtensionBanner: View {
 
     private var title: LocalizedStringKey {
         status.state == .notInstalled ? "NTFS extension not installed" : "NTFS extension not enabled"
-    }
-
-    private var instruction: LocalizedStringKey {
-        if #available(macOS 27.0, *) {
-            return "Turn on “ntfs3g” in the File System Extensions list."
-        }
-        return "In Settings, scroll to Extensions → open “File System Extensions” → turn on “ntfs3g”."
     }
 }
 

@@ -41,6 +41,7 @@ struct LegacyMountSheet: View {
                     }
                     Text("macOS 15 prefers Apple's NTFS driver. This one-time compatibility command switches only the selected volume to xntfs.")
                     Text("First enable ntfs3g in System Settings. Close files on this volume before continuing. A mounted volume will be unmounted normally; busy volumes will not be forced.")
+                    ExtensionEnablementInstructions()
                     Button { ExtensionStatus.openSettings() } label: {
                         Label("Open Settings…", systemImage: "gearshape")
                     }

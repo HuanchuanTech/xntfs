@@ -484,16 +484,6 @@
         }
       }
     },
-    "In Settings, scroll to Extensions → open “File System Extensions” → turn on “ntfs3g”." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在系统设置中向下滚动到「扩展」→ 打开「文件系统扩展」→ 启用「ntfs3g」。"
-          }
-        }
-      }
-    },
     "In-app mount goes to /Volumes (macOS 27+). Choose a folder to mount into a custom location via a Terminal command." : {
       "extractionState" : "stale",
       "localizations" : {
@@ -961,12 +951,32 @@
         }
       }
     },
+    "Open File System Extension and turn on ntfs3g." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开「文件系统扩展」，然后开启 ntfs3g。"
+          }
+        }
+      }
+    },
     "Open Settings…" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "打开系统设置…"
+          }
+        }
+      }
+    },
+    "Open System Settings > General > Login Items & Extensions, then scroll down to Extensions." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开「系统设置」>「通用」>「登录项与扩展」，然后向下滚动到「扩展」。"
           }
         }
       }
@@ -1130,6 +1140,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在终端运行——沙盒应用无法替你执行:"
+          }
+        }
+      }
+    },
+    "Select **By Category**, not By App. Open File System Extensions and turn on ntfs3g." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择「**按类别**」，而不是「按 App」。打开「文件系统扩展」，然后开启 ntfs3g。"
           }
         }
       }
@@ -1333,16 +1353,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "该卷为只读(例如以只读方式 attach 的镜像),只能以只读方式挂载。"
-          }
-        }
-      }
-    },
-    "Turn on “ntfs3g” in the File System Extensions list." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "在「文件系统扩展」列表中启用「ntfs3g」。"
           }
         }
       }
