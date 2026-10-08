@@ -56,6 +56,27 @@ which fixes the 2026.9.18 regression that could reject new files and directories
   that API is unavailable on macOS 15. See [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
   and [validation details](docs/issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime).
 
+## Finder metadata
+
+The current source stores extended attributes (including Finder tags and resource forks)
+in same-named NTFS alternate data streams, instead of creating new AppleDouble `._` files.
+Each attribute is limited to **128 KiB**, matching the limit observed in mounted FSKit
+tests on macOS 27. This limit does not apply to ordinary file contents.
+
+**Existing `._` files are not automatically migrated or deleted.** Until migrated, their
+metadata is not exposed by the native xattr API. Back up the files and their `._` companions
+before upgrading or migrating. With the volume mounted read/write using the new driver,
+macOS's `dot_clean` can merge the old metadata into native attributes. For one directory
+(without descending into subdirectories):
+
+```sh
+dot_clean -f -v "/Volumes/YourDrive/YourFolder"
+```
+
+This command changes metadata and removes successfully merged `._` files. Verify tags and
+resource forks afterward, and keep the backup. Do not bulk-delete `._` files or use cleanup
+options that discard them without merging. The app does not run this command automatically.
+
 ## The six features
 
 1. **Localization (English + Simplified Chinese)** — `xntfs/Localizable.xcstrings` (String Catalog). Add more

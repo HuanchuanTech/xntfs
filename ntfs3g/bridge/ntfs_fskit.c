@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/disk.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #include <ntfs-3g/types.h>
 #include <ntfs-3g/param.h>
@@ -761,6 +762,204 @@ int64_t nfsk_write(ntfs_fskit_volume *v, uint64_t ino, int64_t offset, const voi
         return -1;
     }
     return total;
+}
+
+/* ---- Extended attributes: named $DATA, never the unnamed file contents ---- */
+static int xattr_name_error(const char *name) {
+    if (!name || !*name) return EINVAL;
+    if (strlen(name) > NFSK_MAX_XATTR_NAME) return ENAMETOOLONG;
+    /* Do not expose NTFS/ntfs-3g private streams through a user xattr API. */
+    if (name[0] == '$' || !strncmp(name, "ntfs-3g.", 8)) return EPERM;
+    return 0;
+}
+
+static int xattr_unicode_name(const char *name, ntfschar **unicode) {
+    int error = xattr_name_error(name);
+    if (error) return -error;
+    /* Attribute names are byte-sensitive, unlike normalized file names. Avoid
+     * changing ntfs-3g's process-global filename normalization setting. */
+    CFStringRef string = CFStringCreateWithCString(kCFAllocatorDefault, name, kCFStringEncodingUTF8);
+    if (!string) return -EILSEQ;
+    CFIndex length = CFStringGetLength(string), bytes = 0;
+    *unicode = calloc((size_t)length + 1, sizeof(ntfschar));
+    if (!*unicode) { CFRelease(string); return -ENOMEM; }
+    CFIndex converted = CFStringGetBytes(string, CFRangeMake(0, length), kCFStringEncodingUTF16LE,
+                                        0, false, (UInt8 *)*unicode, length * 2, &bytes);
+    CFRelease(string);
+    return converted == length && bytes == length * 2 ? (int)length : -EILSEQ;
+}
+
+static int xattr_utf8_name(const ntfschar *unicode, int length, char *name) {
+    CFStringRef string = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8 *)unicode,
+                                                length * 2, kCFStringEncodingUTF16LE, false);
+    if (!string) return -EILSEQ;
+    CFIndex bytes = 0;
+    CFIndex converted = CFStringGetBytes(string, CFRangeMake(0, CFStringGetLength(string)),
+                                        kCFStringEncodingUTF8, 0, false, (UInt8 *)name,
+                                        NFSK_MAX_XATTR_NAME, &bytes);
+    CFIndex characters = CFStringGetLength(string);
+    CFRelease(string);
+    if (converted != characters) return -ENAMETOOLONG;
+    name[bytes] = 0;
+    return (size_t)bytes == strlen(name) ? (int)bytes : -EINVAL;
+}
+
+static int xattr_read_value(ntfs_attr *attr, void *buf, size_t size) {
+    size_t done = 0;
+    while (done < size) {
+        s64 count = ntfs_attr_pread(attr, done, size - done, (char *)buf + done);
+        if (count <= 0) return -(count < 0 && errno ? errno : EIO);
+        done += (size_t)count;
+    }
+    return 0;
+}
+
+static int xattr_write_value(ntfs_attr *attr, const void *buf, size_t size) {
+    size_t done = 0;
+    /* Keep the old tail until all new bytes have been written. */
+    while (done < size) {
+        s64 count = ntfs_attr_pwrite(attr, done, size - done, (const char *)buf + done);
+        if (count <= 0) return -(count < 0 && errno ? errno : EIO);
+        done += (size_t)count;
+    }
+    if (ntfs_attr_pclose(attr) || ntfs_attr_truncate(attr, (s64)size)) return -(errno ? errno : EIO);
+    return 0;
+}
+
+int64_t nfsk_getxattr(ntfs_fskit_volume *v, uint64_t ino, const char *name, void *buf, size_t size) {
+    if (!v || !v->vol) return -EINVAL;
+    if (is_reserved_mft(to_mref(ino))) return -EPERM;
+    ntfschar *unicode = NULL;
+    int length = xattr_unicode_name(name, &unicode);
+    if (length < 0) { free(unicode); return length; }
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
+    if (!ni) { int error = errno ? errno : EIO; free(unicode); return -error; }
+    ntfs_attr *attr = ntfs_attr_open(ni, AT_DATA, unicode, length);
+    int64_t result;
+    if (!attr) {
+        result = -(errno == ENOENT ? ENOATTR : (errno ? errno : EIO));
+    } else if (attr->data_size < 0) {
+        result = -EIO;
+    } else if (attr->data_size > NFSK_MAX_XATTR_SIZE) {
+        result = -E2BIG;
+    } else {
+        result = attr->data_size;
+        if (buf) {
+            if (size < (size_t)result) result = -ERANGE;
+            else {
+                int rc = xattr_read_value(attr, buf, (size_t)result);
+                if (rc) result = rc;
+            }
+        }
+    }
+    if (attr) ntfs_attr_close(attr);
+    free(unicode);
+    if (nfsk_inode_close(ni) && result >= 0) result = -(errno ? errno : EIO);
+    return result;
+}
+
+int64_t nfsk_listxattr(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t size) {
+    if (!v || !v->vol) return -EINVAL;
+    if (is_reserved_mft(to_mref(ino))) return -EPERM;
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
+    if (!ni) return -(errno ? errno : EIO);
+    ntfs_attr_search_ctx *search = ntfs_attr_get_search_ctx(ni, NULL);
+    int saved = search ? 0 : (errno ? errno : EIO);
+    size_t total = 0;
+    if (search) {
+        while (true) {
+            errno = 0;
+            if (ntfs_attr_lookup(AT_DATA, NULL, 0, CASE_SENSITIVE, 0, NULL, 0, search)) {
+                if (errno != ENOENT) saved = errno ? errno : EIO;
+                break;
+            }
+            if (!search->attr->name_length) continue;
+            char name[NFSK_MAX_XATTR_NAME + 1];
+            int length = xattr_utf8_name((ntfschar *)((char *)search->attr + le16_to_cpu(search->attr->name_offset)),
+                                         search->attr->name_length, name);
+            if (length == -ENAMETOOLONG || length == -EINVAL) continue;
+            if (length < 0) { saved = -length; break; }
+            if (xattr_name_error(name)) continue;
+            size_t bytes = (size_t)length + 1;
+            if (total > NFSK_MAX_XATTR_SIZE - bytes) saved = E2BIG;
+            else if (buf && (total > size || bytes > size - total)) saved = ERANGE;
+            else {
+                if (buf) memcpy(buf + total, name, bytes);
+                total += bytes;
+            }
+            if (saved) break;
+        }
+        ntfs_attr_put_search_ctx(search);
+    }
+    if (nfsk_inode_close(ni) && !saved) saved = errno ? errno : EIO;
+    return saved ? -saved : (int64_t)total;
+}
+
+int nfsk_setxattr(ntfs_fskit_volume *v, uint64_t ino, const char *name,
+                  const void *value, size_t size, int policy) {
+    if (!v || !v->vol || policy < NFSK_XATTR_SET || policy > NFSK_XATTR_DELETE ||
+        (size && !value) || (policy == NFSK_XATTR_DELETE && (value || size))) return -EINVAL;
+    if (v->read_only) return -EROFS;
+    if (is_reserved_mft(to_mref(ino))) return -EPERM;
+    if (size > NFSK_MAX_XATTR_SIZE) return -E2BIG;
+    ntfschar *unicode = NULL;
+    int length = xattr_unicode_name(name, &unicode);
+    if (length < 0) { free(unicode); return length; }
+    ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
+    if (!ni) { int error = errno ? errno : EIO; free(unicode); return -error; }
+    ntfs_attr *attr = ntfs_attr_open(ni, AT_DATA, unicode, length);
+    int saved = 0;
+    void *previous = NULL;
+    size_t previous_size = 0;
+    bool created = false;
+    if (!attr && errno != ENOENT) { saved = errno ? errno : EIO; goto done; }
+    if (attr && policy == NFSK_XATTR_CREATE) { saved = EEXIST; goto done; }
+    if (!attr && (policy == NFSK_XATTR_REPLACE || policy == NFSK_XATTR_DELETE)) {
+        saved = ENOATTR; goto done;
+    }
+    if (policy == NFSK_XATTR_DELETE) {
+        if (ntfs_attr_rm(attr)) saved = errno ? errno : EIO;
+        goto changed;
+    }
+    if (attr) {
+        if (attr->data_size < 0) { saved = EIO; goto done; }
+        if (attr->data_size > NFSK_MAX_XATTR_SIZE) { saved = E2BIG; goto done; }
+        previous_size = (size_t)attr->data_size;
+        if (previous_size) {
+            previous = malloc(previous_size);
+            if (!previous) { saved = ENOMEM; goto done; }
+            int rc = xattr_read_value(attr, previous, previous_size);
+            if (rc) { saved = -rc; goto done; }
+        }
+    } else {
+        if (ntfs_attr_add(ni, AT_DATA, unicode, length, NULL, 0)) { saved = errno ? errno : EIO; goto done; }
+        created = true;
+        attr = ntfs_attr_open(ni, AT_DATA, unicode, length);
+        if (!attr) {
+            saved = errno ? errno : EIO;
+            if (ntfs_attr_remove(ni, AT_DATA, unicode, length))
+                v->devctx->fatal_writeback_error = v->devctx->writeback_error = errno ? errno : EIO;
+            goto done;
+        }
+    }
+    saved = -xattr_write_value(attr, value, size);
+    if (saved) {
+        /* A failed replacement must not silently discard the old metadata. */
+        int rollback = created ? ntfs_attr_rm(attr) : xattr_write_value(attr, previous, previous_size);
+        if (rollback) v->devctx->fatal_writeback_error = v->devctx->writeback_error = EIO;
+        goto done;
+    }
+changed:
+    if (!saved) {
+        if (!(ni->flags & FILE_ATTR_ARCHIVE)) { ni->flags |= FILE_ATTR_ARCHIVE; NInoFileNameSetDirty(ni); }
+        ntfs_inode_update_times(ni, NTFS_UPDATE_CTIME);
+    }
+done:
+    if (attr) ntfs_attr_close(attr);
+    free(previous);
+    free(unicode);
+    if (nfsk_inode_close(ni) && !saved) saved = errno ? errno : EIO;
+    return -saved;
 }
 
 /* ---- Namespace mutation ---- */

@@ -29,3 +29,10 @@ xcrun clang "${flags[@]}" "$root/tests/test_directory_enumeration.c" "$work/enum
     "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/enumeration-tests"
 cp "$fixture" "$work/test.img"
 "$work/enumeration-tests" "$work/test.img" 2>&1 | tee "$work/enumeration-results.log"
+xcrun clang "${flags[@]}" -Dntfs_attr_pwrite=nfsk_test_attr_pwrite \
+    -Dntfs_attr_pread=nfsk_test_attr_pread \
+    -c "$root/ntfs3g/bridge/ntfs_fskit.c" -o "$work/xattr-bridge.o"
+xcrun clang "${flags[@]}" "$root/tests/test_xattrs.c" "$work/xattr-bridge.o" \
+    "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/xattr-tests"
+cp "$fixture" "$work/test.img"
+"$work/xattr-tests" "$work/test.img" 2>&1 | tee "$work/xattr-results.log"

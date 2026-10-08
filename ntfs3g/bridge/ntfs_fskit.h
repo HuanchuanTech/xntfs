@@ -96,6 +96,23 @@ int      nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_nam
                      uint64_t dst_dir, const char *dst_name);
 int      nfsk_readlink(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t cap);
 
+/* Native xattrs use same-named NTFS data streams (ntfs-3g openxattr mapping).
+ * FSKit transfers whole values, so bound per-request memory consumption. */
+enum {
+    NFSK_MAX_XATTR_SIZE = 128 * 1024,
+    NFSK_MAX_XATTR_NAME = 127,
+    NFSK_XATTR_SET = 0,
+    NFSK_XATTR_CREATE = 1,
+    NFSK_XATTR_REPLACE = 2,
+    NFSK_XATTR_DELETE = 3,
+};
+/* get/list return byte counts or -errno; NULL buffers query the required size.
+ * list returns NUL-terminated names concatenated without an extra terminator. */
+int64_t nfsk_getxattr(ntfs_fskit_volume *v, uint64_t ino, const char *name, void *buf, size_t size);
+int64_t nfsk_listxattr(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t size);
+int     nfsk_setxattr(ntfs_fskit_volume *v, uint64_t ino, const char *name,
+                     const void *value, size_t size, int policy);
+
 /* --- Backend (implemented in ntfs_device_fskit.m) ---
  * A backend wraps either an FSBlockDeviceResource (a real disk/partition) or an
  * opened image file, behind one I/O interface. Create one, pass the returned

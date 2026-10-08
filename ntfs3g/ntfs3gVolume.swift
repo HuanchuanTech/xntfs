@@ -23,7 +23,8 @@ struct NTFSBackend {
 
 @available(macOS 15.4, *)
 final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperations,
-                          FSVolume.ReadWriteOperations, FSVolume.OpenCloseOperations {
+                          FSVolume.ReadWriteOperations, FSVolume.OpenCloseOperations,
+                          FSVolume.XattrOperations {
 
     private var handle: OpaquePointer?
     private var backend: NTFSBackend?
@@ -435,8 +436,69 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     var maximumNameLength: Int { 255 }
     var restrictsOwnershipChanges: Bool { false }
     var truncatesLongNames: Bool { false }
-    var maximumFileSize: UInt64 { UInt64.max }
-    var maximumXattrSize: Int { 0 }
+    var maximumFileSize: UInt64 { UInt64(Int64.max) }
+    // FSKit's automatic conversion adds one; UInt64.max overflows and makes
+    // Finder see a 2 GiB limit. Match the bridge's signed 64-bit file offsets.
+    var maximumFileSizeInBits: Int { 64 }
+    var maximumXattrSize: Int { Int(NFSK_MAX_XATTR_SIZE) }
+
+    // MARK: Extended attributes
+    func xattr(named name: FSFileName, of item: FSItem) async throws -> Data {
+        try withLock {
+            guard let it = item as? ntfs3gItem, let h = handle,
+                  let key = name.string, !key.utf8.contains(0) else { throw posixError(EINVAL) }
+            return try key.withCString { key in
+                let size = nfsk_getxattr(h, it.ino, key, nil, 0)
+                if size < 0 { throw posixError(Int32(-size)) }
+                var data = Data(count: Int(size))
+                let read = data.withUnsafeMutableBytes { nfsk_getxattr(h, it.ino, key, $0.baseAddress, $0.count) }
+                if read < 0 { throw posixError(Int32(-read)) }
+                guard read == size else { throw posixError(EIO) }
+                return data
+            }
+        }
+    }
+
+    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem,
+                  policy: FSVolume.SetXattrPolicy) async throws {
+        try withLock {
+            guard let it = item as? ntfs3gItem, let h = handle,
+                  let key = name.string, !key.utf8.contains(0) else { throw posixError(EINVAL) }
+            let bridgePolicy: Int32
+            switch policy {
+            case .alwaysSet: bridgePolicy = Int32(NFSK_XATTR_SET)
+            case .mustCreate: bridgePolicy = Int32(NFSK_XATTR_CREATE)
+            case .mustReplace: bridgePolicy = Int32(NFSK_XATTR_REPLACE)
+            case .delete: bridgePolicy = Int32(NFSK_XATTR_DELETE)
+            @unknown default: throw posixError(EINVAL)
+            }
+            let rc: Int32 = try key.withCString { key in
+                if policy == .delete { return nfsk_setxattr(h, it.ino, key, nil, 0, bridgePolicy) }
+                guard let value else { throw posixError(EINVAL) }
+                return value.withUnsafeBytes { nfsk_setxattr(h, it.ino, key, $0.baseAddress, $0.count, bridgePolicy) }
+            }
+            if rc < 0 { throw posixError(-rc) }
+        }
+    }
+
+    func xattrs(of item: FSItem) async throws -> [FSFileName] {
+        try withLock {
+            guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
+            let size = nfsk_listxattr(h, it.ino, nil, 0)
+            if size < 0 { throw posixError(Int32(-size)) }
+            if size == 0 { return [] }
+            var bytes = [CChar](repeating: 0, count: Int(size))
+            let read = bytes.withUnsafeMutableBufferPointer { nfsk_listxattr(h, it.ino, $0.baseAddress, $0.count) }
+            if read < 0 { throw posixError(Int32(-read)) }
+            guard read == size else { throw posixError(EIO) }
+            return try bytes.split(separator: 0).map { name in
+                guard let string = String(bytes: name.map { UInt8(bitPattern: $0) }, encoding: .utf8) else {
+                    throw posixError(EIO)
+                }
+                return FSFileName(string: string)
+            }
+        }
+    }
 
     // MARK: ReadWrite
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> Int {

@@ -53,6 +53,23 @@ xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
   macOS 15 不提供该 API。见 [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
   和[验证说明](docs/issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime)。
 
+## Finder 元数据
+
+当前源码将扩展属性（包括 Finder 标签和资源叉）保存到同名的 NTFS 备用数据流（ADS），
+不再为新属性生成 AppleDouble `._` 文件。单个属性上限为 **128 KiB**，与 macOS 27
+实际挂载测试中观察到的 FSKit 限制一致。这个限制不影响普通文件内容的大小。
+
+**已有 `._` 文件不会自动迁移或删除。** 迁移前，其中的元数据不会通过原生扩展属性接口显示。
+升级或迁移前，请同时备份原文件及其 `._` 伴随文件。使用新驱动以读写方式挂载后，可以用
+macOS 自带的 `dot_clean` 将旧元数据合并到原生属性中。例如，仅处理一个目录、不递归子目录：
+
+```sh
+dot_clean -f -v "/Volumes/YourDrive/YourFolder"
+```
+
+此命令会修改元数据，并删除合并成功的 `._` 文件。完成后请检查标签和资源叉，并保留备份。
+不要直接批量删除 `._`，也不要使用跳过合并、直接丢弃文件的清理选项。应用不会自动执行此命令。
+
 ## 六大功能
 
 1. **本地化(英文 + 简体中文)** —— `xntfs/Localizable.xcstrings`(String Catalog)。

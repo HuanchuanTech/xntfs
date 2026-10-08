@@ -20,8 +20,30 @@ struct VolumeRegressionTests {
         precondition(!normal.requestedMountOptions.contains(.readOnly))
         precondition(normal.enableOpenUnlinkEmulation)
         precondition(normal.supportedVolumeCapabilities.caseFormat == .insensitiveCasePreserving)
+        precondition(normal.maximumFileSize == UInt64(Int64.max) && normal.maximumFileSizeInBits == 64)
+        precondition(normal.maximumXattrSize == Int(NFSK_MAX_XATTR_SIZE))
+        let root = ntfs3gItem(ino: NFSK_ROOT_INO, parentIno: NFSK_PARENT_OF_ROOT, name: FSFileName(string: "/"))
+        let xattrName = FSFileName(string: "com.apple.metadata:_kMDItemUserTags")
+        let value = Data("test tags".utf8)
+        try await normal.setXattr(named: xattrName, to: value, on: root, policy: .mustCreate)
+        let readback = try await normal.xattr(named: xattrName, of: root)
+        let names = try await normal.xattrs(of: root)
+        precondition(readback == value && names.contains(where: { $0.string == xattrName.string }))
+        do {
+            try await normal.setXattr(named: xattrName, to: Data(), on: root, policy: .mustCreate)
+            preconditionFailure("mustCreate accepted a duplicate")
+        } catch { precondition((error as NSError).code == Int(EEXIST)) }
+        try await normal.setXattr(named: xattrName, to: Data(), on: root, policy: .mustReplace)
+        let empty = try await normal.xattr(named: xattrName, of: root)
+        precondition(empty.isEmpty)
+        try await normal.setXattr(named: xattrName, to: nil, on: root, policy: .delete)
+        do {
+            _ = try await normal.xattr(named: xattrName, of: root)
+            preconditionFailure("deleted xattr still exists")
+        } catch { precondition((error as NSError).code == Int(ENOATTR)) }
         normal.teardown()
         print("PASS: FSKit free-space fields, writable flags, and open-unlink emulation opt-in")
+        print("PASS: signed 64-bit size limits and native FSKit xattr create/read/list/replace/delete")
 
         let prepared = try backend(image, writable: true)
         var error: Int32 = 0
@@ -40,7 +62,6 @@ struct VolumeRegressionTests {
                                        activationBackend: { _, _ in nil }, onContainerStatusChange: { _ in })
         defer { fallback.teardown() }
         precondition(fallback.requestedMountOptions.contains(.readOnly))
-        let root = ntfs3gItem(ino: NFSK_ROOT_INO, parentIno: NFSK_PARENT_OF_ROOT, name: FSFileName(string: "/"))
         let (item, name) = try await fallback.lookupItem(named: FSFileName(string: "volumemixed.txt"), inDirectory: root)
         precondition((item as? ntfs3gItem)?.ino == mixed && name.string == "VolumeMiXeD.txt")
         print("PASS: effective read-only fallback reaches FSKit mount options; canonical lookup reaches Swift")
