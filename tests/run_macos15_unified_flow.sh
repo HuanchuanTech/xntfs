@@ -2,13 +2,16 @@
 # Live test: a disposable, unique-serial MBR image; never a physical drive.
 # Run via sudo from the desktop user. Does not install apps or change preferences.
 set -euo pipefail
-[ "$#" = 5 ] || { printf 'Usage: sudo bash %s FIXTURE APP VERIFIER OUTPUT X86_EXTENSION_UUID\n' "$0"; exit 2; }
+[ "$#" = 5 ] || [ "$#" = 6 ] || { printf 'Usage: sudo bash %s FIXTURE APP VERIFIER OUTPUT X86_EXTENSION_UUID [FEATURE_HOOK]\n' "$0"; exit 2; }
 [ "$EUID" = 0 ] && [ "${SUDO_UID:-0}" -gt 0 ]
 [[ "$(/usr/bin/sw_vers -productVersion)" = 15.* ]]
 [ "$(/usr/bin/uname -m)" = x86_64 ]
 owner=$SUDO_UID
 [ "$owner" = "$(/usr/bin/stat -f %u /dev/console)" ]
 fixture=$1 app=$2 verifier=$3 output=$4 expected_uuid=$5
+feature_hook=${6:-}
+feature_status=0
+if [ -n "$feature_hook" ]; then [ -x "$feature_hook" ]; fi
 script="$app/Contents/Resources/macos15-mount.sh"
 route=/Library/Filesystems/xntfs-macos15-session.fs
 [ -f "$fixture" ] && [ -f "$script" ] && [ -x "$verifier" ]
@@ -33,8 +36,10 @@ finish() {
     if [ -n "$whole" ]; then
         if as_user /usr/bin/hdiutil detach "$whole"; then whole=''; attached=0; else status=1; fi
     fi
-    if [ "$attached" = 0 ]; then
+    if [ "$attached" = 0 ] && [ "$status" = 0 ]; then
         /bin/rm -f "$copy"
+    elif [ "$attached" = 0 ]; then
+        printf 'Detached failing test image preserved for diagnosis: %s\n' "$copy"
     else
         printf 'Copy still attached or its device was not identified; preserving %s\n' "$copy"
         status=1
@@ -77,6 +82,12 @@ check() {
     local point
     point=$("$verifier" point "$output/info-$1.plist")
     as_user "$verifier" check "$1" "$point" "$device"
+    if [ -n "$feature_hook" ]; then
+        if ! as_user "$feature_hook" "$1" "$point" "$device"; then
+            feature_status=1
+            printf 'FAIL: feature hook for %s; continuing independent checks.\n' "$1"
+        fi
+    fi
     line
 }
 verify_new_binary() {
@@ -135,4 +146,9 @@ check media-ro
 as_user /usr/bin/hdiutil detach "$whole"; whole=''; attached=0
 [ "$(hash "$copy")" = "$before_media" ]
 printf 'PASS: read-only media stays read-only despite the writable image default.\n'
-printf 'ALL UNIFIED LOAD/ACTIVATE CHECKS PASSED.\n'
+if [ "$feature_status" = 0 ]; then
+    printf 'ALL UNIFIED LOAD/ACTIVATE AND FEATURE CHECKS PASSED.\n'
+else
+    printf 'Unified load/activate completed, but feature checks failed.\n'
+fi
+exit "$feature_status"

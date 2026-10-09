@@ -15,7 +15,13 @@ import Observation
 @MainActor
 @Observable
 final class ExtensionStatus {
-    enum State: Equatable { case unknown, bundled, notInstalled, disabled, enabled }
+    enum State: Equatable {
+        case unknown, bundled, notInstalled, disabled, enabled
+
+        func shouldShowLegacyGuidance(dismissed: Bool, hasMountedVolume: Bool) -> Bool {
+            self == .bundled && !dismissed && !hasMountedVolume
+        }
+    }
 
     static var needsLegacyCompatibility: Bool {
         ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 15

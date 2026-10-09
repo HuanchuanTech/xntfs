@@ -126,7 +126,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             replyHandler(.notRecognized, nil)
             return
         }
-        var nameBuf = [CChar](repeating: 0, count: 260)
+        var nameBuf = [CChar](repeating: 0, count: 1024)
         var serial: UInt64 = 0
         let recognized = nameBuf.withUnsafeMutableBufferPointer { nfsk_probe(made.backend, $0.baseAddress, $0.count, &serial) }
         let totalBytes = nfsk_block_total_bytes(made.backend)
@@ -244,12 +244,62 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
 
     // MARK: maintenance (required for block-device unary file systems)
 
+    enum CheckMode {
+        case quick, verify, repair
+
+        init(options: [String]) throws {
+            var flags = Set<Character>()
+            for option in options {
+                guard option.hasPrefix("-"), option.count > 1 else { throw posixError(EINVAL) }
+                for flag in option.dropFirst() {
+                    guard "nqy".contains(flag) else { throw posixError(EINVAL) }
+                    flags.insert(flag)
+                }
+            }
+            guard !(flags.contains("y") && (flags.contains("n") || flags.contains("q"))) else {
+                throw posixError(EINVAL)
+            }
+            self = flags.contains("y") ? .repair : flags.contains("q") ? .quick : .verify
+        }
+    }
+
     func startCheck(task: FSTask, options: FSTaskOptions) throws -> Progress {
+        let mode = try CheckMode(options: options.taskOptions)
+        guard mode == .quick else {
+            let message = mode == .repair
+                ? "xntfs does not repair NTFS volumes. Use Windows disk checking; no changes were made."
+                : "xntfs supports mount preflight (-q), not full filesystem verification. No changes were made."
+            task.logMessage(message)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTSUP),
+                          userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        guard let volume else { throw posixError(ENXIO) }
         let progress = Progress(totalUnitCount: 1)
+        let work = DispatchGroup()
+        work.enter()
+        if #available(macOS 26.0, *) {
+            task.cancellationHandler = {
+                progress.cancel()
+                work.wait()
+                return nil
+            }
+        }
         debugLog("startCheck options=\(options.taskOptions)")
         DispatchQueue.global(qos: .utility).async {
+            defer { work.leave() }
+            var result: Error?
+            do {
+                guard !progress.isCancelled else { throw posixError(ECANCELED) }
+                task.logMessage("Checking NTFS mount prerequisites read-only; this is not a full filesystem scan.")
+                try volume.quickCheck()
+                guard !progress.isCancelled else { throw posixError(ECANCELED) }
+                task.logMessage("NTFS mount preflight passed. No repairs or disk writes were performed.")
+            } catch {
+                result = error
+                task.logMessage(error.localizedDescription)
+            }
             progress.completedUnitCount = 1
-            task.didComplete(error: nil)
+            task.didComplete(error: result)
         }
         return progress
     }

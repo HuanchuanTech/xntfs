@@ -41,6 +41,13 @@ int nfsk_test_inode_real_close(ntfs_inode *ni) {
     errno = saved;
     return result;
 }
+int nfsk_test_inode_sync(ntfs_inode *ni) {
+    inside_close++;
+    int result = ntfs_inode_sync(ni), saved = errno;
+    inside_close--;
+    errno = saved;
+    return result;
+}
 
 static uint64_t lookup(ntfs_fskit_volume *v, const char *name) {
     int error = 0;

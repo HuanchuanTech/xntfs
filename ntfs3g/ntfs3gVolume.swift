@@ -24,7 +24,8 @@ struct NTFSBackend {
 @available(macOS 15.4, *)
 final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperations,
                           FSVolume.ReadWriteOperations, FSVolume.OpenCloseOperations,
-                          FSVolume.XattrOperations {
+                          FSVolume.XattrOperations, FSVolume.RenameOperations,
+                          FSVolume.PreallocateOperations {
 
     private var handle: OpaquePointer?
     private var backend: NTFSBackend?
@@ -36,12 +37,19 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     private let lock = NSLock()
     private var items: [UInt64: ntfs3gItem] = [:]
     private let rootItem: ntfs3gItem
+    private let legacyOpenUnlink: Bool
+
+    static var needsLegacyOpenUnlink: Bool {
+        if #available(macOS 26.0, *) { return false }
+        return true
+    }
 
     /// `backend` comes from `nfsk_backend_from_block` / `nfsk_backend_from_file`.
     /// Ownership of `backend` transfers to this volume (freed in `teardown`).
     init(backend: NTFSBackend,
          activationBackend: @escaping ([String], Bool) throws -> NTFSBackend?,
-         onContainerStatusChange: @escaping (FSContainerStatus) -> Void) throws {
+         onContainerStatusChange: @escaping (FSContainerStatus) -> Void,
+         legacyOpenUnlink: Bool = ntfs3gVolume.needsLegacyOpenUnlink) throws {
         var err: Int32 = 0
         guard let h = nfsk_mount(backend.backend, !backend.writable, &err) else {
             backend.cleanup()
@@ -71,6 +79,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         self.activationBackend = activationBackend
         self.onContainerStatusChange = onContainerStatusChange
         self.rootItem = root
+        self.legacyOpenUnlink = legacyOpenUnlink
 
         let vid = FSVolume.Identifier(uuid: NTFSVolumeSupport.volumeUUID(serial: st.volume_serial, label: volName, sizeBytes: totalBytes))
         super.init(volumeID: vid, volumeName: FSFileName(string: volName))
@@ -123,7 +132,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         attrs.parentID = FSItem.Identifier(rawValue: parent) ?? .invalid
         attrs.uid = 0
         attrs.gid = 0
-        attrs.flags = 0
+        attrs.flags = a.flags
         attrs.modifyTime = timespec(tv_sec: Int(a.mtime_sec), tv_nsec: Int(a.mtime_nsec))
         attrs.accessTime = timespec(tv_sec: Int(a.atime_sec), tv_nsec: Int(a.atime_nsec))
         attrs.changeTime = timespec(tv_sec: Int(a.ctime_sec), tv_nsec: Int(a.ctime_nsec))
@@ -144,16 +153,12 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let caps = FSVolume.SupportedCapabilities()
         caps.supportsHardLinks = true           // via ntfs_link (writable mounts)
-        // Read-only symlinks: getattr/enumerate report resolvable reparse points as symlinks
-        // and readSymbolicLink resolves them (FSKit drives readlink off the item type, not
-        // this flag — see FSVolume.h). We do NOT advertise the capability, because creation is
-        // unsupported; leaving it true would let the OS/Finder offer `ln -s` and then fail.
-        caps.supportsSymbolicLinks = false
+        caps.supportsSymbolicLinks = true
         caps.supportsPersistentObjectIDs = true
         caps.supports64BitObjectIDs = true
         caps.supports2TBFiles = true
         caps.supportsSparseFiles = true
-        caps.supportsHiddenFiles = false        // getattr never reports UF_HIDDEN and setAttributes ignores .flags
+        caps.supportsHiddenFiles = true
         caps.caseFormat = .insensitiveCasePreserving
         return caps
     }
@@ -191,6 +196,27 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     // MARK: lifecycle
+    func quickCheck() throws {
+        try withLock {
+            guard !tornDown, let backend, handle != nil else { throw posixError(ENXIO) }
+            guard !activated, readOnly else { throw posixError(EBUSY) }
+            var reason: Int32 = 0
+            let rc = nfsk_quick_check(backend.backend, &reason)
+            guard rc == 0 else {
+                let detail: String
+                switch reason {
+                case Int32(NFSK_CHECK_DIRTY): detail = "The NTFS volume is marked dirty or a Windows disk check is in progress."
+                case Int32(NFSK_CHECK_HIBERNATED): detail = "Windows hibernation or Fast Startup prevents writable mounting. Fully shut down Windows first."
+                case Int32(NFSK_CHECK_JOURNAL): detail = "The NTFS journal is unclean, unreadable, or contains cached Windows metadata."
+                default: detail = "NTFS core metadata could not be read or validated."
+                }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(-rc), userInfo: [
+                    NSLocalizedDescriptionKey: detail + " No repairs were attempted."
+                ])
+            }
+        }
+    }
+
     func activate(options: FSTaskOptions) async throws -> FSItem {
         try withLock {
             guard !tornDown, handle != nil else { throw posixError(ENXIO) }
@@ -260,32 +286,66 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem) async throws -> FSItem.Attributes {
         try withLock {
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
-            var consumed: FSItem.Attribute = []
-            if newAttributes.isValid(.size) {
-                let rc = nfsk_truncate(h, it.ino, newAttributes.size)
-                if rc != 0 { throw posixError(-rc) }
-                consumed.insert(.size)
-            }
-            let wantM = newAttributes.isValid(.modifyTime)
-            let wantA = newAttributes.isValid(.accessTime)
-            if wantM || wantA {
-                let m = newAttributes.modifyTime
-                let a = newAttributes.accessTime
-                let rc = nfsk_set_times(h, it.ino,
-                                        wantM ? Int64(m.tv_sec) : Int64.min, Int64(m.tv_nsec),
-                                        wantA ? Int64(a.tv_sec) : Int64.min, Int64(a.tv_nsec))
-                if rc != 0 { throw posixError(-rc) }
-                if wantM { consumed.insert(.modifyTime) }
-                if wantA { consumed.insert(.accessTime) }
-            }
-            // Report which attributes we actually applied: FSKit calls wasAttributeConsumed()
-            // on the request and treats anything not in consumedAttributes as not-honored.
-            newAttributes.consumedAttributes = consumed
-            var a = nfsk_attr_t()
-            let rc = nfsk_getattr(h, it.ino, &a)
-            if rc != 0 { throw posixError(-rc) }
-            return makeAttributes(a, parentIno: it.parentIno)
+            return try applyAttributes(newAttributes, ino: it.ino, parent: it.parentIno, handle: h)
         }
+    }
+
+    private func metadataRequest(_ request: FSItem.SetAttributesRequest) throws -> nfsk_metadata_t {
+        guard !request.isValid(.backupTime) else { throw posixError(ENOTSUP) }
+        if request.isValid(.size), request.size > UInt64(Int64.max) { throw posixError(EFBIG) }
+        var metadata = nfsk_metadata_t()
+        if request.isValid(.modifyTime) {
+            metadata.valid |= UInt32(NFSK_SET_MTIME)
+            metadata.mtime_sec = Int64(request.modifyTime.tv_sec)
+            metadata.mtime_nsec = Int64(request.modifyTime.tv_nsec)
+        }
+        if request.isValid(.accessTime) {
+            metadata.valid |= UInt32(NFSK_SET_ATIME)
+            metadata.atime_sec = Int64(request.accessTime.tv_sec)
+            metadata.atime_nsec = Int64(request.accessTime.tv_nsec)
+        }
+        if request.isValid(.birthTime) {
+            metadata.valid |= UInt32(NFSK_SET_BTIME)
+            metadata.btime_sec = Int64(request.birthTime.tv_sec)
+            metadata.btime_nsec = Int64(request.birthTime.tv_nsec)
+        }
+        if request.isValid(.flags) {
+            metadata.valid |= UInt32(NFSK_SET_FLAGS)
+            metadata.flags = request.flags
+        }
+        let rc = nfsk_validate_metadata(&metadata)
+        if rc != 0 { throw posixError(-rc) }
+        return metadata
+    }
+
+    // Called with the volume lock held, including while initializing a new item.
+    private func applyAttributes(_ request: FSItem.SetAttributesRequest, ino: UInt64,
+                                 parent: UInt64, handle: OpaquePointer) throws -> FSItem.Attributes {
+        guard !readOnly else { throw posixError(EROFS) }
+        var metadata = try metadataRequest(request)
+        var attributes = nfsk_attr_t()
+        let initial = nfsk_getattr(handle, ino, &attributes)
+        if initial != 0 { throw posixError(-initial) }
+        request.consumedAttributes = []
+        // Preserve the existing ignored-ownership policy: mode/uid/gid remain
+        // unconsumed. Rejecting them here also rejects otherwise valid copy metadata.
+        if request.isValid(.size) {
+            if attributes.type == UInt32(NFSK_TYPE_FILE) {
+                let rc = nfsk_truncate(handle, ino, request.size)
+                if rc != 0 { throw posixError(-rc) }
+            } else if request.size != attributes.size { throw posixError(EINVAL) }
+            request.consumedAttributes.insert(.size)
+        }
+        if metadata.valid != 0 {
+            let rc = nfsk_set_metadata(handle, ino, &metadata)
+            if rc != 0 { throw posixError(-rc) }
+            for attribute: FSItem.Attribute in [.modifyTime, .accessTime, .birthTime, .flags] where request.isValid(attribute) {
+                request.consumedAttributes.insert(attribute)
+            }
+        }
+        let rc = nfsk_getattr(handle, ino, &attributes)
+        if rc != 0 { throw posixError(-rc) }
+        return makeAttributes(attributes, parentIno: parent)
     }
 
     // MARK: lookup / reclaim
@@ -310,9 +370,13 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func reclaimItem(_ item: FSItem) async throws {
-        withLock {
+        try withLock {
             guard let it = item as? ntfs3gItem else { return }
             guard it.ino != NFSK_ROOT_INO else { return }
+            if legacyOpenUnlink, items[it.ino] === it, let handle {
+                let rc = nfsk_close_item(handle, it.ino)
+                if rc != 0 { throw posixError(-rc) }
+            }
             let removeCachedItem = {
                 if self.items[it.ino] === it { self.items.removeValue(forKey: it.ino) }
             }
@@ -349,11 +413,20 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
                     attributes newAttributes: FSItem.SetAttributesRequest) async throws -> (FSItem, FSFileName) {
         try withLock {
             guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
+            guard type == .file || type == .directory else { throw posixError(ENOTSUP) }
+            _ = try metadataRequest(newAttributes)
             let kind = UInt32(type == .directory ? NFSK_TYPE_DIR : NFSK_TYPE_FILE)
             var err: Int32 = 0
             let ino = nameStr.withCString { nfsk_create(h, dir.ino, $0, kind, &err) }
             if ino == 0 { throw posixError(err) }
+            do { _ = try applyAttributes(newAttributes, ino: ino, parent: dir.ino, handle: h) }
+            catch {
+                let cleanup = nameStr.withCString { nfsk_remove(h, dir.ino, $0) }
+                if cleanup != 0 { NSLog("[xntfs] failed to remove incompletely initialized item: errno \(-cleanup)") }
+                throw error
+            }
             let fsName = FSFileName(string: nameStr)
+            items.removeValue(forKey: ino)
             return (item(for: ino, parentIno: dir.ino, name: fsName), fsName)
         }
     }
@@ -361,7 +434,26 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     func createSymbolicLink(named name: FSFileName, inDirectory directory: FSItem,
                             attributes newAttributes: FSItem.SetAttributesRequest,
                             linkContents contents: FSFileName) async throws -> (FSItem, FSFileName) {
-        throw posixError(ENOTSUP)
+        try withLock {
+            guard let dir = directory as? ntfs3gItem, let h = handle,
+                  let nameStr = name.string, let target = contents.string,
+                  !nameStr.utf8.contains(0), !target.utf8.contains(0) else { throw posixError(EINVAL) }
+            _ = try metadataRequest(newAttributes)
+            var error: Int32 = 0
+            let ino = nameStr.withCString { name in
+                target.withCString { nfsk_symlink(h, dir.ino, name, $0, &error) }
+            }
+            guard ino != 0 else { throw posixError(error) }
+            do { _ = try applyAttributes(newAttributes, ino: ino, parent: dir.ino, handle: h) }
+            catch {
+                let cleanup = nameStr.withCString { nfsk_remove(h, dir.ino, $0) }
+                if cleanup != 0 { NSLog("[xntfs] failed to remove incompletely initialized symlink: errno \(-cleanup)") }
+                throw error
+            }
+            let actual = FSFileName(string: nameStr)
+            items.removeValue(forKey: ino)
+            return (item(for: ino, parentIno: dir.ino, name: actual), actual)
+        }
     }
 
     func createLink(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem) async throws -> FSFileName {
@@ -526,9 +618,67 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
 
-    // MARK: OpenClose (no-ops)
-    func openItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {}
-    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {}
+    // MARK: Volume name / preallocation
+    func setVolumeName(_ name: FSFileName) async throws -> FSFileName {
+        try withLock {
+            guard let h = handle, let label = name.string, !label.utf8.contains(0) else { throw posixError(EINVAL) }
+            let rc = label.withCString { nfsk_rename_volume(h, $0) }
+            if rc != 0 { throw posixError(-rc) }
+            self.name = name
+            rootItem.name = name
+            return name
+        }
+    }
+
+    func preallocateSpace(for item: FSItem, at offset: off_t, length: Int,
+                          flags: FSVolume.PreallocateFlags) async throws -> Int {
+        try withLock {
+            guard let h = handle, let item = item as? ntfs3gItem else { throw posixError(EINVAL) }
+            guard !readOnly else { throw posixError(EROFS) }
+            let supported: FSVolume.PreallocateFlags = [.all, .persist, .fromEOF]
+            guard flags.subtracting(supported).isEmpty else { throw posixError(ENOTSUP) }
+            let rc = nfsk_preallocate(h, item.ino, Int64(offset), Int64(length), flags.contains(.fromEOF))
+            if rc < 0 { throw posixError(Int32(-rc)) }
+            return Int(rc)
+        }
+    }
+
+    // MARK: OpenClose
+    func openItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
+        try withLock {
+            guard let h = handle, let it = item as? ntfs3gItem else { throw posixError(EINVAL) }
+            if readOnly && modes.contains(.write) { throw posixError(EROFS) }
+            guard legacyOpenUnlink else { return }
+            let rc = nfsk_open_item(h, it.ino)
+            if rc != 0 { throw posixError(-rc) }
+        }
+    }
+
+    func closeItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
+        guard legacyOpenUnlink, modes.isEmpty else { return }
+        try withLock {
+            guard let h = handle, let it = item as? ntfs3gItem else { throw posixError(EINVAL) }
+            guard items[it.ino] === it else { return }
+            let rc = nfsk_close_item(h, it.ino)
+            if rc != 0 { throw posixError(-rc) }
+            evictDeletedItem(item, handle: h)
+        }
+    }
+}
+
+@available(macOS 27.0, *)
+extension ntfs3gVolume: FSVolume.SeekRegionHandler {
+    func seek(within item: FSItem, from offset: off_t, region: FSVolume.SeekRegion,
+              context: FSContext) async throws -> FSSeekRegionResult {
+        try withLock {
+            guard let h = handle, let it = item as? ntfs3gItem else { throw posixError(EINVAL) }
+            guard region == .data || region == .hole else { throw posixError(EINVAL) }
+            var result: Int64 = 0
+            let rc = nfsk_seek_region(h, it.ino, Int64(offset), region == .data, &result)
+            if rc != 0 { throw posixError(-rc) }
+            return FSSeekRegionResult(returnedOffset: off_t(result))
+        }
+    }
 }
 
 // MARK: - Directory enumeration trampoline

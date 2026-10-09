@@ -32,7 +32,7 @@ xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
 
 | Piece | State |
 |-------|-------|
-| `ntfs3g` extension (NTFS read/write engine) | ✅ builds; engine statically linked; FSKit conformances complete |
+| `ntfs3g` extension (NTFS read/write engine) | ✅ builds; engine statically linked; [implemented operations and limits](docs/fskit-feature-alignment.md) |
 | `xntfs` app (UI, monitor, mount service, settings) | ✅ builds |
 | English + Simplified Chinese localization | ✅ `Localizable.xcstrings` (en, zh-Hans) |
 | App icon | ✅ generated, full AppIcon set |
@@ -47,14 +47,28 @@ which fixes the 2026.9.18 regression that could reject new files and directories
 
 ## Known issues
 
-- **macOS 15: deleting or replacing an open file can invalidate its existing handles.**
-  If a file is deleted, or replaced by renaming another file over it, while an app still
-  has it open, subsequent reads or metadata queries through the old handle may fail
-  with `ENOENT` (file not found). This remains unfixed on macOS 15; a fix is deferred.
-  Close files in all apps before deleting or replacing them. The current source enables
-  FSKit's open-unlink emulation on macOS 26+, with mounted tests passing on macOS 27;
-  that API is unavailable on macOS 15. See [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
-  and [validation details](docs/issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime).
+- **macOS 15 open-file lifetime: native fix validated on macOS 15.8.**
+  The current source retains deleted/replaced open files until final close, without
+  depending on macOS 26 APIs. Bridge, direct Swift and mounted lifetime tests
+  passed on macOS 15.8 x86_64 with TestFlight 1.0.9 (13). Older builds can still
+  lose access through existing handles; close files before deleting or replacing
+  them. macOS 26+ keeps FSKit's emulation, tested on macOS 27; its
+  unlinked open files still report a link count of 1. See [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
+  and [current validation](docs/fskit-feature-alignment.md).
+- **macOS 15 allocation reporting can remain stale while a file is open.**
+  Mounted tests reproduced outdated allocated-space values after ordinary writes
+  and preallocation, until the last descriptor closed. Data and logical file size
+  remained correct in these tests. The same probe passed on macOS 27; the cause
+  is not yet established. See [the focused retest](docs/fskit-feature-alignment.md#focused-allocation-retest).
+
+## Filesystem operations
+
+The current source supports native creation-time and hidden-flag updates,
+symbolic links, volume renaming, persistent preallocation for ordinary files,
+and sparse-region queries on macOS 27. It performs a read-only mount preflight,
+not a full filesystem check or repair. These are source capabilities, not a
+claim that every published build includes them. See the [design, tests and
+remaining limits](docs/fskit-feature-alignment.md).
 
 ## Finder metadata
 

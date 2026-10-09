@@ -48,7 +48,7 @@ typedef struct {
     uint64_t free_files;
     uint64_t volume_serial;      /* NTFS 64-bit boot-sector serial; 0 if unreadable */
     uint8_t  read_only;
-    char     volume_name[260];   /* UTF-8, NUL-terminated */
+    char     volume_name[1024];  /* UTF-8, NUL-terminated */
 } nfsk_statfs_t;
 
 typedef struct {
@@ -56,6 +56,7 @@ typedef struct {
     uint64_t parent_ino;   /* parent dir in our numbering; 0 if unknown */
     uint32_t type;         /* NFSK_TYPE_* */
     uint32_t mode;         /* synthesized POSIX permission bits */
+    uint32_t flags;        /* supported BSD flags, currently UF_HIDDEN */
     uint32_t nlink;
     uint64_t size;
     uint64_t alloc_size;
@@ -77,6 +78,17 @@ void nfsk_umount(ntfs_fskit_volume *v);
 int  nfsk_sync(ntfs_fskit_volume *v);
 int  nfsk_statfs(ntfs_fskit_volume *v, nfsk_statfs_t *out);
 
+/* Read-only mount preflight, not a full consistency scan or repair. The resource
+ * must not be mounted writable elsewhere. Returns 0 or -errno and a diagnostic. */
+enum {
+    NFSK_CHECK_CLEAN = 0,
+    NFSK_CHECK_METADATA = 1,
+    NFSK_CHECK_DIRTY = 2,
+    NFSK_CHECK_HIBERNATED = 3,
+    NFSK_CHECK_JOURNAL = 4,
+};
+int  nfsk_quick_check(void *resource, int *reason);
+
 /* --- item operations --- */
 int      nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out);
 uint64_t nfsk_lookup(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name_utf8, int *out_errno);
@@ -92,6 +104,33 @@ int      nfsk_truncate(ntfs_fskit_volume *v, uint64_t ino, uint64_t size);
 int      nfsk_set_times(ntfs_fskit_volume *v, uint64_t ino,
                         int64_t mtime_sec, int64_t mtime_nsec,
                         int64_t atime_sec, int64_t atime_nsec);
+enum {
+    NFSK_SET_MTIME = 1,
+    NFSK_SET_ATIME = 2,
+    NFSK_SET_BTIME = 4,
+    NFSK_SET_FLAGS = 8,
+};
+typedef struct {
+    uint32_t valid;
+    uint32_t flags;
+    int64_t mtime_sec, mtime_nsec;
+    int64_t atime_sec, atime_nsec;
+    int64_t btime_sec, btime_nsec;
+} nfsk_metadata_t;
+int      nfsk_validate_metadata(const nfsk_metadata_t *metadata);
+int      nfsk_set_metadata(ntfs_fskit_volume *v, uint64_t ino, const nfsk_metadata_t *metadata);
+uint64_t nfsk_symlink(ntfs_fskit_volume *v, uint64_t dir_ino, const char *name,
+                      const char *target, int *out_errno);
+int      nfsk_rename_volume(ntfs_fskit_volume *v, const char *name);
+int64_t  nfsk_preallocate(ntfs_fskit_volume *v, uint64_t ino, int64_t offset,
+                          int64_t length, bool from_eof);
+int      nfsk_seek_region(ntfs_fskit_volume *v, uint64_t ino, int64_t offset,
+                          bool seek_data, int64_t *result);
+
+/* FSKit open/close describe access modes, not descriptor counts. Opening is
+ * idempotent; call close only when no access modes remain. */
+int      nfsk_open_item(ntfs_fskit_volume *v, uint64_t ino);
+int      nfsk_close_item(ntfs_fskit_volume *v, uint64_t ino);
 int      nfsk_rename(ntfs_fskit_volume *v, uint64_t src_dir, const char *src_name,
                      uint64_t dst_dir, const char *dst_name);
 int      nfsk_readlink(ntfs_fskit_volume *v, uint64_t ino, char *buf, size_t cap);

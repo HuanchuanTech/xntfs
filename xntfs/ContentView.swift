@@ -16,33 +16,33 @@ struct ContentView: View {
     @State private var showError = false
     @State private var showAddImage = false
     @State private var pendingImage: PendingImage?
+    @AppStorage("legacyExtensionGuidanceDismissed") private var legacyGuidanceDismissed = false
+
+    private var hasMountedXntfsVolume: Bool {
+        model.devices.contains { $0.state.isMounted && $0.mountedByXntfs }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             if extStatus.state == .disabled || extStatus.state == .notInstalled {
                 ExtensionBanner(status: extStatus, onDiagnostics: { showDiagnostics = true })
-            } else if extStatus.state == .bundled {
-                HStack(spacing: 12) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("On macOS 15, enable ntfs3g in Settings, then select a volume to mount it with xntfs.")
-                                .font(.callout)
-                            ExtensionEnablementInstructions()
-                        }
-                    } icon: {
-                        Image(systemName: "info.circle")
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    Button("Open Settings…") { ExtensionStatus.openSettings() }
-                    Button("Diagnostics…") { showDiagnostics = true }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .overlay(alignment: .bottom) { Divider() }
+            } else if extStatus.state.shouldShowLegacyGuidance(
+                dismissed: legacyGuidanceDismissed, hasMountedVolume: hasMountedXntfsVolume
+            ) {
+                LegacyExtensionGuidance(
+                    onDiagnostics: { showDiagnostics = true },
+                    onDismiss: { legacyGuidanceDismissed = true }
+                )
             }
             mainContent
         }
         .task { await extStatus.refresh() }
+        .onChange(of: hasMountedXntfsVolume, initial: true) { _, mounted in
+            // Remember completed setup, without claiming the current switch state is known.
+            if ExtensionStatus.needsLegacyCompatibility && mounted {
+                legacyGuidanceDismissed = true
+            }
+        }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
             model.refreshDevices()
         }

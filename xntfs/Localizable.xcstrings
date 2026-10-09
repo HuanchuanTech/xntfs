@@ -302,6 +302,16 @@
         }
       }
     },
+    "Don't show this tip again" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "不再显示此提示"
+          }
+        }
+      }
+    },
     "Done" : {
       "localizations" : {
         "zh-Hans" : {
@@ -920,12 +930,12 @@
         }
       }
     },
-    "On macOS 15, enable ntfs3g in Settings, then select a volume to mount it with xntfs." : {
+    "On macOS 15, xntfs cannot check whether ntfs3g is enabled. If it is already on, dismiss this tip and select a volume to mount with xntfs." : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "macOS 15 用户请先在系统设置中开启 ntfs3g，再选择一个卷，使用 xntfs 挂载。"
+            "value" : "macOS 15 上，xntfs 无法检测 ntfs3g 的开关状态。如果已经开启，可关闭此提示并选择卷，使用 xntfs 挂载。"
           }
         }
       }

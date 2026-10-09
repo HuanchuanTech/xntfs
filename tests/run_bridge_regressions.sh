@@ -13,6 +13,7 @@ flags=(-arch "$target_arch" -g -DHAVE_CONFIG_H=1
 if [[ "${NFSK_SANITIZE:-}" == address ]]; then flags+=(-fsanitize=address -fno-omit-frame-pointer); fi
 xcrun clang "${flags[@]}" -Dntfs_inode_close=nfsk_test_inode_close \
     -Dntfs_inode_real_close=nfsk_test_inode_real_close \
+    -Dntfs_inode_sync=nfsk_test_inode_sync \
     -c "$root/ntfs3g/bridge/ntfs_fskit.c" -o "$work/bridge.o"
 xcrun clang "${flags[@]}" "$root/tests/test_bridge_regressions.c" "$work/bridge.o" \
     "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/regressions"

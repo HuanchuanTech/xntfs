@@ -31,11 +31,24 @@ struct CompatibilityTests {
 
         let status = ExtensionStatus()
         assert(status.isEnabled == nil && !status.isInstalled && status.registrationOK == nil)
+        let states: [ExtensionStatus.State] = [.unknown, .bundled, .notInstalled, .disabled, .enabled]
+        for state in states {
+            for dismissed in [false, true] {
+                for mounted in [false, true] {
+                    assert(state.shouldShowLegacyGuidance(dismissed: dismissed, hasMountedVolume: mounted) ==
+                           (state == .bundled && !dismissed && !mounted))
+                }
+            }
+        }
         if ExtensionStatus.needsLegacyCompatibility {
             try writeInfo(id: ExtensionStatus.bundleID)
             await status.refresh(appURL: app)
             assert(status.state == .bundled && status.isEnabled == nil && !status.isInstalled)
             assert(status.moduleURLs.isEmpty && status.registrationOK == nil)
+            assert(!status.state.shouldShowLegacyGuidance(dismissed: true, hasMountedVolume: false))
+            await status.refresh(appURL: app)
+            assert(status.state == .bundled && status.isEnabled == nil)
+            assert(!status.state.shouldShowLegacyGuidance(dismissed: true, hasMountedVolume: false))
             try writeInfo(id: "someone.else")
             await status.refresh(appURL: app)
             assert(status.state == .notInstalled && status.bundledExtensionURL == nil)
@@ -80,6 +93,6 @@ struct CompatibilityTests {
                 assert(command(device) != nil)
             }
         }
-        print("PASS: bundle detection, unknown status, command quoting, identity, read-only and mounted/unmounted devices.")
+        print("PASS: bundle detection, unknown status, legacy guidance, command quoting, identity, read-only and mounted/unmounted devices.")
     }
 }

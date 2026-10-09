@@ -1,5 +1,13 @@
 # Issues 2, 3 and 4: fixes and validation
 
+> Update (2026-10-09): this document records the earlier implementation and tests.
+> The current source now implements native open-file retention for macOS 15,
+> with bridge, direct Swift and actual mounted lifetime tests passing on macOS
+> 15.8 x86_64. A separate allocation-reporting issue remains unresolved. See
+> [FSKit feature alignment](fskit-feature-alignment.md) for the new implementation,
+> test results and remaining limits. The deferred-fix status below describes the
+> 2026-09-28 snapshot, not the current source.
+
 ## Confirmed findings
 
 - [Issue 2](https://github.com/HuanchuanTech/xntfs/issues/2): the bridge read free-space counters without initializing them from the NTFS allocation bitmaps. A mostly empty test image reported no free clusters before the fix. Mount now calls `ntfs_volume_get_free_space()` and fails if initialization fails. Allocation, deletion and remount tests verify the counters. This confirms the defect, not the exact 8 KB value on the reporter's 2 TB disk.

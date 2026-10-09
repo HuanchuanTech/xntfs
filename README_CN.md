@@ -32,7 +32,7 @@ xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
 
 | 部件 | 状态 |
 |-------|-------|
-| `ntfs3g` 扩展(NTFS 读写引擎) | ✅ 可编译;引擎静态链接;FSKit 协议实现完整 |
+| `ntfs3g` 扩展(NTFS 读写引擎) | ✅ 可编译;引擎静态链接;[已实现操作与边界](docs/fskit-feature-alignment.md) |
 | `xntfs` 应用(UI、监视器、挂载服务、设置) | ✅ 可编译 |
 | 英文 + 简体中文本地化 | ✅ `Localizable.xcstrings`(en、zh-Hans) |
 | 应用图标 | ✅ 已生成,完整 AppIcon 集 |
@@ -45,13 +45,23 @@ xntfs.app  (SwiftUI,App 沙盒 —— 控制面板;不是后台代理)
 
 ## 已知缺陷
 
-- **macOS 15：删除或覆盖仍被打开的文件，可能使已有文件句柄失效。**
-  当应用仍打开着某个文件时，删除该文件，或通过重命名另一文件覆盖它，可能导致应用
-  通过旧句柄读取内容或查询属性时收到 `ENOENT`（文件不存在）。此问题在 macOS 15
-  上仍未修复，暂缓处理。删除或覆盖前，请先在所有应用中关闭该文件。当前源码在
-  macOS 26+ 启用了 FSKit 的打开文件删除模拟机制，并已在 macOS 27 挂载测试中验证；
-  macOS 15 不提供该 API。见 [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
-  和[验证说明](docs/issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime)。
+- **macOS 15 文件生命周期：原生修复已在 macOS 15.8 验证。**
+  当前源码会保留已删除或被覆盖的打开文件，直到最后关闭，不依赖 macOS 26 的 API。
+  在 macOS 15.8 x86_64 上，桥接层、直接 Swift 测试及 TestFlight 1.0.9 (13) 的实际挂载生命周期测试均已通过。
+  旧构建仍可能使已有句柄失效，删除或覆盖前请先关闭文件。macOS 26+ 继续使用
+  FSKit 的模拟机制，已在 macOS 27 验证；删除后仍打开的文件，其链接数仍显示为 1。
+  见 [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
+  和[本轮验证记录](docs/fskit-feature-alignment.md)。
+- **macOS 15 上，文件打开期间的已分配空间信息可能不及时更新。**
+  实际挂载测试中，普通写入和预分配后均出现旧值，直到最后一个文件描述符关闭才更新。
+  本轮测试的数据内容与逻辑文件大小均保持正确。同一测试在 macOS 27 通过，但原因尚未确定。
+  见[专项复测记录](docs/fskit-feature-alignment.md#focused-allocation-retest)。
+
+## 文件系统操作
+
+当前源码支持修改原生创建时间与隐藏标志、符号链接、卷改名、普通文件的持久空间预分配，
+以及 macOS 27 上的稀疏区域查询。挂载前会进行只读的安全性预检，不提供完整检查或修复。
+这些是源码能力，不代表所有已发布版本均已包含。详见[设计、测试与能力边界](docs/fskit-feature-alignment.md)。
 
 ## Finder 元数据
 

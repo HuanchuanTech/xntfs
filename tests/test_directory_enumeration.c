@@ -144,6 +144,8 @@ static int collect(void *opaque, const char *name, uint64_t ino, uint32_t type, 
     strcpy(item->name, name);
     item->ino = ino;
     item->type = type;
+    nfsk_attr_t attributes;
+    if (nfsk_getattr(out->volume, ino, &attributes) || attributes.type != type) out->invalid++;
     item->cookie = out->cookie = cookie;
     char folded[1024];
     strcpy(folded, name);
