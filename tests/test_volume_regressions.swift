@@ -12,6 +12,33 @@ struct VolumeRegressionTests {
         let volume = try ntfs3gVolume(backend: backend(image, writable: true),
             activationBackend: { _, _ in nil }, onContainerStatusChange: { _ in }, legacyOpenUnlink: true)
         let root = ntfs3gItem(ino: NFSK_ROOT_INO, parentIno: NFSK_PARENT_OF_ROOT, name: FSFileName(string: "/"))
+        let rootGet = FSItem.GetAttributesRequest()
+        rootGet.wantedAttributes = [.flags, .modifyTime, .changeTime]
+        let rootBefore = try await volume.attributes(rootGet, of: root)
+        precondition(rootBefore.flags == 0)
+        let rootClear = FSItem.SetAttributesRequest()
+        rootClear.flags = 0
+        var rootAttrs = try await volume.setAttributes(rootClear, on: root)
+        precondition(rootAttrs.flags == 0 && rootClear.wasAttributeConsumed(.flags))
+        precondition(rootAttrs.changeTime.tv_sec == rootBefore.changeTime.tv_sec &&
+                     rootAttrs.changeTime.tv_nsec == rootBefore.changeTime.tv_nsec)
+        let rootUpdate = FSItem.SetAttributesRequest()
+        rootUpdate.flags = 0
+        rootUpdate.modifyTime = timespec(tv_sec: 946684790, tv_nsec: 123456700)
+        rootAttrs = try await volume.setAttributes(rootUpdate, on: root)
+        precondition(rootAttrs.flags == 0 && rootAttrs.modifyTime.tv_sec == 946684790 &&
+                     rootAttrs.modifyTime.tv_nsec == 123456700)
+        precondition(rootUpdate.wasAttributeConsumed(.flags) && rootUpdate.wasAttributeConsumed(.modifyTime))
+        let rootHide = FSItem.SetAttributesRequest()
+        rootHide.flags = UInt32(UF_HIDDEN)
+        rootHide.modifyTime = timespec(tv_sec: 946684791, tv_nsec: 0)
+        try await expect(ENOTSUP) { _ = try await volume.setAttributes(rootHide, on: root) }
+        rootAttrs = try await volume.attributes(rootGet, of: root)
+        precondition(rootAttrs.flags == 0 && rootAttrs.modifyTime.tv_sec == 946684790 &&
+                     rootAttrs.modifyTime.tv_nsec == 123456700)
+        precondition(!rootHide.wasAttributeConsumed(.flags) && !rootHide.wasAttributeConsumed(.modifyTime))
+        print("PASS: visible volume root, nohidden no-op, combined metadata and root hiding rejection")
+
         let create = FSItem.SetAttributesRequest()
         create.size = 123
         create.mode = 0o600
@@ -117,6 +144,9 @@ struct VolumeRegressionTests {
             activationBackend: { _, _ in nil }, onContainerStatusChange: { _ in })
         defer { readOnly.teardown() }
         try readOnly.quickCheck()
+        rootAttrs = try await readOnly.attributes(rootGet, of: root)
+        precondition(rootAttrs.flags == 0)
+        try await expect(EROFS) { _ = try await readOnly.setAttributes(rootClear, on: root) }
         try await expect(EROFS) { try await readOnly.openItem(root, modes: [.write]) }
         try await expect(EROFS) { _ = try await readOnly.setVolumeName(FSFileName(string: "No")) }
         let modes = try [["-q"], ["-qn"], ["-y"], ["-n"], []].map { try ntfs3gFileSystem.CheckMode(options: $0) }

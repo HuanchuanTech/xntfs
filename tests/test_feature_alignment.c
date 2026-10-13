@@ -64,6 +64,10 @@ static void prepare_native(const char *path) {
     ntfs_volume *volume = ntfs_mount(path, NTFS_MNT_NONE);
     require(volume != NULL && ntfs_volume_get_free_space(volume) == 0, "native fixture mount");
     ntfs_inode *root = ntfs_inode_open(volume, FILE_root);
+    require(root != NULL, "native root fixture");
+    root->flags |= FILE_ATTR_HIDDEN | FILE_ATTR_SYSTEM;
+    ntfs_inode_mark_dirty(root);
+    NInoFileNameSetDirty(root);
     ntfschar *name = NULL, *target = NULL;
     int length = ntfs_mbstoucs("LongOpenName.txt", &name);
     ntfs_inode *file = ntfs_create(root, const_cpu_to_le32(0), name, length, S_IFREG);
@@ -77,6 +81,15 @@ static void prepare_native(const char *path) {
     free(name); free(target);
     require(file && ntfs_inode_close_in_dir(file, root) == 0, "Interix symlink fixture");
     require(ntfs_inode_close(root) == 0 && ntfs_umount(volume, FALSE) == 0, "close native fixtures");
+}
+static uint32_t read_native_root_flags(const char *path) {
+    ntfs_volume *volume = ntfs_mount(path, NTFS_MNT_RDONLY | NTFS_MNT_FORENSIC);
+    require(volume != NULL, "read-only root observer");
+    ntfs_inode *root = ntfs_inode_open(volume, FILE_root);
+    require(root != NULL, "read native root flags");
+    uint32_t flags = le32_to_cpu(root->flags);
+    require(ntfs_inode_close(root) == 0 && ntfs_umount(volume, FALSE) == 0, "close root observer");
+    return flags;
 }
 static int find_retention(void *p, const ntfschar *name, int length, int name_type,
                           s64 position, MFT_REF ref, unsigned type) {
@@ -202,10 +215,41 @@ int main(int argc, char **argv) {
         return result;
     }
     prepare_native(argv[1]);
+    uint32_t root_flags = read_native_root_flags(argv[1]);
     int error = 0;
     ntfs_fskit_volume *v = nfsk_mount(&d, false, &error);
     require(v != NULL, "mount feature fixture");
     nfsk_attr_t a;
+
+    nfsk_attr_t root_before;
+    require(nfsk_getattr(v, NFSK_ROOT_INO, &root_before) == 0, "root attributes");
+    CHECK(root_before.type == NFSK_TYPE_DIR && root_before.flags == 0,
+          "NTFS hidden/system root is exposed as a visible volume");
+    nfsk_metadata_t root_metadata = { .valid = NFSK_SET_FLAGS, .flags = 0 };
+    int writes_before = d.writes;
+    /* Attribute readback uses the bridge's normal inode synchronization path;
+     * check setter writes before that readback. */
+    CHECK(nfsk_set_metadata(v, NFSK_ROOT_INO, &root_metadata) == 0 && d.writes == writes_before &&
+          nfsk_getattr(v, NFSK_ROOT_INO, &a) == 0 && a.flags == 0 &&
+          a.ctime_sec == root_before.ctime_sec && a.ctime_nsec == root_before.ctime_nsec,
+          "clearing the root hidden flag succeeds without writes or ctime changes");
+    root_metadata.valid |= NFSK_SET_MTIME;
+    root_metadata.mtime_sec = 946684790;
+    CHECK(nfsk_set_metadata(v, NFSK_ROOT_INO, &root_metadata) == 0 &&
+          nfsk_getattr(v, NFSK_ROOT_INO, &a) == 0 && a.flags == 0 && a.mtime_sec == 946684790,
+          "clearing the root hidden flag still applies other requested metadata");
+    root_metadata.flags = UF_HIDDEN;
+    root_metadata.mtime_sec++;
+    writes_before = d.writes;
+    CHECK(nfsk_set_metadata(v, NFSK_ROOT_INO, &root_metadata) == -ENOTSUP && d.writes == writes_before &&
+          nfsk_getattr(v, NFSK_ROOT_INO, &a) == 0 && a.flags == 0 &&
+          a.mtime_sec == 946684790,
+          "hiding the volume root is rejected before changing any metadata");
+    root_metadata.flags = UF_IMMUTABLE;
+    CHECK(nfsk_set_metadata(v, NFSK_ROOT_INO, &root_metadata) == -ENOTSUP,
+          "root visibility policy does not accept unsupported flags");
+    require(nfsk_sync(v) == 0, "synchronize root metadata for observer");
+    CHECK(read_native_root_flags(argv[1]) == root_flags, "root NTFS flags remain unchanged on disk");
 
     uint64_t parent = create(v, NFSK_ROOT_INO, "LifetimeParent", NFSK_TYPE_DIR);
     uint64_t old = create(v, parent, "Old", NFSK_TYPE_FILE);
@@ -281,10 +325,23 @@ int main(int argc, char **argv) {
     metadata.valid = NFSK_SET_FLAGS; metadata.flags = 0;
     CHECK(nfsk_set_metadata(v, meta, &metadata) == 0 && nfsk_getattr(v, meta, &a) == 0 && a.flags == 0, "hidden flag can be cleared");
 
+    uint64_t hidden_dir = create(v, NFSK_ROOT_INO, "HiddenDirectory", NFSK_TYPE_DIR);
+    metadata.flags = UF_HIDDEN;
+    CHECK(nfsk_set_metadata(v, hidden_dir, &metadata) == 0 && nfsk_getattr(v, hidden_dir, &a) == 0 &&
+          a.type == NFSK_TYPE_DIR && a.flags == UF_HIDDEN, "ordinary directories can still be hidden");
+    metadata.flags = 0;
+    CHECK(nfsk_set_metadata(v, hidden_dir, &metadata) == 0 && nfsk_getattr(v, hidden_dir, &a) == 0 && a.flags == 0,
+          "ordinary directory hidden flags can still be cleared");
+
     char target[4096];
     uint64_t interix = lookup(v, NFSK_ROOT_INO, "InterixLink");
     CHECK(interix && nfsk_getattr(v, interix, &a) == 0 && a.type == NFSK_TYPE_SYMLINK &&
           nfsk_readlink(v, interix, target, sizeof target) == 0 && !strcmp(target, "Metadata"), "existing Interix symlinks have consistent type and target");
+    nfsk_metadata_t interix_flags = { .valid = NFSK_SET_FLAGS, .flags = a.flags ^ UF_HIDDEN };
+    CHECK(nfsk_set_metadata(v, interix, &interix_flags) == -ENOTSUP &&
+          nfsk_getattr(v, interix, &a) == 0 && a.type == NFSK_TYPE_SYMLINK &&
+          nfsk_readlink(v, interix, target, sizeof target) == 0 && !strcmp(target, "Metadata"),
+          "root flag handling preserves Interix special-file protection");
     uint64_t relative = nfsk_symlink(v, NFSK_ROOT_INO, "RelativeLink", "Metadata", &error);
     uint64_t absolute = nfsk_symlink(v, NFSK_ROOT_INO, "AbsoluteLink", "/some/absolute/path", &error);
     CHECK(relative && nfsk_getattr(v, relative, &a) == 0 && a.type == NFSK_TYPE_SYMLINK &&
@@ -349,6 +406,10 @@ int main(int argc, char **argv) {
     nfsk_umount(v);
     v = nfsk_mount(&d, true, &error);
     require(v != NULL, "read-only remount");
+    CHECK(nfsk_getattr(v, NFSK_ROOT_INO, &a) == 0 && a.flags == 0, "root stays visible after read-only remount");
+    root_metadata.valid = NFSK_SET_FLAGS; root_metadata.flags = 0;
+    CHECK(nfsk_set_metadata(v, NFSK_ROOT_INO, &root_metadata) == -EROFS,
+          "root flag requests still respect read-only mode");
     CHECK(nfsk_statfs(v, &after) == 0 && !strcmp(after.volume_name, "Renamed NTFS"), "volume label survives remount");
     CHECK(nfsk_getattr(v, meta, &a) == 0 && a.btime_sec == 946684800 && a.flags == 0, "creation time and flags survive remount");
     CHECK(nfsk_getattr(v, allocation, &a) == 0 && a.size == 65536 && a.alloc_size >= 65536, "preallocation survives close and remount");

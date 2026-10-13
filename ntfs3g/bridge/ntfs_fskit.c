@@ -761,7 +761,9 @@ int nfsk_getattr(ntfs_fskit_volume *v, uint64_t ino, nfsk_attr_t *out) {
     out->nlink = le16_to_cpu(ni->mrec->link_count);
     nfsk_open_ref *opened = nfsk_open_ref_for(v->vol, ni->mft_no);
     if (opened && opened->anchor && out->nlink) out->nlink--;
-    out->flags = (ni->flags & FILE_ATTR_HIDDEN) ? UF_HIDDEN : 0;
+    /* Formatters may mark the NTFS root HIDDEN | SYSTEM. Exposing HIDDEN here
+     * hides the entire mounted volume in macOS, not just an ordinary item. */
+    out->flags = ni->mft_no != FILE_root && (ni->flags & FILE_ATTR_HIDDEN) ? UF_HIDDEN : 0;
 
     uint32_t type = nfsk_inode_type(ni);
     if (type == NFSK_TYPE_DIR) {
@@ -1332,20 +1334,29 @@ int nfsk_set_metadata(ntfs_fskit_volume *v, uint64_t ino, const nfsk_metadata_t 
     int valid = nfsk_validate_metadata(m);
     if (valid) return valid;
     if (is_reserved_mft(to_mref(ino))) return -EPERM;
+    uint32_t fields = m->valid;
+    if (to_mref(ino) == FILE_root && (fields & NFSK_SET_FLAGS)) {
+        /* The root is always visible in macOS. Clearing its exposed flags is
+         * a no-op; retain the original NTFS flags for other operating systems.
+         * Resolve flag-only requests before opening an inode for writeback. */
+        if (m->flags & UF_HIDDEN) return -ENOTSUP;
+        fields &= ~NFSK_SET_FLAGS;
+        if (!fields) return 0;
+    }
     ntfs_inode *ni = nfsk_inode_open(v->vol, to_mref(ino));
     if (!ni) return -errno;
     /* HIDDEN distinguishes some Interix special files from ordinary data. */
-    if ((m->valid & NFSK_SET_FLAGS) &&
+    if ((fields & NFSK_SET_FLAGS) &&
         (!!(m->flags & UF_HIDDEN) != !!(ni->flags & FILE_ATTR_HIDDEN)) &&
         !(ni->flags & FILE_ATTR_REPARSE_POINT) &&
         (ni->flags & FILE_ATTR_SYSTEM) && ntfs_interix_types(ni) != NTFS_DT_REG) {
         nfsk_inode_close(ni);
         return -ENOTSUP;
     }
-    if (m->valid & NFSK_SET_MTIME) { struct timespec ts = { (time_t)m->mtime_sec, (long)m->mtime_nsec }; ni->last_data_change_time = timespec2ntfs(ts); }
-    if (m->valid & NFSK_SET_ATIME) { struct timespec ts = { (time_t)m->atime_sec, (long)m->atime_nsec }; ni->last_access_time = timespec2ntfs(ts); }
-    if (m->valid & NFSK_SET_BTIME) { struct timespec ts = { (time_t)m->btime_sec, (long)m->btime_nsec }; ni->creation_time = timespec2ntfs(ts); }
-    if (m->valid & NFSK_SET_FLAGS) {
+    if (fields & NFSK_SET_MTIME) { struct timespec ts = { (time_t)m->mtime_sec, (long)m->mtime_nsec }; ni->last_data_change_time = timespec2ntfs(ts); }
+    if (fields & NFSK_SET_ATIME) { struct timespec ts = { (time_t)m->atime_sec, (long)m->atime_nsec }; ni->last_access_time = timespec2ntfs(ts); }
+    if (fields & NFSK_SET_BTIME) { struct timespec ts = { (time_t)m->btime_sec, (long)m->btime_nsec }; ni->creation_time = timespec2ntfs(ts); }
+    if (fields & NFSK_SET_FLAGS) {
         if (m->flags & UF_HIDDEN) ni->flags |= FILE_ATTR_HIDDEN;
         else ni->flags &= ~FILE_ATTR_HIDDEN;
     }

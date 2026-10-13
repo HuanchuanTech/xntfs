@@ -21,7 +21,7 @@ unrelated metadata, report writeback errors, and survive a close/remount test.
 | Item types | Use the same classification for enumeration and attributes, including Interix special files. | Do not expose unsupported special-file creation as ordinary-file creation. |
 | Symbolic links | Create WSL-format NTFS symlinks; preserve relative and absolute POSIX targets, and continue reading Interix symlinks. | Reject targets exceeding the readlink buffer before changing the namespace. Windows-native link path translation remains best effort. |
 | Timestamps | Apply creation, modification and access times, including creation-time requests. | NTFS has no native backup-time field. Do not substitute ctime or claim an unsupported time was applied. |
-| BSD flags | Map the NTFS hidden attribute to `UF_HIDDEN` and round-trip it. | Unsupported immutable/append/system flags must not be silently accepted. Ownership and ACL mapping remain outside this work. |
+| BSD flags | Map the NTFS hidden attribute to `UF_HIDDEN` for ordinary items. The volume root is always exposed as visible, preserving its on-disk NTFS flags. Clearing root flags is a no-op; other requested timestamps still apply. | Setting `UF_HIDDEN` on the root returns `ENOTSUP`. Unsupported immutable/append/system flags must not be silently accepted. Ownership and ACL mapping remain outside this work. |
 | Creation attributes | Apply supported requested attributes before returning the new item; clean up a newly created item if initialization fails. | Synthesized permission bits and ignored ownership remain the existing policy, not a Windows ACL implementation. |
 | Volume name | Use `ntfs_volume_rename`, update the FSKit-visible name only after success, and preserve the boot-sector identity. | Reject invalid/oversized names and read-only changes. |
 | Preallocation | Reserve storage for ordinary uncompressed files without changing logical EOF or existing data. Report actual allocation. | Reject unsupported contiguous-allocation guarantees and sparse/compressed/encrypted cases rather than pretending to honor them. |
@@ -40,6 +40,20 @@ Sources:
 - [FSBlockDeviceResource](https://developer.apple.com/documentation/fskit/fsblockdeviceresource)
 - [Disk Arbitration quick-check and repair calls](https://github.com/apple-oss-distributions/DiskArbitration/blob/main/diskarbitrationd/DASupport.m)
 - [Disk Arbitration repair failure and read-only fallback](https://github.com/apple-oss-distributions/DiskArbitration/blob/main/diskarbitrationd/DAMount.c)
+
+## Volume root visibility regression (2026-10-13)
+
+[Issue #10](https://github.com/HuanchuanTech/xntfs/issues/10) reports a hidden
+mounted volume. The regression fixture explicitly sets the native NTFS root's
+`HIDDEN | SYSTEM` flags. Tests cover visible root attributes, clearing flags
+without setter writes or ctime changes, combined timestamp updates, rejected
+root hiding, unchanged on-disk flags, and visibility after a read-only remount.
+Ordinary file/directory hidden flags and Interix protection remain covered.
+
+On macOS 27.0 (26A428), all 81 C feature checks, 24 allocation fault-injection
+cases, and direct Swift FSKit tests passed. Five root checks failed before the
+fix. These are disposable-image bridge/API tests; Finder and ForkLift display
+with the updated extension has not been verified through an OS mount.
 
 ## Validation (2026-10-09)
 
