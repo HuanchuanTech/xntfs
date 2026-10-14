@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/disk.h>
 #include <unistd.h>
@@ -1027,6 +1028,8 @@ static int xattr_name_error(const char *name) {
     if (strlen(name) > NFSK_MAX_XATTR_NAME) return ENAMETOOLONG;
     /* Do not expose NTFS/ntfs-3g private streams through a user xattr API. */
     if (name[0] == '$' || !strncmp(name, "ntfs-3g.", 8)) return EPERM;
+    /* Windows uses this ADS as WOF file contents, rather than user metadata. */
+    if (!strcasecmp(name, "WofCompressedData")) return EPERM;
     return 0;
 }
 

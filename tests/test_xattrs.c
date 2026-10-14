@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <ntfs-3g/attrib.h>
 #include <ntfs-3g/inode.h>
+#include <ntfs-3g/volume.h>
+#include <ntfs-3g/unistr.h>
 #include "ntfs_fskit.h"
 
 typedef struct { int fd; int64_t size; } test_device;
@@ -67,6 +69,34 @@ static int listed(ntfs_fskit_volume *v, uint64_t ino, const char *name) {
     return 0;
 }
 
+/* Seed/read Windows' private backing ADS independently of the xattr bridge. */
+static int backing_stream(const char *path, uint64_t ino, const char *name, int create) {
+    const char payload[] = "private compressed backing bytes";
+    ntfs_volume *vol = ntfs_mount(path, create ? NTFS_MNT_NONE : NTFS_MNT_RDONLY);
+    if (!vol) return -1;
+    ntfs_inode *ni = ntfs_inode_open(vol, ino);
+    ntfschar *unicode = NULL;
+    int length = ntfs_mbstoucs(name, &unicode), result = -1;
+    if (ni && length > 0) {
+        if (create) {
+            result = ntfs_attr_add(ni, AT_DATA, unicode, length, (const u8 *)payload, sizeof payload);
+        } else {
+            ntfs_attr *attr = ntfs_attr_open(ni, AT_DATA, unicode, length);
+            char bytes[sizeof payload];
+            if (attr) {
+                result = attr->data_size == sizeof payload &&
+                         ntfs_attr_pread(attr, 0, sizeof bytes, bytes) == sizeof bytes &&
+                         !memcmp(bytes, payload, sizeof bytes) ? 0 : -1;
+                ntfs_attr_close(attr);
+            }
+        }
+    }
+    free(unicode);
+    if (ni && ntfs_inode_close(ni)) result = -1;
+    if (ntfs_umount(vol, FALSE)) result = -1;
+    return result;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     test_device device = {.fd = open(argv[1], O_RDWR)};
@@ -79,6 +109,25 @@ int main(int argc, char **argv) {
     uint64_t file = nfsk_create(v, NFSK_ROOT_INO, "XattrFile", NFSK_TYPE_FILE, &error);
     uint64_t dir = nfsk_create(v, NFSK_ROOT_INO, "XattrDirectory", NFSK_TYPE_DIR, &error);
     if (!file || !dir) return 2;
+    const char *private_names[] = {"WofCompressedData", "wofcompresseddata"};
+    uint64_t private_files[2];
+    private_files[0] = nfsk_create(v, NFSK_ROOT_INO, "PrivateWof", NFSK_TYPE_FILE, &error);
+    private_files[1] = nfsk_create(v, NFSK_ROOT_INO, "PrivateWofLower", NFSK_TYPE_FILE, &error);
+    if (!private_files[0] || !private_files[1]) return 2;
+    nfsk_umount(v);
+    for (int i = 0; i < 2; i++)
+        if (backing_stream(argv[1], private_files[i], private_names[i], 1)) return 2;
+    v = nfsk_mount(&device, false, &error);
+    if (!v) return 2;
+    for (int i = 0; i < 2; i++) {
+        CHECK(!listed(v, private_files[i], private_names[i]), "WOF backing ADS is not enumerated as a user xattr");
+        CHECK(nfsk_getxattr(v, private_files[i], private_names[i], NULL, 0) == -EPERM,
+              "WOF backing ADS cannot be read through xattrs");
+        CHECK(nfsk_setxattr(v, private_files[i], private_names[i], "replace", 7, NFSK_XATTR_SET) == -EPERM,
+              "WOF backing ADS cannot be replaced through xattrs");
+        CHECK(nfsk_setxattr(v, private_files[i], private_names[i], NULL, 0, NFSK_XATTR_DELETE) == -EPERM,
+              "WOF backing ADS cannot be deleted through xattrs");
+    }
     const char *key = "com.apple.metadata:_kMDItemUserTags";
     char original[65536], replacement[65536], output[32];
     memset(original, 0x31, sizeof original);
@@ -184,6 +233,9 @@ int main(int argc, char **argv) {
           "read-only mounts reject xattr writes and deletes");
     nfsk_umount(v);
     close(device.fd);
+    for (int i = 0; i < 2; i++)
+        CHECK(backing_stream(argv[1], private_files[i], private_names[i], 0) == 0,
+              "private backing bytes survive rejected xattr operations and remount");
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
