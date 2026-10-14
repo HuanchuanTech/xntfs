@@ -14,6 +14,10 @@ xcrun clang "${flags[@]}" "$root/tests/test_feature_alignment.c" "$root/ntfs3g/b
     "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/feature-tests"
 cp "$fixture" "$work/test.img"
 "$work/feature-tests" "$work/test.img" 2>&1 | tee "$work/results.log"
+xcrun clang "${flags[@]}" "$root/tests/test_volume_label.c" "$root/ntfs3g/bridge/ntfs_fskit.c" \
+    "$root/build/libntfs-universal/libntfs-3g.a" -framework CoreFoundation -o "$work/label-tests"
+cp "$fixture" "$work/test.img"
+"$work/label-tests" "$work/test.img" 2>&1 | tee "$work/label-results.log"
 for nonresident in 0 1; do
     for nth in {1..12}; do
         cp "$fixture" "$work/test.img"
