@@ -1700,7 +1700,8 @@ int nfsk_rename_volume(ntfs_fskit_volume *v, const char *name) {
     int length = ntfs_mbstoucs(name, &unicode);
     if (length < 0) return -(errno ? errno : EILSEQ);
     int error = length >= 128 ? ENAMETOOLONG : 0;
-    if (!error && ntfs_volume_rename(v->vol, unicode, length + 1)) error = errno ? errno : EIO;
+    /* AT_VOLUME_NAME contains exactly the label's UTF-16 code units, without NUL. */
+    if (!error && ntfs_volume_rename(v->vol, unicode, length)) error = errno ? errno : EIO;
     free(unicode);
     if (!error) return nfsk_sync(v);
     return -error;
