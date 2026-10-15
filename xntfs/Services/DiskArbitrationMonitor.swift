@@ -127,7 +127,6 @@ final class DiskArbitrationMonitor {
         // content hint can't be trusted for mounted volumes — DiskArbitration has been
         // seen to mislabel NTFS as MS-DOS/exFAT — so check the real mount fs-type.
         let info = mountURL.flatMap { Self.mountInfo($0) }
-        let byModule = info?.fsType == Self.moduleFSType
         guard Self.isNTFSVolume(mountedType: info?.fsType, volumeKind: kind,
                                 contentHint: content, leaf: leaf) else { return nil }
 
@@ -150,7 +149,7 @@ final class DiskArbitrationMonitor {
             contentHint: content,
             isRemovable: removable || ejectable,
             devicePath: "/dev/\(bsd)")
-        dev.mountedByXntfs = byModule
+        dev.mountedFileSystemType = info?.fsType
         dev.readOnly = info?.readOnly ?? false
         dev.mediaWritable = (d[kDADiskDescriptionMediaWritableKey as String] as? Bool) ?? true
         let media = DADiskCopyIOMedia(disk)

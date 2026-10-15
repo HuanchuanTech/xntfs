@@ -22,6 +22,22 @@ enum MountState: Equatable {
     var mountPoint: URL? { if case .mounted(let u) = self { return u }; return nil }
 }
 
+enum MountDriver: Equatable {
+    case xntfs
+    case system
+    case other(String)
+    case unknown
+
+    init(fileSystemType: String?) {
+        switch fileSystemType?.lowercased() {
+        case "xntfs": self = .xntfs
+        case "ntfs": self = .system
+        case nil, "": self = .unknown
+        case let name?: self = .other(name)
+        }
+    }
+}
+
 /// One NTFS volume/partition. Identified by its BSD name (e.g. `disk4s1`).
 struct NTFSDevice: Identifiable, Equatable {
     let id: String                 // BSD name, e.g. "disk4s1"
@@ -32,10 +48,9 @@ struct NTFSDevice: Identifiable, Equatable {
     var isRemovable: Bool
     var devicePath: String         // "/dev/disk4s1"
     var state: MountState = .unmounted
-    /// True when the volume is currently mounted through our FSKit module (its
-    /// mount fs-type matches the extension's FSShortName), regardless of whether
-    /// this app or the system performed the mount.
-    var mountedByXntfs: Bool = false
+    /// Actual statfs type, not Disk Arbitration's format hint or extension enablement.
+    /// nil means that the current driver could not be determined.
+    var mountedFileSystemType: String?
     /// True when the mounted volume is read-only (statfs MNT_RDONLY).
     var readOnly: Bool = false
     /// Whether the underlying media is writable (DAMediaWritable). When false the volume
@@ -49,10 +64,18 @@ struct NTFSDevice: Identifiable, Equatable {
 
     var displayName: String { volumeName.isEmpty ? id : volumeName }
 
+    var mountDriver: MountDriver {
+        state.isMounted ? MountDriver(fileSystemType: mountedFileSystemType) : .unknown
+    }
+
+    var mountedByXntfs: Bool { mountDriver == .xntfs }
+
+    var needsXntfsMountGuidance: Bool { mountDriver == .system && readOnly }
+
     static func == (lhs: NTFSDevice, rhs: NTFSDevice) -> Bool {
         lhs.id == rhs.id && lhs.volumeName == rhs.volumeName &&
-        lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes &&
-        lhs.mountedByXntfs == rhs.mountedByXntfs && lhs.readOnly == rhs.readOnly &&
+        lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes && lhs.kind == rhs.kind &&
+        lhs.mountedFileSystemType == rhs.mountedFileSystemType && lhs.readOnly == rhs.readOnly &&
         lhs.mediaWritable == rhs.mediaWritable && lhs.registryEntryID == rhs.registryEntryID
     }
 }

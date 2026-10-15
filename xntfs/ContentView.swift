@@ -70,12 +70,12 @@ struct ContentView: View {
             List(selection: $selection) {
                 Section("Devices") {
                     ForEach(physicalDevices) { device in
-                        DeviceRow(device: device, byXntfs: device.mountedByXntfs, isSelected: selection == device.id).tag(device.id)
+                        DeviceRow(device: device, isSelected: selection == device.id).tag(device.id)
                     }
                 }
                 Section("Disk Images") {
                     ForEach(imageDevices) { device in
-                        DeviceRow(device: device, byXntfs: device.mountedByXntfs, isSelected: selection == device.id).tag(device.id)
+                        DeviceRow(device: device, isSelected: selection == device.id).tag(device.id)
                     }
                     ForEach(model.mountedImages) { image in
                         HStack(spacing: 10) {
@@ -200,7 +200,6 @@ struct ExtensionBanner: View {
 
 struct DeviceRow: View {
     let device: NTFSDevice
-    var byXntfs: Bool = false
     var isSelected: Bool = false
 
     var body: some View {
@@ -209,18 +208,31 @@ struct DeviceRow: View {
                 .font(.title2)
                 .foregroundStyle(iconColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text(device.displayName).font(.body)
-                Text("\(device.sizeBytes.humanSize) · \(Text(statusText))")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text(device.displayName).font(.body).lineLimit(1)
+                    .foregroundStyle(isSelected ? Color.white : .primary)
+                Text(device.sizeBytes.humanSize)
+                    .font(.caption)
+                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : .secondary)
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(statusColor)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
             if device.state.isMounted {
-                Text(byXntfs ? "xntfs" : "System")
+                HStack(spacing: 3) {
+                    if device.needsXntfsMountGuidance {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    Text(device.mountDriver.label)
+                }
                     .font(.caption2).fontWeight(.semibold)
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(badgeColor.opacity(0.18))
                     .foregroundStyle(badgeColor)
                     .clipShape(Capsule())
+                    .fixedSize()
             }
         }
         .padding(.vertical, 2)
@@ -234,7 +246,12 @@ struct DeviceRow: View {
     }
     private var badgeColor: Color {
         if isSelected { return .white }
-        return byXntfs ? .accentColor : .secondary
+        if device.needsXntfsMountGuidance { return .orange }
+        return device.mountedByXntfs ? .accentColor : .secondary
+    }
+    private var statusColor: Color {
+        if isSelected { return .white }
+        return device.needsXntfsMountGuidance ? .orange : .secondary
     }
 
     private var icon: String {
@@ -249,10 +266,58 @@ struct DeviceRow: View {
         switch device.state {
         case .unmounted: return "Not mounted"
         case .mounting: return "Mounting…"
-        case .mounted: return device.readOnly ? "Mounted · read-only" : "Mounted"
+        case .mounted:
+            if device.mountDriver == .unknown { return "Mounted" }
+            return device.readOnly ? "Read-only" : "Read/write"
         case .unmounting: return "Ejecting…"
         case .failed: return "Failed"
         }
+    }
+}
+
+private extension MountDriver {
+    var label: LocalizedStringKey {
+        switch self {
+        case .xntfs: return "xntfs"
+        case .system: return "System"
+        case .other: return "Other"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
+struct SystemMountGuidance: View {
+    let device: NTFSDevice
+    var needsLegacyCompatibility = ExtensionStatus.needsLegacyCompatibility
+    var onLegacyMount: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("This volume is not using xntfs", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text("macOS has mounted this volume read-only. Enabling xntfs does not change an existing mount.")
+            if needsLegacyCompatibility {
+                Text("Enable ntfs3g, then choose Mount with xntfs. Reconnecting alone does not switch drivers on macOS 15.")
+                Button(action: onLegacyMount) {
+                    Label("Mount with xntfs…", systemImage: "externaldrive.badge.plus")
+                }
+            } else {
+                if device.kind == .removable {
+                    Text("After enabling ntfs3g, safely eject and reconnect the drive, or unmount and mount this volume in Disk Utility.")
+                } else {
+                    Text("After enabling ntfs3g, unmount this volume in Disk Utility, then mount it again.")
+                }
+                Button { DiskUtility.open() } label: {
+                    Label("Open Disk Utility", systemImage: "externaldrive")
+                }
+            }
+            if !device.mediaWritable {
+                Text("The underlying media is read-only. Switching to xntfs alone cannot make it writable.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -264,6 +329,11 @@ struct DeviceDetailView: View {
 
     var body: some View {
         Form {
+            if device.needsXntfsMountGuidance {
+                Section {
+                    SystemMountGuidance(device: device) { showLegacyMountSheet = true }
+                }
+            }
             Section("Volume") {
                 LabeledContent("Name", value: device.displayName)
                 LabeledContent("BSD device", value: device.devicePath)
@@ -271,12 +341,26 @@ struct DeviceDetailView: View {
                 LabeledContent("Format", value: "NTFS")
                 if case .mounted(let url) = device.state {
                     LabeledContent("Mounted at", value: url.path)
-                    LabeledContent("Access", value: device.readOnly ? "Read-only" : "Read/write")
+                    LabeledContent("Driver") {
+                        HStack {
+                            Text(device.mountDriver.label)
+                            if case .other(let name) = device.mountDriver {
+                                Text(verbatim: "(\(name))").foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    LabeledContent("Access") {
+                        if device.mountDriver == .unknown {
+                            Text("Unknown")
+                        } else {
+                            Text(device.readOnly ? LocalizedStringKey("Read-only") : "Read/write")
+                        }
+                    }
                 }
             }
 
             Section {
-                if ExtensionStatus.needsLegacyCompatibility {
+                if ExtensionStatus.needsLegacyCompatibility && !device.needsXntfsMountGuidance {
                     Button { showLegacyMountSheet = true } label: {
                         Label("Mount with xntfs…", systemImage: "externaldrive.badge.plus")
                     }

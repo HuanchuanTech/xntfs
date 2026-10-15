@@ -83,6 +83,26 @@
         }
       }
     },
+    "After enabling ntfs3g, safely eject and reconnect the drive, or unmount and mount this volume in Disk Utility." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 ntfs3g 后，请安全推出并重新连接磁盘，或在「磁盘工具」中卸载此卷后重新挂载。"
+          }
+        }
+      }
+    },
+    "After enabling ntfs3g, unmount this volume in Disk Utility, then mount it again." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 ntfs3g 后，请在「磁盘工具」中卸载此卷，然后重新挂载。"
+          }
+        }
+      }
+    },
     "Attach Disk Image" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -322,6 +342,16 @@
         }
       }
     },
+    "Driver" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "驱动"
+          }
+        }
+      }
+    },
     "Eject" : {
       "localizations" : {
         "zh-Hans" : {
@@ -358,6 +388,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "请先在「文件系统扩展」中开启 ntfs3g，再挂载此卷。"
+          }
+        }
+      }
+    },
+    "Enable ntfs3g, then choose Mount with xntfs. Reconnecting alone does not switch drivers on macOS 15." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请启用 ntfs3g，然后选择「使用 xntfs 挂载」。在 macOS 15 上，仅重新连接磁盘不会切换驱动。"
           }
         }
       }
@@ -548,6 +588,16 @@
     },
     "macOS doesn't let sandboxed apps mount physical disks. Mount it with the command below, with Disk Utility, or by reconnecting the drive — it will still use xntfs." : {
 
+    },
+    "macOS has mounted this volume read-only. Enabling xntfs does not change an existing mount." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS 已将此卷以只读方式挂载。开启 xntfs 扩展不会改变已经挂载的卷所使用的驱动。"
+          }
+        }
+      }
     },
     "Manual mounting" : {
       "extractionState" : "stale",
@@ -1001,6 +1051,16 @@
         }
       }
     },
+    "Other" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "其他"
+          }
+        }
+      }
+    },
     "Plug in an NTFS drive, or add a disk image." : {
       "localizations" : {
         "zh-Hans" : {
@@ -1297,6 +1357,16 @@
         }
       }
     },
+    "The underlying media is read-only. Switching to xntfs alone cannot make it writable." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "底层介质为只读，仅切换到 xntfs 无法让它变成可写。"
+          }
+        }
+      }
+    },
     "The volume mounted with a different access mode than requested. Check its current status before using it." : {
       "localizations" : {
         "zh-Hans" : {
@@ -1357,6 +1427,16 @@
         }
       }
     },
+    "This volume is not using xntfs" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此卷尚未使用 xntfs"
+          }
+        }
+      }
+    },
     "This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only." : {
       "localizations" : {
         "zh-Hans" : {
@@ -1373,6 +1453,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在「文件系统扩展」中开启 ntfs3g。"
+          }
+        }
+      }
+    },
+    "Unknown" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未知"
           }
         }
       }

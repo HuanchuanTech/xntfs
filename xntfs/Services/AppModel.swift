@@ -104,10 +104,9 @@ final class AppModel {
             switch outcome {
             case .mounted(let url):
                 devices[index].state = .mounted(url)
-                if let info = DiskArbitrationMonitor.mountInfo(url) {
-                    devices[index].readOnly = info.readOnly
-                    devices[index].mountedByXntfs = info.fsType == DiskArbitrationMonitor.moduleFSType
-                }
+                let info = DiskArbitrationMonitor.mountInfo(url)
+                devices[index].readOnly = info?.readOnly ?? false
+                devices[index].mountedFileSystemType = info?.fsType
             case .failed(let msg), .needsSystemMount(let msg, _): devices[index].state = .failed(msg)
             }
         }
