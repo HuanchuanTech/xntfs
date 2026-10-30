@@ -40,6 +40,7 @@ xcuserdata/
 
 # Local diagnostics and release scratch
 /_tmp/
+/docs/app-store-listing.md
 /install-backups.*.tar.gz
 /*.zip
 /*.tar.gz

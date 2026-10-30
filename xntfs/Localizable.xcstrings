@@ -1,16 +1,6 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-    "%@ · %@" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "%1$@ · %2$@"
-          }
-        }
-      }
-    },
     "A sandboxed app can't mount this here, so paste this into Terminal:" : {
       "extractionState" : "stale",
       "localizations" : {

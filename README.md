@@ -1,184 +1,84 @@
-# xntfs — NTFS for macOS (FSKit + ntfs-3g)
+# xntfs - Open-source NTFS read/write for macOS
 
-> 📖 Also available in [Simplified Chinese](README_CN.md).
+> Use Windows-formatted drives on your Mac with Apple FSKit and ntfs-3g, without macFUSE or a kernel extension.
 
 <a href="https://apps.apple.com/app/xntfs/id6782636021"><img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download xntfs on the App Store" height="44"></a>
 
-A macOS app + **FSKit file-system extension** that reads and writes NTFS volumes using the
-[ntfs-3g](https://github.com/tuxera/ntfs-3g) engine. No kernel extension, no macFUSE.
+![xntfs showing a Boot Camp volume and an NTFS disk image](assets/xntfs-screenshot.png)
 
-The `ntfs3g` app-extension reuses the portable **`libntfs-3g`** core (all the NTFS logic — MFT,
-runlists, compression, security descriptors, `$LogFile`) behind a thin FSKit `FSVolume` mapping
-layer, the same way ntfs-3g's own `src/ntfs-3g.c` maps FUSE onto libntfs.
+## What is xntfs?
 
-The extension lets macOS mount supported NTFS drives under `/Volumes` without a background app.
-The app lists drives and disk images, shows their actual mount and read-only status, and helps
-diagnose extension setup. Mounting controls depend on the macOS version; see below.
+xntfs is a simple macOS utility for people who use Windows-formatted NTFS drives with a Mac. It helps you read and write supported NTFS volumes, including external hard drives, SSDs, USB drives, Boot Camp volumes, and NTFS disk images.
 
-```
-xntfs.app  (SwiftUI, App Sandbox — control panel; not a background agent)
- ├─ AppModel ── DiskArbitrationMonitor   detect/list NTFS drives (detection only)
- │           └─ MountService             manual mount/unmount (DiskArbitration), image attach
- └─ Contents/Extensions/ntfs3g.appex     FSKit module — the actual NTFS driver (+ auto-mount)
-        ntfs3g.swift            @main UnaryFileSystemExtension
-        ntfs3gFileSystem.swift  probe / load / unload / fsck
-        ntfs3gVolume.swift      every FSVolume operation → nfsk_* bridge
-        bridge/ntfs_fskit.c     libntfs logic (mount, getattr, readdir, read, write, create…)
-        bridge/ntfs_device_fskit.m  block I/O over FSBlockDeviceResource (sector-aligned RMW)
-        + libntfs-3g.a (arm64 + x86_64, statically linked)
-```
+When macOS presents an NTFS drive as read-only, xntfs provides a user-space file-system extension based on Apple's FSKit and the open-source ntfs-3g engine. Once the extension is enabled, supported NTFS devices can be mounted by macOS under `/Volumes` and used from Finder like other mounted volumes.
 
-## Status
+## Why use xntfs?
 
-| Piece | State |
-|-------|-------|
-| `ntfs3g` extension (NTFS read/write engine) | ✅ builds; engine statically linked; [implemented operations and limits](docs/fskit-feature-alignment.md) |
-| `xntfs` app (UI, monitor, mount service, settings) | ✅ builds |
-| English + Simplified Chinese localization | ✅ `Localizable.xcstrings` (en, zh-Hans) |
-| App icon | ✅ generated, full AppIcon set |
-| End-to-end mount on a Mac | Verified on macOS 15.8 and 27.0; the extension still needs FSKit provisioning and user enablement |
+- **FSKit instead of macFUSE** - xntfs uses Apple's modern FSKit file-system extension model and does not install a kernel extension or depend on macFUSE.
+- **Read and write NTFS** - ntfs-3g provides the NTFS file-system engine used by the extension.
+- **Automatic mounting** - macOS and Disk Arbitration can detect and mount supported NTFS devices after the extension is enabled.
+- **A focused interface** - see drives, disk images, the actual driver in use, read-only state, mount location, and basic actions such as eject and Reveal in Finder.
+- **Clear diagnostics** - inspect extension installation, enablement, registration paths, duplicate registrations, and common setup problems.
+- **Works across Intel and Apple silicon** - the project builds for `x86_64` and `arm64`.
+- **Open source** - the source code, build scripts, tests, privacy policy, and compatibility notes are available in this repository.
 
-The extension uses a restricted FSKit entitlement. A locally built copy requires a signing team
-whose provisioning profile authorizes it; building alone does not enable the extension.
+## Who is it for?
 
-The bundled engine is pinned to [ntfs-3g 2026.9.28](https://github.com/tuxera/ntfs-3g/releases/tag/2026.9.28),
-which fixes the 2026.9.18 regression that could reject new files and directories with
-`EINVAL`. See [issue #7 validation](docs/issue-7-validation.md).
+xntfs is for Mac users who regularly exchange files with Windows computers, use NTFS-formatted USB drives or external disks, run Boot Camp, or need to inspect an NTFS disk image on macOS.
 
-## Known issues
+If you are searching for an **NTFS driver for Mac**, **NTFS read/write support on macOS**, an **open-source NTFS utility**, **FSKit NTFS**, or **ntfs-3g on macOS**, this project is designed for that use case.
 
-- **macOS 15 open-file lifetime: native fix validated on macOS 15.8.**
-  The current source retains deleted/replaced open files until final close, without
-  depending on macOS 26 APIs. Bridge, direct Swift and mounted lifetime tests
-  passed on macOS 15.8 x86_64 with TestFlight 1.0.9 (13). Older builds can still
-  lose access through existing handles; close files before deleting or replacing
-  them. macOS 26+ keeps FSKit's emulation, tested on macOS 27; its
-  unlinked open files still report a link count of 1. See [issue #4](https://github.com/HuanchuanTech/xntfs/issues/4)
-  and [current validation](docs/fskit-feature-alignment.md).
-- **macOS 15 allocation reporting can remain stale while a file is open.**
-  Mounted tests reproduced outdated allocated-space values after ordinary writes
-  and preallocation, until the last descriptor closed. Data and logical file size
-  remained correct in these tests. The same probe passed on macOS 27; the cause
-  is not yet established. See [the focused retest](docs/fskit-feature-alignment.md#focused-allocation-retest).
+## Typical workflow
 
-## Filesystem operations
+1. Install xntfs and enable `ntfs3g` in macOS System Settings under File System Extensions.
+2. Connect an NTFS drive or select an NTFS disk image.
+3. Confirm the volume is mounted by `xntfs`, then open it in Finder and work with its files.
 
-The current source supports native creation-time and hidden-flag updates,
-symbolic links, volume renaming, persistent preallocation for ordinary files,
-and sparse-region queries on macOS 27. It performs a read-only mount preflight,
-not a full filesystem check or repair. These are source capabilities, not a
-claim that every published build includes them. See the [design, tests and
-remaining limits](docs/fskit-feature-alignment.md).
+The app reports the actual mounted file-system type. If macOS has already mounted the volume with its built-in NTFS driver, xntfs explains that enabling the extension does not change an existing mount and shows the next step for that macOS version.
+
+## macOS support
+
+| macOS | Mounting workflow |
+|---|---|
+| macOS 15 | The built-in NTFS driver may take priority. xntfs provides a per-volume, copyable Terminal command for the user to run when an xntfs mount is needed. |
+| macOS 26 | Supported devices can auto-mount after enablement. Use Disk Utility for manual mounts and image attachment. |
+| macOS 27 | Adds in-app mounting through the newer FSKit and Disk Arbitration APIs, including raw single-volume NTFS images. |
+
+The minimum deployment target is macOS 15.4. The exact workflow depends on the macOS version, extension state, device type, and whether the underlying media is writable.
+
+## Scope and limits
+
+- The FSKit extension must be signed, installed, and enabled by the user before macOS can use it.
+- A physical medium or disk image attached read-only remains read-only; changing the file-system driver cannot make read-only media writable.
+- macOS 27 in-app image mounting currently targets raw, single-volume NTFS images. Partitioned or compressed images should be opened in Disk Utility first.
+- xntfs provides a read-only mount preflight. It is not a full filesystem repair or recovery tool.
+- Existing AppleDouble `._` metadata is not automatically migrated or deleted. See the Finder metadata notes below before migrating files.
 
 ## Finder metadata
 
-The current source stores extended attributes (including Finder tags and resource forks)
-in same-named NTFS alternate data streams, instead of creating new AppleDouble `._` files.
-Each attribute is limited to **128 KiB**, matching the limit observed in mounted FSKit
-tests on macOS 27. This limit does not apply to ordinary file contents.
+The current source stores extended attributes, including Finder tags and resource forks, in same-named NTFS alternate data streams. Existing `._` files are not automatically migrated or deleted. Read the [Finder metadata and migration notes](docs/fskit-feature-alignment.md) before upgrading or migrating data.
 
-**Existing `._` files are not automatically migrated or deleted.** Until migrated, their
-metadata is not exposed by the native xattr API. Back up the files and their `._` companions
-before upgrading or migrating. With the volume mounted read/write using the new driver,
-macOS's `dot_clean` can merge the old metadata into native attributes. For one directory
-(without descending into subdirectories):
+## xntfs and commercial NTFS tools
 
-```sh
-dot_clean -f -v "/Volumes/YourDrive/YourFolder"
-```
+Mac users may also come across commercial products such as [Microsoft NTFS for Mac by Paragon Software](https://www.paragon-software.com/home/ntfs-mac/) and [Microsoft NTFS for Mac by Tuxera](https://ntfsformac.tuxera.com/). xntfs takes a different approach: it is an open-source project built around Apple's FSKit and the ntfs-3g engine. It is independent and is not affiliated with Apple, Microsoft, Paragon Software, Tuxera, or the ntfs-3g maintainers.
 
-This command changes metadata and removes successfully merged `._` files. Verify tags and
-resource forks afterward, and keep the backup. Do not bulk-delete `._` files or use cleanup
-options that discard them without merging. The app does not run this command automatically.
+## Related project
 
-## The six features
+[xlinuxfs](https://github.com/HuanchuanTech/xlinuxfs) brings read/write support for ext2/3/4, XFS, and Btrfs to macOS through FSKit and the Linux Kernel Library (LKL). xntfs focuses on NTFS; xlinuxfs focuses on Linux file systems. Both projects use FSKit and avoid macFUSE.
 
-1. **Localization (English + Simplified Chinese)** — `xntfs/Localizable.xcstrings` (String Catalog). Add more
-   languages by adding `localizations` entries.
-2. **Auto-mount removable NTFS** — handled by the **system**, not the app: the extension's
-   `Info.plist` registers NTFS `FSMediaTypes` (`Windows_NTFS`, MS Basic-Data GUID, partitionless),
-   so DiskArbitration can auto-mount supported NTFS drives under `/Volumes` without the app
-   running. On macOS 15, the built-in NTFS driver may take priority; see the manual workaround.
-3. **Mount location** — drives mount under `/Volumes/<name>`; the system picks the path and
-   de-duplicates names. Mounting to a **custom folder is not possible** for a sandboxed FSKit
-   volume (the extension can only reach `/Volumes` and its own sandbox temp paths), so
-   `/Volumes` is the only target.
-4. **Multiple drives at once** — devices are tracked by BSD name and mounted independently.
-5. **Manual mount / unmount** — on macOS 27, the app offers in-app mounting with a read-only
-   choice. On macOS 15, it shows a copyable Terminal command to mount a selected volume with
-   xntfs, including volumes already attached by Disk Utility. On macOS 26, use Disk Utility.
-   Mounted volumes can be revealed in Finder or ejected from the app.
-6. **Disk images** — on macOS 27, the app can select and mount a raw, single-volume NTFS image.
-   Partitioned or compressed images are opened in Disk Utility. On older systems, attach images
-   in Disk Utility; a selected NTFS partition can then use the macOS 15 manual workaround.
+## Documentation
 
-## Build
+- [Architecture and code structure](docs/architecture.md)
+- [Build and development](docs/build.md)
+- [FSKit feature alignment and validation](docs/fskit-feature-alignment.md)
+- [macOS 15 compatibility](docs/macos15-compatibility.md)
+- [macOS 27 support](docs/macos27-support.md)
+- [Issue #7 validation](docs/issue-7-validation.md)
+- [Privacy policy](PRIVACY.md)
 
-The repo is a normal Xcode project — open `xntfs.xcodeproj` and build the `xntfs` scheme.
-Build settings for the extension (bridging header, `libntfs-3g.a` link, header search paths,
-`HAVE_CONFIG_H`) and the app (entitlements, zh-Hans region) are already committed; they
-were applied with `scripts/wire_project.rb` (re-runnable, idempotent, needs the `xcodeproj` gem).
+## Open source
 
-Before building in Xcode, generate the universal static library and shared `config.h`
-(requires Autotools and GNU libtool):
-```sh
-./scripts/build-libntfs.sh
-lipo -archs build/libntfs-universal/libntfs-3g.a
-```
-The script builds arm64 and x86_64 separately, then combines them under
-`build/libntfs-universal/`. That directory is ignored by Git; run the script again after a clean
-checkout or when updating the ntfs-3g submodule.
+- [Source code and issues](https://github.com/HuanchuanTech/xntfs)
+- [GPLv2 license](LICENSE)
 
-The project uses the maintainer's signing team by default. Choose your own team in Xcode and
-configure the FSKit capability before running a local build.
-
-## Provisioning (required to actually run the extension)
-
-The extension declares the **restricted** entitlement `com.apple.developer.fskit.fsmodule`
-(`ntfs3g/ntfs3g.entitlements`). macOS (AMFI) refuses to load the extension unless that entitlement
-is authorized by a provisioning profile. With **automatic signing** and team `529LJDH392`, this
-works only if that team's App ID has the **FSKit File System Module** capability enabled in the
-Apple Developer portal. Replace the project team with your own before signing. Once provisioned,
-enable the module under **System Settings → General →
-Login Items & Extensions → File System Extensions**.
-
-## Sandbox & mounting
-
-The mounting paths differ by operating system:
-
-- **macOS 27:** the app uses FSKit and Disk Arbitration APIs for in-app volume and image mounts.
-- **macOS 26:** automatic mounting works when the extension is enabled; Disk Utility handles
-  manual mounts and image attachment.
-- **macOS 15:** the built-in NTFS driver can win automatic selection. The app provides a
-  copyable, per-volume Terminal command that temporarily selects xntfs. It asks for confirmation
-  and administrator authentication, then removes its temporary `.fs` entry. The app does not
-  execute this command itself. See [the compatibility details](docs/macos15-compatibility.md).
-
-> This is a *technical* capability result; App Review is a separate policy gate.
-
-## Layout
-
-```
-xntfs/                     app target (SwiftUI)
-  xntfsApp.swift           @main App + Settings scene
-  ContentView.swift        device/image list + OS-specific mount controls
-  DiskUtility.swift        opens Apple's Disk Utility (mount / attach images)
-  MountSheet.swift         in-app mount sheet on macOS 27
-  LegacyMountSheet.swift   manual mount guidance on macOS 15
-  CopyableCommand.swift    copyable-command control
-  DiagnosticsView.swift    extension-status diagnostics page
-  SettingsView.swift       read-only-by-default preference
-  Model/NTFSDevice.swift
-  Services/                AppModel, AppSettings, DiskArbitrationMonitor, MountService,
-                           ExtensionStatus
-  Localizable.xcstrings    en + zh-Hans
-  Assets.xcassets/AppIcon  generated icon set
-ntfs3g/                    FSKit extension target
-  ntfs3g*.swift            @main + FSUnaryFileSystem + FSVolume + FSItem
-  bridge/                  ntfs_fskit.{h,c}, ntfs_device_fskit.m, bridging header
-  Info.plist               FSShortName=xntfs, FSMediaTypes, block resources
-  ntfs3g.entitlements      com.apple.developer.fskit.fsmodule + sandbox
-ntfs-3g/                   upstream source + built libntfs-3g.a
-scripts/wire_project.rb    applies extension/app build settings (xcodeproj gem)
-assets/xntfs-icon.svg      icon source
-```
+xntfs is an independent project. NTFS is a Microsoft file-system format, and the names Apple, Microsoft, Paragon, Tuxera, and ntfs-3g belong to their respective owners.
