@@ -70,6 +70,10 @@ final class MountService {
 
     // MARK: mount
     func unifiedMount(_ device: NTFSDevice, readOnly: Bool) async -> MountOutcome {
+        var fields = device.diagnosticFields
+        fields[.requestedReadOnly] = String(readOnly)
+        fields[.attempt] = UUID().uuidString
+        DiagnosticRecorder.shared.record(.mount, .started, fields: fields)
         guard #available(macOS 27.0, *) else {
             return .failed(String(localized: "Mounting in the app isn't available — use Disk Utility to mount this volume."))
         }
@@ -78,14 +82,24 @@ final class MountService {
             guard modules.contains(where: { $0.bundleIdentifier == ExtensionStatus.bundleID && $0.isEnabled }) else {
                 throw MountError.extensionUnavailable
             }
-            return .mounted(try await mount(device, readOnly: readOnly))
+            let url = try await mount(device, readOnly: readOnly)
+            fields[.effectiveReadOnly] = DiskArbitrationMonitor.mountInfo(url).map { String($0.readOnly) } ?? "unknown"
+            fields[.driver] = "xntfs"
+            fields[.state] = "mounted"
+            DiagnosticRecorder.shared.record(.mount, .succeeded, fields: fields)
+            return .mounted(url)
         } catch MountError.sandboxDenied {
+            DiagnosticRecorder.shared.record(.mount, .failed, fields: fields,
+                error: NSError(domain: "DiskArbitration", code: Int(kDAReturnNotPrivileged)))
             let message = MountError.sandboxDenied.localizedDescription
             guard let command = SystemMountCommand.diskutil(bsdName: device.id, readOnly: readOnly || !device.mediaWritable) else {
                 return .failed(message)
             }
             return .needsSystemMount(message: message, command: command)
-        } catch { return .failed(error.localizedDescription) }
+        } catch {
+            DiagnosticRecorder.shared.record(.mount, .failed, fields: fields, error: error)
+            return .failed(error.localizedDescription)
+        }
     }
 
     private func mount(_ device: NTFSDevice, readOnly: Bool) async throws -> URL {
@@ -115,6 +129,8 @@ final class MountService {
                 let box = DACallbackBox { dissenter in
                     if let dissenter {
                         let status = DADissenterGetStatus(dissenter)
+                        DiagnosticRecorder.shared.record(.mount, .failed, fields: [.device: device.id, .source: "DiskArbitration"],
+                            error: NSError(domain: "DiskArbitration", code: Int(status)))
                         if status == DAReturn(kDAReturnNotPrivileged), device.kind != .diskImage {
                             cont.resume(throwing: MountError.sandboxDenied)
                             return
@@ -147,7 +163,12 @@ final class MountService {
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let box = DACallbackBox { dissenter in
-                if let dissenter { cont.resume(throwing: MountError.dissented(status: DADissenterGetStatus(dissenter), message: nil)) }
+                if let dissenter {
+                    let status = DADissenterGetStatus(dissenter)
+                    DiagnosticRecorder.shared.record(.unmount, .failed, fields: [.device: device.id, .source: "DiskArbitration"],
+                        error: NSError(domain: "DiskArbitration", code: Int(status)))
+                    cont.resume(throwing: MountError.dissented(status: status, message: nil))
+                }
                 else { cont.resume(returning: ()) }
             }
             let opts: DADiskUnmountOptions = force ? DADiskUnmountOptions(kDADiskUnmountOptionForce) : DADiskUnmountOptions(kDADiskUnmountOptionDefault)

@@ -8,6 +8,7 @@ struct PendingImage: Identifiable {
 struct ImageMountSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     let source: URL
     var onMounted: (URL) -> Void
 
@@ -26,6 +27,7 @@ struct ImageMountSheet: View {
                     Button("Open Settings…") { ExtensionStatus.openSettings() }
                     Button("Open Disk Utility") { DiskUtility.open() }
                 }
+                Button("Report a Problem...") { openWindow(id: "problem-report") }
             }
             HStack {
                 if busy { ProgressView().controlSize(.small) }

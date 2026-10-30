@@ -65,6 +65,18 @@ final class DiskArbitrationMonitor {
         }
     }
 
+    func devicesForDiagnostics() async -> [NTFSDevice] {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                let snapshot = currentDevices.compactMap { device -> NTFSDevice? in
+                    guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device.id) else { return nil }
+                    return makeDevice(disk, bsd: device.id)
+                }
+                continuation.resume(returning: snapshot)
+            }
+        }
+    }
+
     var currentDevices: [NTFSDevice] {
         lock.lock(); defer { lock.unlock() }
         return Array(devices.values).sorted { $0.id < $1.id }

@@ -34,6 +34,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     private var tornDown = false
     private var readOnly: Bool
     private var activated = false
+    var diagnosticContext: [DiagnosticEvent.Field: String] = [:]
     private let lock = NSLock()
     private var items: [UInt64: ntfs3gItem] = [:]
     private let rootItem: ntfs3gItem
@@ -196,13 +197,30 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     // MARK: lifecycle
-    func quickCheck() throws {
+    private func withRecordedLock<T>(_ action: DiagnosticEvent.Action, _ body: () throws -> T) throws -> T {
         try withLock {
+            DiagnosticRecorder.shared.record(action, .started, fields: diagnosticContext)
+            do {
+                let result = try body()
+                DiagnosticRecorder.shared.record(action, .succeeded,
+                    fields: diagnosticContext.merging([.effectiveReadOnly: String(readOnly)]) { _, new in new })
+                return result
+            } catch {
+                DiagnosticRecorder.shared.record(action, .failed, fields: diagnosticContext, error: error)
+                throw error
+            }
+        }
+    }
+
+    func quickCheck() throws {
+        try withRecordedLock(.check) {
             guard !tornDown, let backend, handle != nil else { throw posixError(ENXIO) }
             guard !activated, readOnly else { throw posixError(EBUSY) }
             var reason: Int32 = 0
             let rc = nfsk_quick_check(backend.backend, &reason)
             guard rc == 0 else {
+                DiagnosticRecorder.shared.record(.check, .failed,
+                    fields: diagnosticContext.merging([.reason: String(reason)]) { _, new in new }, error: posixError(-rc))
                 let detail: String
                 switch reason {
                 case Int32(NFSK_CHECK_DIRTY): detail = "The NTFS volume is marked dirty or a Windows disk check is in progress."
@@ -218,7 +236,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func activate(options: FSTaskOptions) async throws -> FSItem {
-        try withLock {
+        try withRecordedLock(.activate) {
             guard !tornDown, handle != nil else { throw posixError(ENXIO) }
             guard !activated else { throw posixError(EBUSY) }
             // Disk Arbitration supplies ro/rw here, after loadResource. Reopen before
@@ -248,7 +266,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func mount(options: FSTaskOptions) async throws {
-        try withLock {
+        try withRecordedLock(.mount) {
             // Older FSKit cannot request MNT_RDONLY after a writable activation.
             // Require an explicit read-only retry instead of exposing a writable mount.
             if #unavailable(macOS 26.4), readOnly && backend?.writable == true {
@@ -260,7 +278,10 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         withLock {
             guard let h = handle else { return }
             let rc = nfsk_sync(h)
-            if rc != 0 { NSLog("[xntfs] flush on unmount failed: errno \(-rc)") }
+            if rc != 0 {
+                DiagnosticRecorder.shared.record(.unmount, .failed, fields: diagnosticContext, error: posixError(-rc))
+                NSLog("[xntfs] flush on unmount failed: errno \(-rc)")
+            } else { DiagnosticRecorder.shared.record(.unmount, .succeeded, fields: diagnosticContext) }
         }
     }
 
@@ -268,7 +289,10 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         try withLock {
             guard let h = handle else { return }
             let rc = nfsk_sync(h)
-            if rc != 0 { throw posixError(-rc) }
+            if rc != 0 {
+                DiagnosticRecorder.shared.record(.sync, .failed, fields: diagnosticContext, error: posixError(-rc))
+                throw posixError(-rc)
+            }
         }
     }
 

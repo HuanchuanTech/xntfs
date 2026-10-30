@@ -12,6 +12,7 @@ import SwiftUI
 struct MountSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     let device: NTFSDevice
 
     @State private var readOnly = false
@@ -36,6 +37,7 @@ struct MountSheet: View {
                 Text(errorText).font(.callout).foregroundStyle(systemCommand == nil ? .red : .primary)
                 if let systemCommand { CopyableCommand(command: systemCommand) }
                 Button("Open Disk Utility") { DiskUtility.open() }
+                Button("Report a Problem...") { openWindow(id: "problem-report") }
             }
 
             Spacer(minLength: 0)

@@ -38,6 +38,8 @@ if [[ "$mode" != image ]]; then test_source="$root/tests/test_macos27_devices.sw
 
 /usr/bin/xcrun swiftc -parse-as-library -target "$(uname -m)-apple-macos27.0" \
   "$test_source" \
+  "$root/Shared/DiagnosticRecorder.swift" \
+  "$root/xntfs/Services/ProblemReport.swift" \
   "$root/xntfs/Services/ImageMountService.swift" \
   "$root/xntfs/Services/ExtensionStatus.swift" \
   "$root/xntfs/Services/AppModel.swift" \

@@ -13,6 +13,7 @@ import AppKit
 
 struct DiagnosticsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.scenePhase) private var scenePhase
     let status: ExtensionStatus
     /// Set once the user has been sent to System Settings; combined with a still-disabled
@@ -58,6 +59,7 @@ struct DiagnosticsView: View {
                     Label("Copy Diagnostics", systemImage: "doc.on.doc")
                 }
                 Spacer()
+                Button("Report a Problem...") { openWindow(id: "problem-report"); dismiss() }
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
             .padding(20)

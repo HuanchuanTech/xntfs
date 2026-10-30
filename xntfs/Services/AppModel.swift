@@ -36,10 +36,19 @@ final class AppModel {
 
     func start() {
         mountedImages = ImageMountService.mountedImages()
-        guard !started, let monitor else { return }
+        guard !started else { return }
         started = true
+        DiagnosticRecorder.shared.record(.appStart, .observed,
+            fields: [.state: monitor == nil ? "diskArbitrationUnavailable" : "ready"])
+        guard let monitor else { return }
         monitor.onDevicesChanged = { [weak self] list in
             guard let self else { return }
+            for device in list {
+                let previous = self.devices.first { $0.id == device.id && $0.registryEntryID == device.registryEntryID }
+                if previous?.diagnosticFields != device.diagnosticFields {
+                    DiagnosticRecorder.shared.record(.deviceObserved, .observed, fields: device.diagnosticFields)
+                }
+            }
             // Preserve any locally-tracked transitional state so a DA "changed" event
             // mid-transition can't clobber it — e.g. revert .unmounting back to .mounted
             // and make the Eject button clickable again.
@@ -64,6 +73,11 @@ final class AppModel {
         mountedImages = ImageMountService.mountedImages()
     }
 
+    func devicesForDiagnostics() async -> [NTFSDevice] {
+        guard let monitor else { return devices }
+        return await monitor.devicesForDiagnostics()
+    }
+
     @available(macOS 27.0, *)
     func mountImage(_ source: URL, readOnly: Bool) async throws -> URL {
         guard !mountingImage else { throw POSIXError(.EBUSY) }
@@ -72,7 +86,17 @@ final class AppModel {
             mountingImage = false
             refreshDevices()
         }
-        return try await ImageMountService.mount(source, readOnly: readOnly)
+        let attempt = UUID().uuidString
+        let fields: [DiagnosticEvent.Field: String] = [.kind: "directImage", .requestedReadOnly: String(readOnly), .attempt: attempt]
+        DiagnosticRecorder.shared.record(.mount, .started, fields: fields)
+        do {
+            let url = try await ImageMountService.mount(source, readOnly: readOnly)
+            DiagnosticRecorder.shared.record(.mount, .succeeded, fields: fields)
+            return url
+        } catch {
+            DiagnosticRecorder.shared.record(.mount, .failed, fields: fields, error: error)
+            throw error
+        }
     }
 
     func unmountImage(_ image: MountedImage) async {
@@ -81,8 +105,14 @@ final class AppModel {
             unmountingImages.remove(image.id)
             refreshDevices()
         }
-        do { try await ImageMountService.unmount(image) }
-        catch { setError(ImageMountService.diagnosticMessage(error)) }
+        DiagnosticRecorder.shared.record(.unmount, .started, fields: [.kind: "directImage"])
+        do {
+            try await ImageMountService.unmount(image)
+            DiagnosticRecorder.shared.record(.unmount, .succeeded, fields: [.kind: "directImage"])
+        } catch {
+            DiagnosticRecorder.shared.record(.unmount, .failed, fields: [.kind: "directImage"], error: error)
+            setError(ImageMountService.diagnosticMessage(error))
+        }
     }
 
     /// Mount a device/image volume (in-app only on macOS 27+). Returns the outcome so the
@@ -116,11 +146,14 @@ final class AppModel {
 
     func unmount(_ device: NTFSDevice, force: Bool = false) async {
         guard let mounter else { return }
+        DiagnosticRecorder.shared.record(.unmount, .started, fields: device.diagnosticFields)
         updateState(device.id, .unmounting)
         do {
             try await mounter.unmount(device, force: force)
+            DiagnosticRecorder.shared.record(.unmount, .succeeded, fields: [.device: device.id])
             updateState(device.id, .unmounted)
         } catch {
+            DiagnosticRecorder.shared.record(.unmount, .failed, fields: [.device: device.id], error: error)
             updateState(device.id, .failed(error.localizedDescription))
             setError(error.localizedDescription)
         }

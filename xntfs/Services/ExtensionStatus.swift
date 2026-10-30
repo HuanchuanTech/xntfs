@@ -111,6 +111,12 @@ final class ExtensionStatus {
     }
 
     func refresh(appURL: URL = Bundle.main.bundleURL) async {
+        defer {
+            DiagnosticRecorder.shared.record(.extensionQuery, queryError == nil ? .observed : .failed,
+                fields: [.state: String(describing: state),
+                         .count: Self.needsLegacyCompatibility || queryError != nil ? "unknown" : String(installedCount)],
+                error: queryError)
+        }
         queryError = nil
         bundledExtensionURL = Self.embeddedExtension(in: appURL)
         if Self.needsLegacyCompatibility {

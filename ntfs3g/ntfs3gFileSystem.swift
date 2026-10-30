@@ -118,10 +118,23 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
 
     // MARK: probe / load / unload
 
+    private static func diagnosticFields(_ resource: FSResource) -> [DiagnosticEvent.Field: String] {
+        if let block = resource as? FSBlockDeviceResource {
+            let name = block.bsdName.hasPrefix("/dev/") ? String(block.bsdName.dropFirst(5)) : block.bsdName
+            return [.device: name, .kind: "block", .mediaWritable: String(block.isWritable)]
+        }
+        if #available(macOS 26.0, *), let image = resource as? FSPathURLResource {
+            return [.kind: "directImage", .mediaWritable: String(image.isWritable)]
+        }
+        return [.kind: "unknown"]
+    }
+
     func probeResource(resource: FSResource, replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void) {
+        let fields = Self.diagnosticFields(resource)
         debugLog("probeResource resource=\(resourceTypeDescription(resource))")
         var e: Int32 = 0
         guard let made = Self.makeBackend(resource, allowWrite: false, out: &e) else {   // probe never writes
+            DiagnosticRecorder.shared.record(.probe, .failed, fields: fields, error: posixError(e))
             debugLog("probeResource makeBackend failed errno=\(e)")
             replyHandler(.notRecognized, nil)
             return
@@ -133,11 +146,13 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
         made.cleanup()
         nfsk_backend_free(made.backend)
         guard recognized == 1 else {
+            DiagnosticRecorder.shared.record(.probe, .observed, fields: fields.merging([.reason: "notRecognized"]) { _, new in new })
             debugLog("probeResource not recognized rc=\(recognized)")
             replyHandler(.notRecognized, nil)
             return
         }
         let label = String(cString: nameBuf)
+        DiagnosticRecorder.shared.record(.probe, .succeeded, fields: fields)
         let uuid = NTFSVolumeSupport.volumeUUID(serial: serial, label: label, sizeBytes: totalBytes)
         let container = FSContainerIdentifier(uuid: uuid)
         debugLog("probeResource usable label=\(label) totalBytes=\(totalBytes) uuid=\(uuid.uuidString)")
@@ -148,11 +163,18 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                       replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
         debugLog("loadResource start resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
         let decision = Self.readOnlyDecision(options.taskOptions, resource: resource)
+        var fields = Self.diagnosticFields(resource)
+        fields[.attempt] = UUID().uuidString
+        fields[.requestedReadOnly] = String(decision.readOnly)
+        fields[.source] = decision.source
+        let diagnosticContext = fields
+        DiagnosticRecorder.shared.record(.load, .started, fields: fields)
         var e: Int32 = 0
         // Block-device mount options arrive at activate, not load. Inspect metadata
         // read-only first, including when the user's default is read/write.
         guard let made = Self.makeBackend(resource, allowWrite: false, out: &e) else {
             let error = posixError(e)
+            DiagnosticRecorder.shared.record(.load, .failed, fields: fields, error: error)
             containerStatus = .notReady(status: error)
             debugLog("loadResource makeBackend failed errno=\(e)")
             replyHandler(nil, error)
@@ -166,6 +188,12 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                                            let explicitOptions = options.taskOptions + activationOptions
                                            let readOnly = Self.requestsReadOnly(explicitOptions) ? true
                                                : Self.requestsReadWrite(explicitOptions) ? false : decision.readOnly
+                                           DiagnosticRecorder.shared.record(.activate, .observed,
+                                               fields: diagnosticContext.merging([
+                                                   .requestedReadOnly: String(readOnly),
+                                                   .source: Self.requestsReadOnly(explicitOptions) ? "mount-option-ro"
+                                                       : Self.requestsReadWrite(explicitOptions) ? "mount-option-rw" : decision.source
+                                               ]) { _, new in new })
                                            guard readOnly != currentReadOnly else { return nil }
                                            var error: Int32 = 0
                                            guard let backend = Self.makeBackend(resource, allowWrite: !readOnly, out: &error) else {
@@ -176,11 +204,18 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                                        onContainerStatusChange: { [weak self] status in
                                            self?.containerStatus = status
                                        })
+            vol.diagnosticContext = diagnosticContext
+            // Load-time preferences are not necessarily the activation request.
+            vol.diagnosticContext.removeValue(forKey: .requestedReadOnly)
+            vol.diagnosticContext.removeValue(forKey: .source)
+            DiagnosticRecorder.shared.record(.load, .succeeded,
+                fields: diagnosticContext.merging([.effectiveReadOnly: "true"]) { _, new in new })
             self.volume = vol
             containerStatus = .ready
             debugLog("loadResource success name=\(vol.name.string ?? "") uuid=\(vol.volumeID.uuid.uuidString) initialReadOnly=true defaultReadOnly=\(decision.readOnly) decisionSource=\(decision.source) isImage=\(decision.isImage) key=\(decision.key ?? "none") storedPreference=\(String(describing: decision.storedPreference))")
             replyHandler(vol, nil)
         } catch {
+            DiagnosticRecorder.shared.record(.load, .failed, fields: diagnosticContext, error: error)
             containerStatus = .notReady(status: error as NSError)
             debugLog("loadResource failed error=\(error)")
             replyHandler(nil, error)
@@ -188,6 +223,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
     }
 
     func unloadResource(resource: FSResource, options: FSTaskOptions) async throws {
+        DiagnosticRecorder.shared.record(.unload, .observed, fields: Self.diagnosticFields(resource))
         debugLog("unloadResource resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
         volume?.teardown()
         volume = nil

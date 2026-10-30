@@ -7,6 +7,7 @@ import SwiftUI
 
 @main
 struct xntfsApp: App {
+    @Environment(\.openWindow) private var openWindow
     @State private var model = AppModel()
 
     var body: some Scene {
@@ -24,10 +25,17 @@ struct xntfsApp: App {
                 }
             }
             CommandGroup(replacing: .help) {
+                Button("Report a Problem...") { openWindow(id: "problem-report") }
+                Divider()
                 Link("GitHub", destination: URL(string: "https://github.com/HuanchuanTech/xntfs")!)
                 Link("GitHub Issues", destination: URL(string: "https://github.com/HuanchuanTech/xntfs/issues")!)
             }
         }
+
+        Window("Report a Problem", id: "problem-report") {
+            ProblemReportView().environment(model)
+        }
+        .windowResizability(.contentMinSize)
 
         Settings {
             SettingsView()

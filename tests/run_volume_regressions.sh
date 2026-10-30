@@ -15,6 +15,7 @@ xcrun clang -g -arch "$target_arch" -mmacosx-version-min=15.4 -fobjc-arc -fmodul
 xcrun swiftc -parse-as-library -target "$target_arch-apple-macos15.4" \
     -import-objc-header "$root/ntfs3g/ntfs3g-Bridging-Header.h" -I"$root/ntfs3g/bridge" \
     "$root/tests/test_volume_regressions.swift" "$root/ntfs3g/ntfs3gVolume.swift" \
+    "$root/Shared/DiagnosticRecorder.swift" \
     "$root/ntfs3g/ntfs3gFileSystem.swift" \
     "$root/ntfs3g/ntfs3gItem.swift" "$work/bridge.o" "$work/backend.o" \
     "$root/build/libntfs-universal/libntfs-3g.a" -framework FSKit -framework Foundation -framework DiskArbitration \

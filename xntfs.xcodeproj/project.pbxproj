@@ -63,6 +63,11 @@
 			path = ntfs3g;
 			sourceTree = "<group>";
 		};
+		D1A600000000000000000001 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -89,6 +94,7 @@
 				342D1B9D2FE52D9D00EC5D14 /* xntfs */,
 				342D1BCC2FE52E2200EC5D14 /* ntfs3g */,
 				342D1B9C2FE52D9D00EC5D14 /* Products */,
+				D1A600000000000000000001 /* Shared */,
 			);
 			sourceTree = "<group>";
 		};
@@ -120,6 +126,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				342D1B9D2FE52D9D00EC5D14 /* xntfs */,
+				D1A600000000000000000001 /* Shared */,
 			);
 			name = xntfs;
 			productName = xntfs;
@@ -140,6 +147,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				342D1BCC2FE52E2200EC5D14 /* ntfs3g */,
+				D1A600000000000000000001 /* Shared */,
 			);
 			name = ntfs3g;
 			productName = ntfs3g;
@@ -356,13 +364,14 @@
 				CODE_SIGN_ENTITLEMENTS = xntfs/xntfs.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 16;
+				CURRENT_PROJECT_VERSION = 17;
 				DEVELOPMENT_TEAM = 529LJDH392;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Config/xntfs-Info.plist";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -370,7 +379,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.4;
-				MARKETING_VERSION = 1.1.1;
+				MARKETING_VERSION = 1.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.huanchuan.xntfs;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -380,6 +389,7 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+				XNTFS_SENTRY_DSN = "https://3672905c0be5a9d797584e254dd0783b@o4512345901760512.ingest.us.sentry.io/4512345930924032";
 			};
 			name = Debug;
 		};
@@ -391,13 +401,14 @@
 				CODE_SIGN_ENTITLEMENTS = xntfs/xntfs.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 16;
+				CURRENT_PROJECT_VERSION = 17;
 				DEVELOPMENT_TEAM = 529LJDH392;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Config/xntfs-Info.plist";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -405,7 +416,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.4;
-				MARKETING_VERSION = 1.1.1;
+				MARKETING_VERSION = 1.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.huanchuan.xntfs;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -415,6 +426,7 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+				XNTFS_SENTRY_DSN = "https://3672905c0be5a9d797584e254dd0783b@o4512345901760512.ingest.us.sentry.io/4512345930924032";
 			};
 			name = Release;
 		};

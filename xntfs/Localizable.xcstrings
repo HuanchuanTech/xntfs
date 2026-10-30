@@ -1,6 +1,266 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Report a Problem" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "报告问题"
+          }
+        }
+      }
+    },
+    "Report a Problem..." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "报告问题..."
+          }
+        }
+      }
+    },
+    "What went wrong?" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "遇到了什么问题？"
+          }
+        }
+      }
+    },
+    "Steps to reproduce (optional)" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复现步骤（选填）"
+          }
+        }
+      }
+    },
+    "Reply email (optional)" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回复邮箱（选填）"
+          }
+        }
+      }
+    },
+    "Include diagnostic snapshot" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "附上诊断快照"
+          }
+        }
+      }
+    },
+    "Diagnostics contain app and macOS versions, hardware model, extension status, mount state and recent error codes. File contents, volume names and full paths are not collected." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "诊断信息包含应用和 macOS 版本、机型、扩展状态、挂载状态及近期错误码，不采集文件内容、卷名或完整路径。"
+          }
+        }
+      }
+    },
+    "Review your description for private information before sharing. Each text field allows up to 4,000 characters." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "分享前请检查描述中是否包含隐私信息。问题描述和复现步骤各限 4,000 字。"
+          }
+        }
+      }
+    },
+    "Report Preview" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "报告预览"
+          }
+        }
+      }
+    },
+    "This is the report that will be exported or sent. The snapshot stays unchanged until you edit the report." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出或发送的内容与此报告一致。再次编辑报告前，快照不会改变。"
+          }
+        }
+      }
+    },
+    "Recipient: %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接收端：%@"
+          }
+        }
+      }
+    },
+    "Sending uses Sentry. The receiving service can see your IP address. Your email is included only if you entered it." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "报告通过 Sentry 发送。接收服务可以看到你的 IP 地址；仅在你填写邮箱时附上邮箱。"
+          }
+        }
+      }
+    },
+    "I have reviewed this report and agree to send it." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "我已检查报告并同意发送。"
+          }
+        }
+      }
+    },
+    "Online sending is not configured in this build. You can export the report." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此版本尚未配置在线接收端，你可以导出报告。"
+          }
+        }
+      }
+    },
+    "Edit Report" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "编辑报告"
+          }
+        }
+      }
+    },
+    "Export Report..." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出报告..."
+          }
+        }
+      }
+    },
+    "Send Report" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "发送报告"
+          }
+        }
+      }
+    },
+    "Create Snapshot & Preview" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生成快照并预览"
+          }
+        }
+      }
+    },
+    "Report exported. Nothing was uploaded." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "报告已导出，没有上传任何内容。"
+          }
+        }
+      }
+    },
+    "The service accepted report %@. This does not confirm that it has been reviewed." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接收服务已接受报告 %@，这不代表报告已被查看。"
+          }
+        }
+      }
+    },
+    "Review the report and confirm before sending." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先检查报告，再确认发送。"
+          }
+        }
+      }
+    },
+    "The report exceeds the 512 KB limit. Shorten the description or exclude diagnostics." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "报告超过 512 KB 上限，请缩短描述或取消附上诊断快照。"
+          }
+        }
+      }
+    },
+    "Delivery could not be confirmed. Export the report or try again later." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法确认报告是否送达，请导出报告或稍后重试。"
+          }
+        }
+      }
+    },
+    "The receiving service has reached a limit. Export the report or try again later." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接收服务已达到限额，请导出报告或稍后重试。"
+          }
+        }
+      }
+    },
+    "The service may have accepted the feedback without its attachment. Please export the report as a backup." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接收服务可能只接受了反馈而未接受附件，请导出报告作为备份。"
+          }
+        }
+      }
+    },
+    "The receiving service rejected the report (HTTP %lld). You can export it instead." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接收服务拒绝了报告（HTTP %lld），你仍可导出报告。"
+          }
+        }
+      }
+    },
     "A sandboxed app can't mount this here, so paste this into Terminal:" : {
       "extractionState" : "stale",
       "localizations" : {
