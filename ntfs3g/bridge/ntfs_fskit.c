@@ -64,6 +64,7 @@ typedef struct {
     int last_io_error;
     int writeback_error;
     int fatal_writeback_error;
+    uint64_t boot_serial;  /* cached at mount; nfsk_statfs must not touch the backend */
 } nfsk_devctx;
 
 static int dev_open(struct ntfs_device *dev, int flags) {
@@ -470,7 +471,9 @@ static struct ntfs_device *make_device(void *resource, nfsk_devctx **out_ctx) {
  * from the backend. Used to give the volume a stable identity instead of a weak label+size
  * hash: the serial is immutable, so identity survives relabels and stays distinct between
  * independently-formatted same-label/same-size volumes. (A block-level clone copies the
- * serial, so clones intentionally share identity — inherent to any on-disk id.) */
+ * serial, so clones intentionally share identity — inherent to any on-disk id.)
+ * This issues block I/O, so read it before serving mounted-volume requests — never
+ * from nfsk_statfs() (see nfsk_devctx.boot_serial). */
 static uint64_t read_boot_serial(void *resource) {
     unsigned char b[8];
     if (nfsk_block_pread(resource, b, 0x48, (int64_t)sizeof b) != (int64_t)sizeof b) return 0;
@@ -502,6 +505,10 @@ ntfs_fskit_volume *nfsk_mount(void *resource, bool read_only, int *out_errno) {
         if (out_errno) *out_errno = saved;
         return NULL;
     }
+    /* Cache the immutable serial before the volume starts serving requests. Re-reading
+     * it from nfsk_statfs() added synchronous block I/O to the FSKit request path, where
+     * a blocked read was observed to stall the volume under write load. */
+    ctx->boot_serial = read_boot_serial(resource);
     /* ntfs_make_symlink/ntfs_get_abslink resolve an *absolute* reparse target relative to
      * vol->abs_mnt_point (the `mnt_point` arg is ignored — it's __attribute__((unused))).
      * ntfs_device_mount leaves abs_mnt_point NULL (only the FUSE layer sets it), so an
@@ -692,7 +699,9 @@ int nfsk_statfs(ntfs_fskit_volume *v, nfsk_statfs_t *out) {
     out->read_only = v->read_only ? 1 : 0;
     if (vol->vol_name) { strncpy(out->volume_name, vol->vol_name, sizeof(out->volume_name) - 1);
                          out->volume_name[sizeof(out->volume_name) - 1] = '\0'; }
-    out->volume_serial = v->devctx ? read_boot_serial(v->devctx->resource) : 0;
+    /* Report the serial without block I/O on FSKit's request queue.
+     * No fallback read here — a zero cached serial stays zero. */
+    out->volume_serial = v->devctx ? v->devctx->boot_serial : 0;
     return 0;
 }
 
