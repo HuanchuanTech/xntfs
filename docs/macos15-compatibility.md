@@ -1,12 +1,14 @@
 # macOS 15 compatibility
 
-## Known filesystem defect
+## Open-file lifetime
 
-Deleting an open file, or replacing an open destination by rename, can invalidate
-its existing handles on macOS 15. Later reads or metadata queries may fail with
-`ENOENT`. This remains unresolved and its fix is deferred. Close files in all apps
-before deleting or replacing them; the mounting workaround below does not address
-this defect. See [the scope and validation details](issue-2-3-4-validation.md#known-defect-macos-15-open-file-lifetime).
+Earlier versions could invalidate an open handle when its file was deleted or
+replaced by rename on macOS 15. The current extension retains open files. In the
+TestFlight 1.1.3 (18) check below, uncached reads and `fstat` through the original
+handle succeeded after both operations; the replacement path returned the new
+contents. This verifies those operations on the tested system, not every possible
+close/reclaim interleaving. The mounting workaround itself does not implement
+file retention. See the [historical scope and results](issue-2-3-4-validation.md).
 
 ## Behavior
 
@@ -98,6 +100,31 @@ Apple 规则 2.4.5 要求沙盒、自包含安装，禁止在共享位置安装�
 root 提权。由用户在终端执行，也不意味着可以规避这些要求。审核需要知道
 临时 `.fs` 的位置、用途、权限、生命周期及清理流程；若该工作流不被接受，
 应调整商店版支持范围或移除该入口，不能隐藏功能。
+
+## TestFlight verification (2026-11-12)
+
+- Tested the user-installed TestFlight 1.1.3 (18), for both host and extension,
+  on macOS 15.8.1 (24H32), x86_64 in the existing QEMU guest. The TestFlight
+  signature verified. The running extension UUID
+  `75C4F796-1B23-3ED3-86BD-AE9B04BE2BA4` matched the user's upload Archive.
+- `tests/run_macos15_unified_flow.sh` used the installed app's compatibility
+  command and a disposable MBR image. All four phases passed with actual `xntfs`
+  mounts: explicit read-only, writable with explicit sync/close, read-only
+  remount with persisted content, and read-only media despite a writable default.
+  The 24 command safety checks and stale-connection rejection also passed.
+- A feature hook reused the compressed-write guard and open-file lifetime checks
+  from `tests/verify_macos27_images.swift`. Compressed writable opens and truncation
+  returned `ENOTSUP`; compressed xattr changes returned `EPERM`. Original contents
+  and xattrs remained readable through remount, without AppleDouble fallback.
+  Unlink and replacement rename preserved the old open handle's data and metadata.
+- The runner now checks the current image path and whole-disk/partition pairing
+  before each mount, unmount and detach. One valid and eight invalid attachment
+  fixtures verified that predicate. The live run exited 0; ordinary detach and
+  temporary-route cleanup completed. App binaries, preferences, the input fixture
+  and pre-existing mounts were unchanged.
+- This is actual x86_64 guest execution, not physical Intel hardware acceptance.
+  GUI interaction, macOS 26, raw-image entry, power loss, surprise removal and
+  installation/upgrade/rollback were not tested in this run.
 
 ## Verification (2026-09-26)
 

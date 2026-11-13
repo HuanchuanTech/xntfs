@@ -52,6 +52,7 @@ The minimum deployment target is macOS 15.4. The exact workflow depends on the m
 - A physical medium or disk image attached read-only remains read-only; changing the file-system driver cannot make read-only media writable.
 - macOS 27 in-app image mounting currently targets raw, single-volume NTFS images. Partitioned or compressed images should be opened in Disk Utility first.
 - xntfs provides a read-only mount preflight. It is not a full filesystem repair or recovery tool.
+- NTFS-compressed data streams can be read, but writable opens, size changes, and changes to compressed extended attributes are currently rejected before modifying data. Creating an extended attribute that would inherit NTFS compression is also rejected. A new file in a compression-marked directory may be left empty after its writable open is rejected. Ordinary uncompressed files, including ZIP/RAR archives, remain writable. Rename and whole-file deletion remain available. This restriction avoids known partial-write and full-disk recovery gaps; it does not repair existing damage.
 - Existing AppleDouble `._` metadata is not automatically migrated or deleted. See the Finder metadata notes below before migrating files.
 
 ## Finder metadata

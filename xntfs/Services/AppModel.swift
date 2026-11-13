@@ -12,7 +12,7 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
-    let settings = AppSettings()
+    let settings: AppSettings
     /// All NTFS volumes the monitor knows about — physical and image-backed (kind == .diskImage).
     private(set) var devices: [NTFSDevice] = []
     private(set) var mountedImages: [MountedImage] = []
@@ -21,17 +21,19 @@ final class AppModel {
     var lastError: String?
 
     private let monitor: DiskArbitrationMonitor?
-    private let mounter: MountService?
+    private let mounter: (any DeviceMounting)?
+    private var unmountAttempts: [String: (device: NTFSDevice, token: UUID)] = [:]
     private var started = false
 
-    init() {
-        if let m = DiskArbitrationMonitor() {
-            monitor = m
-            mounter = MountService(monitor: m)
-        } else {
-            monitor = nil
-            mounter = nil
-        }
+    convenience init() {
+        self.init(monitor: DiskArbitrationMonitor())
+    }
+
+    init(monitor: DiskArbitrationMonitor?,
+         mounter: (any DeviceMounting)? = nil, settings: AppSettings? = nil) {
+        self.settings = settings ?? AppSettings()
+        self.monitor = monitor
+        self.mounter = mounter ?? monitor.map { MountService(monitor: $0) }
     }
 
     func start() {
@@ -41,29 +43,31 @@ final class AppModel {
         DiagnosticRecorder.shared.record(.appStart, .observed,
             fields: [.state: monitor == nil ? "diskArbitrationUnavailable" : "ready"])
         guard let monitor else { return }
-        monitor.onDevicesChanged = { [weak self] list in
-            guard let self else { return }
-            for device in list {
-                let previous = self.devices.first { $0.id == device.id && $0.registryEntryID == device.registryEntryID }
-                if previous?.diagnosticFields != device.diagnosticFields {
-                    DiagnosticRecorder.shared.record(.deviceObserved, .observed, fields: device.diagnosticFields)
-                }
-            }
-            // Preserve any locally-tracked transitional state so a DA "changed" event
-            // mid-transition can't clobber it — e.g. revert .unmounting back to .mounted
-            // and make the Eject button clickable again.
-            self.devices = list.map { incoming in
-                if let existing = self.devices.first(where: { $0.id == incoming.id && $0.registryEntryID == incoming.registryEntryID }) {
-                    switch existing.state {
-                    case .mounting, .unmounting: return existing
-                    default: break
-                    }
-                }
-                return incoming
-            }
-        }
+        monitor.onDevicesChanged = { [weak self] list in self?.receiveDevices(list) }
         monitor.start()
         devices = monitor.currentDevices
+    }
+
+    func receiveDevices(_ list: [NTFSDevice]) {
+        unmountAttempts = unmountAttempts.filter { _, attempt in
+            list.contains { $0.isSameDevice(as: attempt.device) }
+        }
+        for device in list {
+            let previous = devices.first { $0.isSameDevice(as: device) }
+            if previous?.diagnosticFields != device.diagnosticFields {
+                DiagnosticRecorder.shared.record(.deviceObserved, .observed, fields: device.diagnosticFields)
+            }
+        }
+        // Preserve transitions only for the same observation of the same media.
+        devices = list.map { incoming in
+            if let existing = devices.first(where: { $0.isSameDevice(as: incoming) }) {
+                switch existing.state {
+                case .mounting, .unmounting: return existing
+                default: break
+                }
+            }
+            return incoming
+        }
     }
 
     // MARK: actions
@@ -73,9 +77,9 @@ final class AppModel {
         mountedImages = ImageMountService.mountedImages()
     }
 
-    func devicesForDiagnostics() async -> [NTFSDevice] {
-        guard let monitor else { return devices }
-        return await monitor.devicesForDiagnostics()
+    func devicesForDiagnostics() async throws -> DiskArbitrationMonitor.DiagnosticObservation {
+        guard let monitor else { return .init(devices: [], isComplete: false) }
+        return try await monitor.devicesForDiagnostics()
     }
 
     @available(macOS 27.0, *)
@@ -120,7 +124,7 @@ final class AppModel {
     @discardableResult
     func mount(_ device: NTFSDevice, readOnly: Bool) async -> MountOutcome {
         guard let mounter else { let m = "DiskArbitration unavailable"; setError(m); return .failed(m) }
-        guard let current = devices.first(where: { $0.id == device.id && $0.registryEntryID == device.registryEntryID }) else {
+        guard let current = devices.first(where: { $0.isSameDevice(as: device) }) else {
             return .failed(MountError.diskNotFound(device.id).localizedDescription)
         }
         switch current.state {
@@ -130,11 +134,11 @@ final class AppModel {
         }
         updateState(device.id, .mounting)
         let outcome = await mounter.unifiedMount(device, readOnly: readOnly)
-        if let index = devices.firstIndex(where: { $0.id == device.id && $0.registryEntryID == device.registryEntryID }) {
+        if let index = devices.firstIndex(where: { $0.isSameDevice(as: device) }) {
             switch outcome {
             case .mounted(let url):
                 devices[index].state = .mounted(url)
-                let info = DiskArbitrationMonitor.mountInfo(url)
+                let info = DiskArbitrationMonitor.mountInfo(url, matchingSource: device.devicePath)
                 devices[index].readOnly = info?.readOnly ?? false
                 devices[index].mountedFileSystemType = info?.fsType
             case .failed(let msg), .needsSystemMount(let msg, _): devices[index].state = .failed(msg)
@@ -145,16 +149,28 @@ final class AppModel {
     }
 
     func unmount(_ device: NTFSDevice, force: Bool = false) async {
-        guard let mounter else { return }
+        guard let mounter, let index = devices.firstIndex(where: { $0.isSameDevice(as: device) }),
+              unmountAttempts[device.id] == nil else { return }
+        switch devices[index].state {
+        case .mounting, .unmounting: return
+        default: break
+        }
+        let token = UUID()
+        unmountAttempts[device.id] = (device, token)
+        defer { if unmountAttempts[device.id]?.token == token { unmountAttempts.removeValue(forKey: device.id) } }
         DiagnosticRecorder.shared.record(.unmount, .started, fields: device.diagnosticFields)
         updateState(device.id, .unmounting)
         do {
             try await mounter.unmount(device, force: force)
+            guard unmountAttempts[device.id]?.token == token,
+                  let index = devices.firstIndex(where: { $0.isSameDevice(as: device) }) else { return }
             DiagnosticRecorder.shared.record(.unmount, .succeeded, fields: [.device: device.id])
-            updateState(device.id, .unmounted)
+            devices[index].state = .unmounted
         } catch {
+            guard unmountAttempts[device.id]?.token == token,
+                  let index = devices.firstIndex(where: { $0.isSameDevice(as: device) }) else { return }
             DiagnosticRecorder.shared.record(.unmount, .failed, fields: [.device: device.id], error: error)
-            updateState(device.id, .failed(error.localizedDescription))
+            devices[index].state = .failed(error.localizedDescription)
             setError(error.localizedDescription)
         }
     }

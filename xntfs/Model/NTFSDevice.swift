@@ -61,6 +61,13 @@ struct NTFSDevice: Identifiable, Equatable {
     var wholeDiskBSD: String = ""
     /// Changes on reconnect, even when Disk Arbitration reuses the BSD name.
     var registryEntryID: UInt64?
+    /// Preserved across description updates, replaced after disappearance/reconnect.
+    /// Also distinguishes observations when an I/O Registry ID is unavailable.
+    var discoveryID = UUID()
+
+    func isSameDevice(as other: NTFSDevice) -> Bool {
+        id == other.id && registryEntryID == other.registryEntryID && discoveryID == other.discoveryID
+    }
 
     var displayName: String { volumeName.isEmpty ? id : volumeName }
 
@@ -73,7 +80,7 @@ struct NTFSDevice: Identifiable, Equatable {
     var needsXntfsMountGuidance: Bool { mountDriver == .system && readOnly }
 
     static func == (lhs: NTFSDevice, rhs: NTFSDevice) -> Bool {
-        lhs.id == rhs.id && lhs.volumeName == rhs.volumeName &&
+        lhs.isSameDevice(as: rhs) && lhs.volumeName == rhs.volumeName &&
         lhs.state == rhs.state && lhs.sizeBytes == rhs.sizeBytes && lhs.kind == rhs.kind &&
         lhs.mountedFileSystemType == rhs.mountedFileSystemType && lhs.readOnly == rhs.readOnly &&
         lhs.mediaWritable == rhs.mediaWritable && lhs.registryEntryID == rhs.registryEntryID

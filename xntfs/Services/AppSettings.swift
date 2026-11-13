@@ -16,14 +16,15 @@ final class AppSettings {
     static let deviceReadOnlyKey = "deviceReadOnly"
     static let imageReadOnlyKey  = "imageReadOnly"
 
-    private let shared = UserDefaults(suiteName: AppSettings.appGroupID)
+    private let shared: UserDefaults?
 
     /// Read-only access for disk drives. Default off (read/write).
     var deviceReadOnly: Bool { didSet { Self.persist(deviceReadOnly, forKey: AppSettings.deviceReadOnlyKey, defaults: shared) } }
     /// Read-only access for disk images. Default on (read-only).
     var imageReadOnly: Bool { didSet { Self.persist(imageReadOnly, forKey: AppSettings.imageReadOnlyKey, defaults: shared) } }
 
-    init() {
+    init(defaults: UserDefaults? = UserDefaults(suiteName: AppSettings.appGroupID)) {
+        shared = defaults
         let deviceValue = shared?.object(forKey: AppSettings.deviceReadOnlyKey) as? Bool
         let imageValue = shared?.object(forKey: AppSettings.imageReadOnlyKey) as? Bool
         self.deviceReadOnly = deviceValue ?? false

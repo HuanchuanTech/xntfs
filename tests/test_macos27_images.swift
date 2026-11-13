@@ -1,13 +1,46 @@
 import CryptoKit
 import Foundation
+import AppKit
 
 // Run in a signed, sandboxed test bundle with the FSKit Mounter entitlement.
 // The host-side verifier checks Finder-equivalent I/O, which is outside this app's sandbox.
 @main
 struct NativeImageTests {
     @MainActor
-    static func main() async throws {
+    static func main() {
         setbuf(stdout, nil)
+        let application = NSApplication.shared
+        application.setActivationPolicy(.regular)
+        Task {
+            do {
+                try await run()
+                exit(0)
+            } catch {
+                print("FAIL native: \(error)")
+                exit(1)
+            }
+        }
+        application.run()
+        print("FAIL native: application event loop stopped before completion")
+        exit(1)
+    }
+
+    @MainActor
+    static func run() async throws {
+        if CommandLine.arguments.contains("--event-loop-smoke") {
+            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+                                styleMask: [], backing: .buffered, defer: false)
+            panel.alphaValue = 0
+            let timer = Timer(timeInterval: 0.1, repeats: false) { _ in NSApplication.shared.abortModal() }
+            RunLoop.main.add(timer, forMode: .modalPanel)
+            _ = NSApplication.shared.runModal(for: panel)
+            panel.orderOut(nil)
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { continuation.resume() }
+            }
+            print("PASS native event loop: async continuation after modal close")
+            return
+        }
         let status = ExtensionStatus()
         await status.refresh()
         let expected = ProcessInfo.processInfo.environment["XNTFS_TEST_EXTENSION"]
@@ -17,10 +50,38 @@ struct NativeImageTests {
         }
         print("EXTENSION \(status.moduleURLs[0].path)")
         let fm = FileManager.default
-        let directory = fm.temporaryDirectory.appendingPathComponent("xntfs-native-tests-\(UUID())")
-        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        let source = directory.appendingPathComponent("quoted ' NTFS \u{955C}\u{50CF}.img")
-        try fm.copyItem(at: Bundle.main.url(forResource: "input", withExtension: "img")!, to: source)
+        let preferencesBefore = try preferenceHash()
+        print("PREFERENCES before=\(preferencesBefore)")
+        guard let path = ProcessInfo.processInfo.environment["XNTFS_TEST_IMAGE"] else {
+            throw TestFailure("The runner must supply its owned raw image")
+        }
+        let source = URL(fileURLWithPath: path)
+        let directory = source.deletingLastPathComponent()
+        guard directory.lastPathComponent.hasPrefix("xntfs-native-tests-") else {
+            throw TestFailure("Unexpected raw test directory")
+        }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = directory
+        panel.prompt = "授权测试目录"
+        panel.message = "仅选择本轮 xntfs-native-tests 目录。测试只修改里面的一次性镜像。"
+        print("AUTHORIZE raw test directory: \(directory.path)")
+        guard panel.runModal() == .OK, let selected = panel.url,
+              selected.standardizedFileURL == directory.standardizedFileURL else {
+            throw TestFailure("The exact owned test directory must be selected")
+        }
+        guard selected.startAccessingSecurityScopedResource() else {
+            throw TestFailure("No security-scoped directory access")
+        }
+        defer { selected.stopAccessingSecurityScopedResource() }
+        print("AUTHORIZED raw test directory: \(directory.path)")
+        let attributes = try fm.attributesOfItem(atPath: source.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw TestFailure("Raw input must be an owned regular file")
+        }
         let file = try FileHandle(forUpdating: source)
         var serial = UInt64.random(in: 1...UInt64.max).littleEndian
         let bytes = withUnsafeBytes(of: &serial) { Data($0) }
@@ -29,6 +90,7 @@ struct NativeImageTests {
         try file.write(contentsOf: bytes)
         try file.seek(toOffset: length - 512 + 0x48)
         try file.write(contentsOf: bytes)
+        try file.synchronize()
         try file.close()
 
         var active: MountedImage?
@@ -45,10 +107,12 @@ struct NativeImageTests {
             }
             try ImageMountService.validateImage(source)
             let initialHash = try hash(source)
+            print("PASS raw input and non-NTFS rejection checks")
             for phase in ["ro", "rw", "remount-ro", "prepare-hibernation", "fallback-ro"] {
                 let readOnly = phase == "ro" || phase == "remount-ro"
                 let expectedReadOnly = readOnly || phase == "fallback-ro"
-                let model = AppModel()
+                let model = AppModel(monitor: DiskArbitrationMonitor(), settings: AppSettings(defaults: nil))
+                print("BEGIN raw mount phase=\(phase)")
                 let url = try await model.mountImage(source, readOnly: readOnly)
                 guard let image = model.mountedImages.first(where: { $0.mountPoint == url }) else {
                     throw TestFailure("Mounted image missing from AppModel")
@@ -56,11 +120,16 @@ struct NativeImageTests {
                 active = image
                 print("MOUNT mode=\(phase) readOnly=\(image.readOnly) bytes=\(image.sizeBytes) source=\(image.source.absoluteString) expected=\(source.absoluteString)")
                 guard image.readOnly == expectedReadOnly,
-                      image.source.standardizedFileURL == source.standardizedFileURL,
-                      image.sizeBytes > 0 else { throw TestFailure("Incorrect image identity/access/capacity") }
-                let reopenedModel = AppModel()
+                      image.source.standardizedFileURL == source.standardizedFileURL else {
+                    throw TestFailure("Incorrect image identity/access")
+                }
+                // Passive snapshots may have unknown capacity; the host verifier
+                // checks live statfs values separately from mount identity.
+                let reopenedModel = AppModel(monitor: DiskArbitrationMonitor(), settings: AppSettings(defaults: nil))
                 reopenedModel.refreshDevices()
-                guard reopenedModel.mountedImages.contains(image) else {
+                guard reopenedModel.mountedImages.contains(where: {
+                    $0.isSameMount(as: image) && $0.readOnly == expectedReadOnly
+                }) else {
                     throw TestFailure("Image not rediscovered by a new model")
                 }
                 do {
@@ -87,14 +156,29 @@ struct NativeImageTests {
                 }
                 print("PASS \(phase): mount, actual mode, model recovery, duplicate rejection, unmount")
             }
-            try fm.removeItem(at: directory)
-            print("PASS cleanup")
+            let preferencesAfter = try preferenceHash()
+            print("PREFERENCES after=\(preferencesAfter)")
+            guard preferencesAfter == preferencesBefore else {
+                throw TestFailure("App Group preferences changed")
+            }
+            print("PASS cleanup: all owned mounts removed; raw image retained for host evidence cleanup")
         } catch {
             if let active { try? await ImageMountService.unmount(active) }
-            if !ImageMountService.mountedImages().contains(where: { $0.source == source }) {
-                try? fm.removeItem(at: directory)
-            }
+            print("PRESERVED failing raw image: \(source.path)")
             throw error
+        }
+    }
+
+    static func preferenceHash() throws -> String {
+        let group = "529LJDH392.group.com.huanchuan.xntfs"
+        guard let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else {
+            throw TestFailure("Cannot inspect the existing App Group preferences")
+        }
+        let file = root.appendingPathComponent("Library/Preferences/\(group).plist")
+        do {
+            return try SHA256.hash(data: Data(contentsOf: file)).map { String(format: "%02x", $0) }.joined()
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return "absent"
         }
     }
 

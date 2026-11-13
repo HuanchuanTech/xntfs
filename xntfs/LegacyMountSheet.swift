@@ -4,10 +4,16 @@ struct LegacyMountSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
-    let device: NTFSDevice
+    // Keep the original selection while this sheet is open, even if the parent
+    // supplies a rediscovered device with the same BSD name.
+    @State private var device: NTFSDevice
+
+    init(device: NTFSDevice) {
+        _device = State(initialValue: device)
+    }
 
     private var currentDevice: NTFSDevice? {
-        model.devices.first { $0.id == device.id && $0.registryEntryID == device.registryEntryID }
+        model.devices.first { $0.isSameDevice(as: device) }
     }
 
     private var command: String? {

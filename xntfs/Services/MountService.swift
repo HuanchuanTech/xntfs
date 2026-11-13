@@ -64,7 +64,13 @@ enum SystemMountCommand {
 }
 
 @MainActor
-final class MountService {
+protocol DeviceMounting: AnyObject {
+    func unifiedMount(_ device: NTFSDevice, readOnly: Bool) async -> MountOutcome
+    func unmount(_ device: NTFSDevice, force: Bool) async throws
+}
+
+@MainActor
+final class MountService: DeviceMounting {
     private let monitor: DiskArbitrationMonitor
     init(monitor: DiskArbitrationMonitor) { self.monitor = monitor }
 
@@ -82,39 +88,41 @@ final class MountService {
             guard modules.contains(where: { $0.bundleIdentifier == ExtensionStatus.bundleID && $0.isEnabled }) else {
                 throw MountError.extensionUnavailable
             }
-            let url = try await mount(device, readOnly: readOnly)
-            fields[.effectiveReadOnly] = DiskArbitrationMonitor.mountInfo(url).map { String($0.readOnly) } ?? "unknown"
+            let result = try await mount(device, readOnly: readOnly)
+            fields[.effectiveReadOnly] = String(result.readOnly)
             fields[.driver] = "xntfs"
             fields[.state] = "mounted"
             DiagnosticRecorder.shared.record(.mount, .succeeded, fields: fields)
-            return .mounted(url)
+            return .mounted(result.url)
         } catch MountError.sandboxDenied {
             DiagnosticRecorder.shared.record(.mount, .failed, fields: fields,
                 error: NSError(domain: "DiskArbitration", code: Int(kDAReturnNotPrivileged)))
-            let message = MountError.sandboxDenied.localizedDescription
-            guard let command = SystemMountCommand.diskutil(bsdName: device.id, readOnly: readOnly || !device.mediaWritable) else {
-                return .failed(message)
+            do {
+                // A denied callback can also outlive the selected media. Only
+                // offer a command for the current, still-unmounted device.
+                let disk = try validatedDisk(device)
+                guard let description = DADiskCopyDescription(disk) as? [String: Any] else {
+                    throw MountError.diskNotFound(device.id)
+                }
+                guard description[kDADiskDescriptionVolumePathKey as String] == nil else { throw MountError.alreadyMounted }
+                let mediaWritable = description[kDADiskDescriptionMediaWritableKey as String] as? Bool ?? device.mediaWritable
+                let message = MountError.sandboxDenied.localizedDescription
+                guard let command = SystemMountCommand.diskutil(bsdName: device.id, readOnly: readOnly || !mediaWritable) else {
+                    return .failed(message)
+                }
+                return .needsSystemMount(message: message, command: command)
+            } catch {
+                DiagnosticRecorder.shared.record(.mount, .failed, fields: fields, error: error)
+                return .failed(error.localizedDescription)
             }
-            return .needsSystemMount(message: message, command: command)
         } catch {
             DiagnosticRecorder.shared.record(.mount, .failed, fields: fields, error: error)
             return .failed(error.localizedDescription)
         }
     }
 
-    private func mount(_ device: NTFSDevice, readOnly: Bool) async throws -> URL {
-        let session = monitor.sessionRef()
-        guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device.id) else {
-            throw MountError.diskNotFound(device.id)
-        }
-        if let expectedID = device.registryEntryID {
-            let media = DADiskCopyIOMedia(disk)
-            guard media != IO_OBJECT_NULL else { throw MountError.diskNotFound(device.id) }
-            defer { IOObjectRelease(media) }
-            var actualID: UInt64 = 0
-            guard IORegistryEntryGetRegistryEntryID(media, &actualID) == KERN_SUCCESS,
-                  actualID == expectedID else { throw MountError.diskNotFound(device.id) }
-        }
+    private func mount(_ device: NTFSDevice, readOnly: Bool) async throws -> (url: URL, readOnly: Bool) {
+        let disk = try validatedDisk(device)
         guard let description = DADiskCopyDescription(disk) as? [String: Any] else {
             throw MountError.diskNotFound(device.id)
         }
@@ -146,21 +154,21 @@ final class MountService {
                                          Unmanaged.passRetained(box).toOpaque(), argv)
             }
         }
-        guard let desc = DADiskCopyDescription(disk) as? [String: Any],
+        // A successful callback does not identify media that may have changed
+        // while awaiting it. Revalidate before accepting this device's mount.
+        let completedDisk = try validatedDisk(device)
+        guard let desc = DADiskCopyDescription(completedDisk) as? [String: Any],
               let url = desc[kDADiskDescriptionVolumePathKey as String] as? URL,
-              let info = DiskArbitrationMonitor.mountInfo(url),
+              let info = DiskArbitrationMonitor.mountInfo(url, matchingSource: device.devicePath),
               info.fsType == DiskArbitrationMonitor.moduleFSType else {
             throw MountError.unexpectedMount
         }
         guard info.readOnly == effectiveReadOnly else { throw MountError.accessModeMismatch }
-        return url
+        return (url, info.readOnly)
     }
 
     func unmount(_ device: NTFSDevice, force: Bool = false) async throws {
-        let session = monitor.sessionRef()
-        guard let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device.id) else {
-            throw MountError.diskNotFound(device.id)
-        }
+        let disk = try validatedDisk(device)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let box = DACallbackBox { dissenter in
                 if let dissenter {
@@ -175,6 +183,21 @@ final class MountService {
             DADiskUnmount(disk, opts, { _, dissenter, ctx in daInvokeBox(dissenter, ctx) },
                           Unmanaged.passRetained(box).toOpaque())
         }
+    }
+
+    private func validatedDisk(_ device: NTFSDevice) throws -> DADisk {
+        guard monitor.currentDevices.contains(where: { $0.isSameDevice(as: device) }),
+              let expectedID = device.registryEntryID,
+              let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, monitor.sessionRef(), device.id) else {
+            throw MountError.diskNotFound(device.id)
+        }
+        let media = DADiskCopyIOMedia(disk)
+        guard media != IO_OBJECT_NULL else { throw MountError.diskNotFound(device.id) }
+        defer { IOObjectRelease(media) }
+        var actualID: UInt64 = 0
+        guard IORegistryEntryGetRegistryEntryID(media, &actualID) == KERN_SUCCESS,
+              actualID == expectedID else { throw MountError.diskNotFound(device.id) }
+        return disk
     }
 
 }

@@ -28,13 +28,26 @@ original_hash=$(hash "$fixture")
 printf '%s\n' "$original_hash" > "$output/fixture-before.sha256"
 /sbin/mount > "$output/mounts-before.txt"
 /usr/bin/pgrep -x ntfs3g > "$output/old-pids.txt" || true
+verify_attachment() {
+    as_user /usr/bin/hdiutil info -plist > "$output/current-attachments.plist" || return
+    "$verifier" attachment "$output/current-attachments.plist" "$copy" "$whole" "$device"
+}
+detach_current() {
+    verify_attachment || return
+    as_user /usr/bin/hdiutil detach "$whole" || return
+    whole=''; attached=0
+}
+unmount_current() {
+    verify_attachment || return
+    as_user /usr/sbin/diskutil unmount "$device"
+}
 finish() {
     status=$?
     trap - EXIT HUP INT TERM
     set +e
     /bin/bash "$script" --authorized "$owner" cleanup || status=1
     if [ -n "$whole" ]; then
-        if as_user /usr/bin/hdiutil detach "$whole"; then whole=''; attached=0; else status=1; fi
+        detach_current || status=1
     fi
     if [ "$attached" = 0 ] && [ "$status" = 0 ]; then
         /bin/rm -f "$copy"
@@ -67,6 +80,7 @@ attach() {
     as_user /usr/bin/hdiutil attach "$1" -plist "$copy" > "$output/attach.plist"
     read -r whole device <<< "$("$verifier" attach "$output/attach.plist")"
     [[ "$whole" =~ ^/dev/disk[0-9]+$ ]] && [ "$device" = "${whole#/dev/}s1" ]
+    verify_attachment
     /usr/sbin/ioreg -a -r -c IOMedia -l > "$output/media.plist"
     read -r entry size <<< "$("$verifier" media "$output/media.plist" "$device")"
     boot=$(/usr/sbin/sysctl -n kern.bootsessionuuid)
@@ -74,6 +88,7 @@ attach() {
 line() { /sbin/mount | /usr/bin/grep -F "/dev/$device on "; }
 no_route() { [ ! -e "$route" ] && [ ! -L "$route" ]; }
 invoke() {
+    verify_attachment
     /bin/bash "$script" --authorized "$owner" mount "$device" "$entry" "$size" "$boot" "$1" "$app"
     no_route
 }
@@ -120,7 +135,7 @@ before_ro=$(hash "$copy")
 invoke ro
 check ro
 verify_new_binary
-as_user /usr/sbin/diskutil unmount "$device"
+unmount_current
 [ "$(hash "$copy")" = "$before_ro" ]
 printf 'PASS: explicit read-only mount left the complete image unchanged.\n'
 
@@ -128,14 +143,14 @@ printf 'PASS: explicit read-only mount left the complete image unchanged.\n'
 # for this case; do not silently rewrite the user's setting to make the test pass.
 invoke auto
 check rw
-as_user /usr/sbin/diskutil unmount "$device"
+unmount_current
 before_remount=$(hash "$copy")
 invoke ro
 check remount-ro
-as_user /usr/sbin/diskutil unmount "$device"
+unmount_current
 [ "$(hash "$copy")" = "$before_remount" ]
 printf 'PASS: writes persist after unmount; read-only remount does not modify the image.\n'
-as_user /usr/bin/hdiutil detach "$whole"; whole=''; attached=0
+detach_current
 
 before_media=$(hash "$copy")
 attach -readonly
@@ -143,7 +158,7 @@ line | /usr/bin/grep -F '(ntfs,'
 printf 'PASS: subsequent attachment without the temporary route uses native NTFS.\n'
 invoke auto
 check media-ro
-as_user /usr/bin/hdiutil detach "$whole"; whole=''; attached=0
+detach_current
 [ "$(hash "$copy")" = "$before_media" ]
 printf 'PASS: read-only media stays read-only despite the writable image default.\n'
 if [ "$feature_status" = 0 ]; then

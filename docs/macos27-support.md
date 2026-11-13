@@ -26,6 +26,34 @@ The macOS 27 device tests found that Disk Arbitration delivers explicit `rdonly`
 This load/activate ordering is shared by macOS 15, 26 and 27; it is not gated to
 macOS 27. Only the host app's mounting entry points differ by OS version.
 
+## Current candidate verification (2026-11-12)
+
+The installed local Development-signed candidate passed the raw
+`FSPathURLResource` flow on macOS 27.2 (26B123), arm64. This is separate from the
+TestFlight package tested on the macOS 15 guest.
+
+- All five phases passed with actual `xntfs` mounts: read-only, read/write,
+  read-only remount, writing a hibernation marker, and a writable request safely
+  falling back to read-only after that marker.
+- Explicit sync/close, persisted file contents, case-insensitive lookup,
+  open-unlink/replacement handles, duplicate/symlink rejection and model
+  rediscovery passed. The initial read-only mount preserved the whole image hash.
+- The seeded compressed-file checks rejected writable opens/truncation with
+  `ENOTSUP` and xattr mutations with `EPERM`, preserving contents and attributes.
+  Independent offline parsing of the final image also passed.
+- App Group preferences, the installed binaries and pre-existing mounts,
+  including GAME, were unchanged. All owned mounts were normally unmounted and
+  the temporary signed test host was unregistered and removed.
+- Two earlier harness failures are retained separately: an early process exit
+  before any host I/O checks, and an obsolete positive-capacity assertion.
+  The first exit's precise cause was not proven. The final helper uses an AppKit
+  event loop with a modal/async smoke check. Cached capacity may be unknown;
+  rediscovery compares mount identity and mode, while the host checks live
+  `statfs` values. No product change was required for this run.
+
+This does not establish macOS 26, physical Intel hardware, a macOS 27 TestFlight
+package, GUI click automation, upgrade/rollback or power-loss acceptance.
+
 ## Verification
 
 On macOS 27.0 (26A428), with Xcode 27.0 (27A266a):
@@ -48,7 +76,15 @@ bash tests/run_macos27_images.sh /Applications/xntfs.app 'Apple Development: you
 bash tests/run_macos27_images.sh /Applications/xntfs.app 'Apple Development: your identity' /path/to/ntfs-mbr.img device-ro
 ```
 
-The runner uses disposable copies with new NTFS serials, cleans up mounts and temporary bundles, and leaves logs under `_tmp`. It tests the service/model and real filesystem I/O; it does not automate SwiftUI clicks. Device-mode fixtures must have an MBR with NTFS in the first partition. Physical USB media and macOS 26 have not been retested on-device for this change.
+The runner uses disposable copies with new NTFS serials, cleans up mounts and
+temporary bundles, and leaves logs under `_tmp`. Raw mode opens a native folder
+picker: authorize the exact `xntfs-native-tests-…` folder shown by the runner.
+It rejects other selections and keeps the working image under the project's
+`_tmp` for evidence, including on failure. Archive the needed evidence and confirm
+that the source is unmounted before removing that copy. It tests the service/model
+and real filesystem I/O; it does not automate SwiftUI clicks. Device-mode fixtures
+must have an MBR with NTFS in the first partition. Physical USB media and macOS 26
+were not part of that historical macOS 27.0 run.
 
 The macOS 15.8 Intel VM retest now passes using the user-installed TestFlight
 `1.0.5 (8)` build. Process samples confirm the running extension's new x86_64

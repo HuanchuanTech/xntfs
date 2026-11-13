@@ -101,9 +101,9 @@ struct ProblemReportView: View {
         busy = true
         message = nil
         defer { busy = false }
-        let snapshot = includeDiagnostics ? await DiagnosticSnapshot.capture(model: model) : nil
-        let newReport = ProblemReport(description: description, steps: steps, contactEmail: email, diagnostics: snapshot)
         do {
+            let snapshot = includeDiagnostics ? try await DiagnosticSnapshot.capture(model: model) : nil
+            let newReport = ProblemReport(description: description, steps: steps, contactEmail: email, diagnostics: snapshot)
             let data = try newReport.encoded()
             guard data.count <= SentryReportSender.maximumReportBytes else { throw ReportSendError.tooLarge }
             reportData = data

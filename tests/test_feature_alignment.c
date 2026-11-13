@@ -11,6 +11,7 @@
 #include <ntfs-3g/attrib.h>
 #include <ntfs-3g/dir.h>
 #include <ntfs-3g/unistr.h>
+#include <ntfs-3g/security.h>
 #include "ntfs_fskit.h"
 
 typedef struct { int fd, writes, syncs, fail_reads, fail_write_at, faulted; int64_t size; } device;
@@ -60,6 +61,87 @@ static int retained_names(void *p, const char *name, uint64_t ino, uint32_t type
     if (!strncmp(name, ".xntfs-open-", 12)) (*(int *)p)++;
     return 0;
 }
+static int retained_attributes(void *p, const char *name, const nfsk_attr_t *a, int64_t cookie) {
+    return retained_names(p, name, a->ino, a->type, cookie);
+}
+static void check_retention_visibility(ntfs_fskit_volume *v, int expected, const char *message) {
+    int names = 0, attributes = 0;
+    CHECK(nfsk_readdir(v, NFSK_ROOT_INO, 0, &names, retained_names) == 0 &&
+          nfsk_readdir_attributes(v, NFSK_ROOT_INO, 0, &attributes, retained_attributes) == 0 &&
+          names == expected && attributes == expected, message);
+}
+static void check_retention_lifetime(ntfs_fskit_volume *v, device *d) {
+    /* Multiple owners and ordinary records distinguish an anchor count from an
+     * open count or a Boolean. Exercise failure/reopen/sync before final release. */
+    for (int cycle = 0; cycle < 8; cycle++) {
+        uint64_t refs[3]; int error = 0; nfsk_attr_t a;
+        uint64_t ordinary = create(v, NFSK_ROOT_INO, "OrdinaryOpen", NFSK_TYPE_FILE);
+        uint64_t parent = create(v, NFSK_ROOT_INO, "LiveOpenDirectory", NFSK_TYPE_DIR);
+        require(nfsk_open_item(v, ordinary) == 0 && nfsk_open_item(v, parent) == 0,
+                "ordinary opens among retention owners");
+        CHECK(nfsk_getattr(v, ordinary, &a) == 0 && a.nlink == 1 &&
+              nfsk_getattr(v, parent, &a) == 0 && a.nlink == 1,
+              "anchorless open file and directory keep their visible link counts");
+        for (int i = 0; i < 3; i++) {
+            char name[32]; snprintf(name, sizeof name, "Retained-%d", i);
+            refs[i] = create(v, NFSK_ROOT_INO, name, NFSK_TYPE_FILE);
+            require(nfsk_write(v, refs[i], 0, "retained", 8, &error) == 8 &&
+                    nfsk_open_item(v, refs[i]) == 0 && nfsk_remove(v, NFSK_ROOT_INO, name) == 0,
+                    "multiple retained payloads");
+        }
+        CHECK(nfsk_getattr(v, ordinary, &a) == 0 && a.nlink == 1 &&
+              nfsk_getattr(v, parent, &a) == 0 && a.nlink == 1,
+              "other retained inodes do not change a live open item's link count");
+        for (int i = 0; i < 3; i++)
+            CHECK(nfsk_getattr(v, refs[i], &a) == 0 && a.nlink == 0,
+                  "each retained inode reports zero visible links");
+        uint64_t child = nfsk_create(v, parent, "Child", NFSK_TYPE_FILE, &error);
+        uint64_t soft = nfsk_symlink(v, parent, "Soft", "Child", &error);
+        CHECK(child && soft && nfsk_link(v, ordinary, parent, "Hard", &error) == 0,
+              "a live open directory accepts create, symlink and hardlink while other anchors exist");
+        CHECK(nfsk_getattr(v, ordinary, &a) == 0 && a.nlink == 2 &&
+              lookup(v, parent, "Hard") == ordinary,
+              "an ordinary open inode reports both hard links alongside retained inodes");
+        require(nfsk_remove(v, parent, "Child") == 0 && nfsk_remove(v, parent, "Soft") == 0 &&
+                nfsk_remove(v, parent, "Hard") == 0, "remove live directory children");
+        CHECK(nfsk_getattr(v, ordinary, &a) == 0 && a.nlink == 1,
+              "removing the extra hard link restores the ordinary link count");
+        check_retention_visibility(v, 0, "multiple retention links hidden in both enumeration modes");
+        CHECK(nfsk_close_item(v, refs[1]) == 0 && nfsk_getattr(v, refs[1], &a) == -ENOENT,
+              "middle retention owner reclaimed independently");
+        check_retention_visibility(v, 0, "closing one owner keeps remaining links hidden");
+        d->fail_reads = 1;
+        CHECK(nfsk_close_item(v, refs[0]) == -EIO, "failed owner release reports read error");
+        d->fail_reads = 0;
+        CHECK(nfsk_getattr(v, refs[0], &a) == 0 && a.nlink == 0 &&
+              nfsk_getattr(v, ordinary, &a) == 0 && a.nlink == 1,
+              "failed close retains only its owner's zero-link metadata");
+        check_retention_visibility(v, 0, "failed owner release keeps all remaining links hidden");
+        CHECK(nfsk_open_item(v, refs[0]) == 0 && nfsk_sync(v) == 0 &&
+              nfsk_getattr(v, refs[0], &a) == 0 && a.nlink == 0 && has_payload(v, refs[0], "retained"),
+              "reopen after failed close prevents sync from reclaiming a live item");
+        CHECK(nfsk_close_item(v, refs[2]) == 0 && nfsk_close_item(v, ordinary) == 0,
+              "closing another owner and an ordinary record preserves the last owner");
+        check_retention_visibility(v, 0, "ordinary close does not expose the last retained link");
+        CHECK(nfsk_close_item(v, refs[0]) == 0 && nfsk_close_item(v, refs[0]) == 0 &&
+              nfsk_getattr(v, refs[0], &a) == -ENOENT, "last owner and repeated close release exactly once");
+        require(nfsk_remove(v, NFSK_ROOT_INO, "OrdinaryOpen") == 0, "remove ordinary open fixture");
+        require(nfsk_close_item(v, parent) == 0 &&
+                nfsk_remove(v, NFSK_ROOT_INO, "LiveOpenDirectory") == 0, "close ordinary directory fixture");
+        check_retention_visibility(v, 0, "all owners reclaimed before next lifetime cycle");
+    }
+    const char *fake = ".xntfs-open-user-file";
+    uint64_t ordinary = create(v, NFSK_ROOT_INO, fake, NFSK_TYPE_FILE);
+    CHECK(lookup(v, NFSK_ROOT_INO, fake) == ordinary, "a user filename with retention prefix remains accessible");
+    check_retention_visibility(v, 1, "retention prefix alone never hides a user file");
+    uint64_t retained = create(v, NFSK_ROOT_INO, "AlongsideUserFile", NFSK_TYPE_FILE);
+    require(nfsk_open_item(v, retained) == 0 && nfsk_remove(v, NFSK_ROOT_INO, "AlongsideUserFile") == 0,
+            "anchor alongside same-prefix user file");
+    check_retention_visibility(v, 1, "only the owned anchor is hidden alongside a same-prefix user file");
+    CHECK(lookup(v, NFSK_ROOT_INO, ".XNTFS-OPEN-USER-FILE") == ordinary && nfsk_close_item(v, retained) == 0,
+          "same-prefix user lookup preserves case-insensitive matching");
+    require(nfsk_remove(v, NFSK_ROOT_INO, fake) == 0, "remove same-prefix fixture");
+}
 static void prepare_native(const char *path) {
     ntfs_volume *volume = ntfs_mount(path, NTFS_MNT_NONE);
     require(volume != NULL && ntfs_volume_get_free_space(volume) == 0, "native fixture mount");
@@ -78,9 +160,29 @@ static void prepare_native(const char *path) {
     length = ntfs_mbstoucs("InterixLink", &name);
     int target_length = ntfs_mbstoucs("Metadata", &target);
     file = ntfs_create_symlink(root, const_cpu_to_le32(0), name, length, target, target_length);
-    free(name); free(target);
+    free(name); free(target); name = NULL;
     require(file && ntfs_inode_close_in_dir(file, root) == 0, "Interix symlink fixture");
+    for (int directory = 0; directory < 2; directory++) {
+        length = ntfs_mbstoucs(directory ? "PreservedFlagsDirectory" : "PreservedFlagsFile", &name);
+        file = ntfs_create(root, const_cpu_to_le32(0), name, length, directory ? S_IFDIR : S_IFREG);
+        free(name); name = NULL;
+        require(file != NULL, "flag preservation fixture");
+        u32 flags = le32_to_cpu(file->flags | FILE_ATTR_READONLY | FILE_ATTR_ARCHIVE |
+                               FILE_ATTR_NOT_CONTENT_INDEXED | FILE_ATTR_OFFLINE);
+        if (directory) flags |= le32_to_cpu(FILE_ATTR_COMPRESSED);
+        require(ntfs_set_ntfs_attrib(file, (const char *)&flags, sizeof flags, 0) == 0 &&
+                ntfs_inode_close_in_dir(file, root) == 0, "native fixture flags");
+    }
     require(ntfs_inode_close(root) == 0 && ntfs_umount(volume, FALSE) == 0, "close native fixtures");
+}
+static uint32_t read_native_flags(const char *path, const char *name) {
+    ntfs_volume *volume = ntfs_mount(path, NTFS_MNT_RDONLY | NTFS_MNT_FORENSIC);
+    require(volume != NULL, "read-only flags observer");
+    ntfs_inode *file = ntfs_pathname_to_inode(volume, NULL, name);
+    require(file != NULL, "native flags inode");
+    uint32_t flags = le32_to_cpu(file->flags);
+    require(ntfs_inode_close(file) == 0 && ntfs_umount(volume, FALSE) == 0, "close flags observer");
+    return flags;
 }
 static uint32_t read_native_root_flags(const char *path) {
     ntfs_volume *volume = ntfs_mount(path, NTFS_MNT_RDONLY | NTFS_MNT_FORENSIC);
@@ -110,6 +212,41 @@ static void read_retention_name(const char *path, char name[96]) {
     name[0] = 0;
     require(root && ntfs_readdir(root, &position, name, find_retention) == 0 && *name, "find on-disk retention link");
     require(ntfs_inode_close(root) == 0 && ntfs_umount(volume, FALSE) == 0, "close read-only observer");
+}
+static void check_retention_teardown(device *d, const char *path) {
+    int error = 0; nfsk_attr_t a;
+    for (int fail = 0; fail <= 1; fail++) {
+        ntfs_fskit_volume *v = nfsk_mount(d, false, &error);
+        require(v != NULL, "mount retention teardown fixture");
+        uint64_t refs[2];
+        for (int i = 0; i < 2; i++) {
+            char name[32]; snprintf(name, sizeof name, "Teardown-%d", i);
+            refs[i] = create(v, NFSK_ROOT_INO, name, NFSK_TYPE_FILE);
+            require(nfsk_write(v, refs[i], 0, "teardown", 8, &error) == 8 &&
+                    nfsk_open_item(v, refs[i]) == 0 && nfsk_remove(v, NFSK_ROOT_INO, name) == 0,
+                    "teardown retained payload");
+        }
+        require(nfsk_sync(v) == 0, "persist live teardown anchors");
+        d->fail_reads = fail;
+        CHECK(nfsk_umount(v) == (fail ? -EIO : 0), "final release reports retention cleanup outcome");
+        d->fail_reads = 0;
+        v = nfsk_mount(d, true, &error); require(v != NULL, "read-only reopen after final release");
+        check_retention_visibility(v, fail ? 2 : 0, "fresh volume exposes only unreclaimed recovery links");
+        for (int i = 0; i < 2; i++) {
+            CHECK(fail ? (nfsk_getattr(v, refs[i], &a) == 0 && a.nlink == 1 && has_payload(v, refs[i], "teardown"))
+                       : nfsk_getattr(v, refs[i], &a) == -ENOENT,
+                  "reopened image preserves failed-release payload or confirms successful reclamation");
+        }
+        require(nfsk_umount(v) == 0, "close read-only retention observer");
+        if (fail) {
+            v = nfsk_mount(d, false, &error); require(v != NULL, "mount recovery cleanup fixture");
+            for (int i = 0; i < 2; i++) {
+                char name[96]; read_retention_name(path, name);
+                require(nfsk_remove(v, NFSK_ROOT_INO, name) == 0 && nfsk_sync(v) == 0, "clean explicit recovery fixture");
+            }
+            require(nfsk_umount(v) == 0, "close recovered fixture");
+        }
+    }
 }
 static uint64_t checksum(device *d) {
     unsigned char bytes[65536]; uint64_t sum = 14695981039346656037ULL;
@@ -305,6 +442,7 @@ int main(int argc, char **argv) {
     CHECK(nfsk_close_item(v, retry) == -EIO, "failed final close reports its I/O error");
     d.fail_reads = 0;
     CHECK(nfsk_sync(v) == 0 && nfsk_getattr(v, retry, &a) == -ENOENT, "synchronize retries pending retention cleanup");
+    check_retention_lifetime(v, &d);
 
     uint64_t meta = create(v, NFSK_ROOT_INO, "Metadata", NFSK_TYPE_FILE);
     nfsk_metadata_t metadata = { .valid = NFSK_SET_BTIME | NFSK_SET_MTIME | NFSK_SET_ATIME | NFSK_SET_FLAGS,
@@ -332,6 +470,20 @@ int main(int argc, char **argv) {
     metadata.flags = 0;
     CHECK(nfsk_set_metadata(v, hidden_dir, &metadata) == 0 && nfsk_getattr(v, hidden_dir, &a) == 0 && a.flags == 0,
           "ordinary directory hidden flags can still be cleared");
+    require(nfsk_sync(v) == 0, "sync before flag observer");
+    for (int directory = 0; directory < 2; directory++) {
+        const char *name = directory ? "PreservedFlagsDirectory" : "PreservedFlagsFile";
+        uint64_t preserved = lookup(v, NFSK_ROOT_INO, name);
+        uint32_t before = read_native_flags(argv[1], name);
+        metadata.flags = UF_HIDDEN;
+        CHECK(nfsk_set_metadata(v, preserved, &metadata) == 0 && nfsk_sync(v) == 0 &&
+              read_native_flags(argv[1], name) == (before | le32_to_cpu(FILE_ATTR_HIDDEN)),
+              "setting hidden preserves every other native file/directory flag");
+        metadata.flags = 0;
+        CHECK(nfsk_set_metadata(v, preserved, &metadata) == 0 && nfsk_sync(v) == 0 &&
+              read_native_flags(argv[1], name) == before,
+              "clearing hidden preserves readonly/offline/archive/index/compression flags on disk");
+    }
 
     char target[4096];
     uint64_t interix = lookup(v, NFSK_ROOT_INO, "InterixLink");
@@ -422,6 +574,7 @@ int main(int argc, char **argv) {
     anchors = 0;
     CHECK(nfsk_readdir(v, NFSK_ROOT_INO, 0, &anchors, retained_names) == 0 && anchors == 0, "normal close/unmount leaves no retention links on disk");
     nfsk_umount(v);
+    check_retention_teardown(&d, argv[1]);
     check_cases(&d, argv[1]);
     close(d.fd);
     printf("%d feature checks, %d failures\n", checks, failures);

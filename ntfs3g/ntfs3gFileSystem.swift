@@ -13,6 +13,29 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                               FSManageableResourceMaintenanceOperations {
 
     private var volume: ntfs3gVolume?
+    private let resourceQueue = DispatchQueue(label: "com.huanchuan.xntfs.resource.io", qos: .userInitiated,
+                                              autoreleaseFrequency: .workItem)
+    private let lifecycleLock = NSLock()
+    private var loading = false
+    private var unloading = false
+    private var generation: UUID?
+
+    private func finishLoad(_ loaded: ntfs3gVolume?, generation expected: UUID, error: Error?) {
+        lifecycleLock.withLock {
+            guard generation == expected else { return }
+            volume = loaded
+            loading = false
+            if loaded == nil { generation = nil }
+            containerStatus = loaded == nil ? .notReady(status: (error as NSError?) ?? posixError(EIO)) : .ready
+        }
+    }
+
+    private func updateContainerStatus(_ status: FSContainerStatus, generation expected: UUID) {
+        lifecycleLock.withLock {
+            guard generation == expected, !unloading, volume != nil else { return }
+            containerStatus = status
+        }
+    }
 
     // MARK: read-only resolution (mount options + per-scenario app preference)
 
@@ -130,6 +153,12 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
     }
 
     func probeResource(resource: FSResource, replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void) {
+        resourceQueue.async(execute: DispatchWorkItem { [self] in
+            probeResourceOnQueue(resource: resource, replyHandler: replyHandler)
+        })
+    }
+
+    private func probeResourceOnQueue(resource: FSResource, replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void) {
         let fields = Self.diagnosticFields(resource)
         debugLog("probeResource resource=\(resourceTypeDescription(resource))")
         var e: Int32 = 0
@@ -139,19 +168,20 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             replyHandler(.notRecognized, nil)
             return
         }
-        var nameBuf = [CChar](repeating: 0, count: 1024)
+        var name: UnsafeMutablePointer<CChar>?
+        defer { free(name) }
         var serial: UInt64 = 0
-        let recognized = nameBuf.withUnsafeMutableBufferPointer { nfsk_probe(made.backend, $0.baseAddress, $0.count, &serial) }
+        let recognized = nfsk_probe_name_alloc(made.backend, &name, &serial)
         let totalBytes = nfsk_block_total_bytes(made.backend)
         made.cleanup()
         nfsk_backend_free(made.backend)
-        guard recognized == 1 else {
+        guard recognized == 1, let name else {
             DiagnosticRecorder.shared.record(.probe, .observed, fields: fields.merging([.reason: "notRecognized"]) { _, new in new })
             debugLog("probeResource not recognized rc=\(recognized)")
             replyHandler(.notRecognized, nil)
             return
         }
-        let label = String(cString: nameBuf)
+        let label = String(cString: name)
         DiagnosticRecorder.shared.record(.probe, .succeeded, fields: fields)
         let uuid = NTFSVolumeSupport.volumeUUID(serial: serial, label: label, sizeBytes: totalBytes)
         let container = FSContainerIdentifier(uuid: uuid)
@@ -161,8 +191,29 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
 
     func loadResource(resource: FSResource, options: FSTaskOptions,
                       replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
-        debugLog("loadResource start resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
-        let decision = Self.readOnlyDecision(options.taskOptions, resource: resource)
+        loadResource(resource: resource, mountOptions: options.taskOptions, replyHandler: replyHandler)
+    }
+
+    // The array is a value snapshot: a queued load never borrows mutable task options.
+    func loadResource(resource: FSResource, mountOptions: [String],
+                      replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
+        let id = UUID()
+        let accepted = lifecycleLock.withLock {
+            guard volume == nil, !loading, !unloading else { return false }
+            loading = true
+            generation = id
+            return true
+        }
+        guard accepted else { replyHandler(nil, posixError(EBUSY)); return }
+        resourceQueue.async(execute: DispatchWorkItem { [self] in
+            loadResourceOnQueue(resource: resource, options: mountOptions, generation: id, replyHandler: replyHandler)
+        })
+    }
+
+    private func loadResourceOnQueue(resource: FSResource, options: [String], generation id: UUID,
+                                     replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
+        debugLog("loadResource start resource=\(resourceTypeDescription(resource)) options=\(options)")
+        let decision = Self.readOnlyDecision(options, resource: resource)
         var fields = Self.diagnosticFields(resource)
         fields[.attempt] = UUID().uuidString
         fields[.requestedReadOnly] = String(decision.readOnly)
@@ -175,7 +226,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
         guard let made = Self.makeBackend(resource, allowWrite: false, out: &e) else {
             let error = posixError(e)
             DiagnosticRecorder.shared.record(.load, .failed, fields: fields, error: error)
-            containerStatus = .notReady(status: error)
+            finishLoad(nil, generation: id, error: error)
             debugLog("loadResource makeBackend failed errno=\(e)")
             replyHandler(nil, error)
             return
@@ -185,7 +236,7 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             // the backend and runs cleanup itself.
             let vol = try ntfs3gVolume(backend: made,
                                        activationBackend: { activationOptions, currentReadOnly in
-                                           let explicitOptions = options.taskOptions + activationOptions
+                                           let explicitOptions = options + activationOptions
                                            let readOnly = Self.requestsReadOnly(explicitOptions) ? true
                                                : Self.requestsReadWrite(explicitOptions) ? false : decision.readOnly
                                            DiagnosticRecorder.shared.record(.activate, .observed,
@@ -202,32 +253,69 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
                                            return backend
                                        },
                                        onContainerStatusChange: { [weak self] status in
-                                           self?.containerStatus = status
+                                           self?.updateContainerStatus(status, generation: id)
                                        })
+            guard !resource.isRevoked else {
+                // The resource went away while synchronous mount was running.
+                // Keep the load reservation until its unpublished volume is freed.
+                Task { [self] in
+                    await vol.teardown()
+                    let error = posixError(ENXIO)
+                    finishLoad(nil, generation: id, error: error)
+                    replyHandler(nil, error)
+                }
+                return
+            }
             vol.diagnosticContext = diagnosticContext
             // Load-time preferences are not necessarily the activation request.
             vol.diagnosticContext.removeValue(forKey: .requestedReadOnly)
             vol.diagnosticContext.removeValue(forKey: .source)
             DiagnosticRecorder.shared.record(.load, .succeeded,
                 fields: diagnosticContext.merging([.effectiveReadOnly: "true"]) { _, new in new })
-            self.volume = vol
-            containerStatus = .ready
+            finishLoad(vol, generation: id, error: nil)
             debugLog("loadResource success name=\(vol.name.string ?? "") uuid=\(vol.volumeID.uuid.uuidString) initialReadOnly=true defaultReadOnly=\(decision.readOnly) decisionSource=\(decision.source) isImage=\(decision.isImage) key=\(decision.key ?? "none") storedPreference=\(String(describing: decision.storedPreference))")
             replyHandler(vol, nil)
         } catch {
             DiagnosticRecorder.shared.record(.load, .failed, fields: diagnosticContext, error: error)
-            containerStatus = .notReady(status: error as NSError)
+            finishLoad(nil, generation: id, error: error)
             debugLog("loadResource failed error=\(error)")
             replyHandler(nil, error)
         }
     }
 
     func unloadResource(resource: FSResource, options: FSTaskOptions) async throws {
+        try await unloadResource(resource: resource)
+    }
+
+    func unloadResource(resource: FSResource) async throws {
         DiagnosticRecorder.shared.record(.unload, .observed, fields: Self.diagnosticFields(resource))
-        debugLog("unloadResource resource=\(resourceTypeDescription(resource)) options=\(options.taskOptions)")
-        volume?.teardown()
-        volume = nil
-        containerStatus = .notReady(status: posixError(EAGAIN))
+        debugLog("unloadResource resource=\(resourceTypeDescription(resource))")
+        let expected = lifecycleLock.withLock { generation }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            // Runs after the load reply returns, even if unload arrives while
+            // mount is still doing I/O. It suspends its caller instead of waiting
+            // on the resource thread for the volume's own I/O queue.
+            resourceQueue.async(execute: DispatchWorkItem { [self] in
+                do {
+                    let retiring = try lifecycleLock.withLock {
+                        guard generation == expected, !loading, !unloading else { throw posixError(EBUSY) }
+                        unloading = true
+                        return volume
+                    }
+                    Task { [self] in
+                        let result = await retiring?.teardown() ?? 0
+                        self.lifecycleLock.withLock {
+                            self.volume = nil
+                            self.generation = nil
+                            self.unloading = false
+                            self.containerStatus = .notReady(status: posixError(result == 0 ? EAGAIN : -result))
+                        }
+                        if result != 0 { continuation.resume(throwing: posixError(-result)) }
+                        else { continuation.resume() }
+                    }
+                } catch { continuation.resume(throwing: error) }
+            })
+        }
     }
 
     // MARK: backend construction
@@ -309,7 +397,10 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTSUP),
                           userInfo: [NSLocalizedDescriptionKey: message])
         }
-        guard let volume else { throw posixError(ENXIO) }
+        let volume = try lifecycleLock.withLock {
+            guard !loading, !unloading, let volume else { throw posixError(ENXIO) }
+            return volume
+        }
         let progress = Progress(totalUnitCount: 1)
         let work = DispatchGroup()
         work.enter()
@@ -321,13 +412,13 @@ final class ntfs3gFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations,
             }
         }
         debugLog("startCheck options=\(options.taskOptions)")
-        DispatchQueue.global(qos: .utility).async {
+        Task {
             defer { work.leave() }
             var result: Error?
             do {
                 guard !progress.isCancelled else { throw posixError(ECANCELED) }
                 task.logMessage("Checking NTFS mount prerequisites read-only; this is not a full filesystem scan.")
-                try volume.quickCheck()
+                try await volume.quickCheck()
                 guard !progress.isCancelled else { throw posixError(ECANCELED) }
                 task.logMessage("NTFS mount preflight passed. No repairs or disk writes were performed.")
             } catch {

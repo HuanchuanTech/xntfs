@@ -42,6 +42,12 @@ final class ExtensionStatus {
     /// Bundle presence is not proof of registration or enablement on macOS 15.
     private(set) var bundledExtensionURL: URL?
 
+    // MainActor-owned admission, not a cache: one active query and one fresh
+    // follow-up shared by callers arriving before that follow-up starts.
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingAppURL: URL?
+
     /// Must match the extension target's bundle identifier.
     static let bundleID = "com.huanchuan.xntfs.ntfs3g"
 
@@ -111,6 +117,39 @@ final class ExtensionStatus {
     }
 
     func refresh(appURL: URL = Bundle.main.bundleURL) async {
+        guard !Task.isCancelled else { return }
+        if let current = refreshTask {
+            pendingAppURL = appURL
+            if let pending = pendingRefreshTask {
+                await pending.value
+                return
+            }
+            let pending = Task {
+                await current.value
+                let nextAppURL = pendingAppURL ?? appURL
+                pendingAppURL = nil
+                refreshTask = pendingRefreshTask
+                pendingRefreshTask = nil
+                await performRefresh(appURL: nextAppURL)
+                if pendingRefreshTask == nil { refreshTask = nil }
+            }
+            pendingRefreshTask = pending
+            await pending.value
+        } else {
+            let task = Task {
+                await performRefresh(appURL: appURL)
+                // Keep the completed task installed until its pending successor
+                // promotes itself, so a caller cannot start a query in that gap.
+                if pendingRefreshTask == nil { refreshTask = nil }
+            }
+            refreshTask = task
+            await task.value
+        }
+        // Cancellation of a waiter does not cancel shared work or free its slot.
+        // Each caller waits only for its generation, not for later refreshes.
+    }
+
+    private func performRefresh(appURL: URL) async {
         defer {
             DiagnosticRecorder.shared.record(.extensionQuery, queryError == nil ? .observed : .failed,
                 fields: [.state: String(describing: state),

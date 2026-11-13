@@ -14,9 +14,21 @@
 #include "ntfs_fskit.h"
 
 typedef struct { int fd; int64_t size; } test_device;
-static int checks, failures, fail_reads, fail_lookup, corrupt_key, fail_next_after = -1;
+static int checks, failures, fail_reads, fail_writes, fail_lookup, miss_checkpoint, corrupt_key, fail_next_after = -1;
 static int fail_read_after;
 static int index_calls, wrong_case_mode, allocation_entries;
+static uint64_t fail_open_mft = UINT64_MAX, fail_close_mft = UINT64_MAX, fail_attr_mft = UINT64_MAX;
+static int injected_faults;
+static int conversion_error, conversion_faults, conversion_calls;
+static void *conversion_partial;
+static int conversion_partial_frees;
+static int track_conversion_result, conversion_result_frees;
+static void *conversion_result;
+static uint64_t fail_search_mft = UINT64_MAX;
+static int fail_search_after = -1;
+static int search_error = EIO, context_error = ENOMEM, search_contexts;
+static uint64_t fail_context_mft = UINT64_MAX;
+static char encoding_names[5][2300], encoding_expected[5][2300];
 #define CHECK(ok, message) do { checks++; if (!(ok)) { failures++; \
     fprintf(stderr, "FAIL: %s\n", message); } else printf("PASS: %s\n", message); } while (0)
 
@@ -24,11 +36,100 @@ static void require(int ok, const char *message) {
     if (!ok) { fprintf(stderr, "Fixture failure: %s (errno=%d)\n", message, errno); exit(2); }
 }
 
+int nfsk_test_ucstombs(const ntfschar *input, int length, char **output, int capacity) {
+    conversion_calls++;
+    if (conversion_error) {
+        conversion_faults++;
+        // Upstream can fail after allocating a partial output; the caller owns it.
+        if (!*output) *output = malloc(8);
+        require(*output != NULL, "allocate partial conversion witness");
+        conversion_partial = *output;
+        errno = conversion_error;
+        return -1;
+    }
+    int result = ntfs_ucstombs(input, length, output, capacity);
+    if (track_conversion_result && result >= 0) {
+        require(!conversion_result && *output, "one owned conversion result at a time");
+        conversion_result = *output;
+    }
+    return result;
+}
+
+void nfsk_test_free(void *pointer) {
+    if (pointer && pointer == conversion_partial) {
+        conversion_partial = NULL;
+        conversion_partial_frees++;
+    }
+    if (pointer && pointer == conversion_result) {
+        conversion_result = NULL;
+        conversion_result_frees++;
+    }
+    free(pointer);
+}
+
+int nfsk_test_attr_lookup(const ATTR_TYPES type, const ntfschar *name,
+        const u32 length, const IGNORE_CASE_BOOL ic, const VCN lowest_vcn,
+        const u8 *value, const u32 value_length, ntfs_attr_search_ctx *ctx) {
+    if (type == AT_FILE_NAME && ctx->ntfs_ino->mft_no == fail_search_mft &&
+        fail_search_after >= 0 && fail_search_after-- == 0) {
+        injected_faults++; errno = search_error; return -1;
+    }
+    return ntfs_attr_lookup(type, name, length, ic, lowest_vcn, value, value_length, ctx);
+}
+
+ntfs_attr_search_ctx *nfsk_test_attr_get_search_ctx(ntfs_inode *ni, MFT_RECORD *mrec) {
+    if (ni && ni->mft_no == fail_context_mft) {
+        fail_context_mft = UINT64_MAX;
+        injected_faults++; errno = context_error; return NULL;
+    }
+    ntfs_attr_search_ctx *ctx = ntfs_attr_get_search_ctx(ni, mrec);
+    if (ctx) search_contexts++;
+    return ctx;
+}
+
+void nfsk_test_attr_put_search_ctx(ntfs_attr_search_ctx *ctx) {
+    if (ctx) search_contexts--;
+    ntfs_attr_put_search_ctx(ctx);
+}
+
+static void encoding_fixture_names(void) {
+    memset(encoding_names[0], 'Z', 255);
+    strcpy(encoding_expected[0], encoding_names[0]);
+    strcpy(encoding_names[1], "A-ReadMe mixed Case.txt");
+    strcpy(encoding_expected[1], encoding_names[1]);
+    strcpy(encoding_names[2], "B-Caf\xc3\xa9");
+    strcpy(encoding_expected[2], "B-Cafe\xcc\x81");
+    strcpy(encoding_names[3], "C-\xf0\x9f\xa7\xa0.txt");
+    strcpy(encoding_expected[3], encoding_names[3]);
+    // 255 UTF-16 units are valid NTFS names. NFD is 2295 UTF-8 bytes here;
+    // replacing the Unicode path with a fixed 256/1024-byte buffer truncates it.
+    for (int i = 0; i < 255; i++) {
+        memcpy(encoding_names[4] + i * 3, "\xea\xb0\x81", 3);
+        memcpy(encoding_expected[4] + i * 9, "\xe1\x84\x80\xe1\x85\xa1\xe1\x86\xa8", 9);
+    }
+}
+
+ntfs_inode *nfsk_test_inode_open(ntfs_volume *vol, MFT_REF ref) {
+    if (MREF(ref) == fail_open_mft) { injected_faults++; fail_open_mft = UINT64_MAX; errno = EIO; return NULL; }
+    return ntfs_inode_open(vol, ref);
+}
+ntfs_attr *nfsk_test_attr_open(ntfs_inode *ni, ATTR_TYPES type, ntfschar *name, u32 length) {
+    if (ni->mft_no == fail_attr_mft) { injected_faults++; fail_attr_mft = UINT64_MAX; errno = EIO; return NULL; }
+    return ntfs_attr_open(ni, type, name, length);
+}
+static int close_fails(ntfs_inode *ni) {
+    if (ni->mft_no != fail_close_mft) return 0;
+    injected_faults++; fail_close_mft = UINT64_MAX; errno = EIO; return 1;
+}
+int nfsk_test_inode_close(ntfs_inode *ni) { return close_fails(ni) ? -1 : ntfs_inode_close(ni); }
+int nfsk_test_inode_real_close(ntfs_inode *ni) { return close_fails(ni) ? -1 : ntfs_inode_real_close(ni); }
+
 int64_t nfsk_block_pread(void *opaque, void *buf, int64_t off, int64_t count) {
     if (fail_reads) { errno = EIO; return -1; }
     return pread(((test_device *)opaque)->fd, buf, count, off);
 }
 int64_t nfsk_block_pwrite(void *opaque, const void *buf, int64_t off, int64_t count) {
+    if (fail_writes) { errno = EIO; return -1; }
     return pwrite(((test_device *)opaque)->fd, buf, count, off);
 }
 int nfsk_block_sync(void *opaque) { return fsync(((test_device *)opaque)->fd) ? -errno : 0; }
@@ -41,6 +142,10 @@ int nfsk_test_index_lookup(const void *key, int length, ntfs_index_context *inde
     index_calls++;
     wrong_case_mode += !!NVolCaseSensitive(index->ni->vol);
     if (fail_lookup) { errno = EIO; return -1; }
+    if (miss_checkpoint && ((const FILE_NAME_ATTR *)key)->file_name_length) {
+        FILE_NAME_ATTR first = {0};
+        return ntfs_index_lookup(&first, sizeof first, index);
+    }
     int rc = ntfs_index_lookup(key, length, index);
     if (corrupt_key && (!rc || errno == ENOENT) && index->entry &&
         !(index->entry->ie_flags & INDEX_ENTRY_END)) index->entry->key_length = const_cpu_to_le16(1);
@@ -116,6 +221,10 @@ static void prepare(const char *path) {
     }
     close_inode(large);
     close_inode(create(root, "EnumEmpty", S_IFDIR));
+    encoding_fixture_names();
+    ntfs_inode *encoding = create(root, "EnumEncoding", S_IFDIR);
+    for (int i = 0; i < 5; i++) close_inode(create(encoding, encoding_names[i], S_IFREG));
+    close_inode(encoding);
     close_inode(root);
     require(ntfs_umount(volume, FALSE) == 0, "unmount prepared fixture");
 }
@@ -159,6 +268,226 @@ static int collect(void *opaque, const char *name, uint64_t ino, uint32_t type, 
     errno = ENOENT; /* Must not leak into the iterator's end-of-directory result. */
     return 0;
 }
+static int collect_attributes(void *opaque, const char *name, const nfsk_attr_t *attributes, int64_t cookie) {
+    listing *out = opaque;
+    nfsk_attr_t standalone;
+    if (nfsk_getattr(out->volume, attributes->ino, &standalone)) { out->invalid++; return 1; }
+    standalone.parent_ino = out->directory;
+    if (memcmp(&standalone, attributes, sizeof standalone)) out->invalid++;
+    return collect(opaque, name, attributes->ino, attributes->type, cookie);
+}
+static int count_attributes(void *opaque, const char *name, const nfsk_attr_t *attributes, int64_t cookie) {
+    return count_entry(opaque, name, attributes->ino, attributes->type, cookie);
+}
+
+typedef struct {
+    ntfs_fskit_volume *volume;
+    uint64_t nested;
+    unsigned seen;
+    int count, invalid;
+} encoding_check;
+
+static int check_encoding(void *opaque, const char *name, uint64_t ino, uint32_t type, int64_t cookie) {
+    encoding_check *check = opaque;
+    int match = -1;
+    for (int i = 0; i < 5; i++) if (!strcmp(name, encoding_expected[i])) match = i;
+    if (match < 0 || type != NFSK_TYPE_FILE || !ino || cookie != ++check->count) {
+        check->invalid++; return 1;
+    }
+    if (check->seen & (1U << match)) check->invalid++;
+    check->seen |= 1U << match;
+    // A nonempty nested walk overwrites its own temporary name many times.
+    // The outer borrowed name must still be intact until this callback returns.
+    if (check->nested) {
+        int nested = 0;
+        if (nfsk_readdir(check->volume, check->nested, 0, &nested, count_entry) || nested != 11 ||
+            strcmp(name, encoding_expected[match])) check->invalid++;
+    }
+    return 0;
+}
+
+static int check_encoding_attributes(void *opaque, const char *name, const nfsk_attr_t *attributes, int64_t cookie) {
+    return check_encoding(opaque, name, attributes->ino, attributes->type, cookie);
+}
+
+static void encoding_tests(ntfs_fskit_volume *v, uint64_t directory, uint64_t nested) {
+    encoding_check check = { .volume = v, .nested = nested };
+    CHECK(nfsk_readdir(v, directory, 0, &check, check_encoding) == 0 &&
+          !check.invalid && check.seen == 31 && check.count == 5,
+          "255-byte ASCII and 2295-byte NFD names survive nested enumeration without truncation");
+    check = (encoding_check){ .volume = v, .nested = nested };
+    CHECK(nfsk_readdir_attributes(v, directory, 0, &check, check_encoding_attributes) == 0 &&
+          !check.invalid && check.seen == 31 && check.count == 5,
+          "attribute enumeration preserves ASCII case, accents, supplementary characters and long Unicode names");
+    for (int i = 0; i < 2; i++) {
+        int expected_error = i ? ENOMEM : EILSEQ, before = conversion_faults, count = 0;
+        int freed = conversion_partial_frees;
+        conversion_error = expected_error;
+        CHECK(nfsk_readdir(v, directory, 0, &count, count_entry) == -expected_error &&
+              conversion_faults == before + 1 && !conversion_partial && conversion_partial_frees == freed + 1,
+              "conversion failure propagates once, stops the walk and frees partial output");
+        before = conversion_faults; count = 0;
+        CHECK(nfsk_readdir_attributes(v, directory, 0, &count, count_attributes) == -expected_error &&
+              conversion_faults == before + 1 && !conversion_partial && conversion_partial_frees == freed + 2,
+              "attribute walk preserves conversion error and frees partial output");
+        conversion_error = 0;
+        check = (encoding_check){ .volume = v };
+        CHECK(nfsk_readdir(v, directory, 0, &check, check_encoding) == 0 &&
+              !check.invalid && check.seen == 31, "conversion failure remains retryable with complete spelling");
+    }
+}
+
+static void canonical_lookup_tests(ntfs_fskit_volume *v, uint64_t directory) {
+    track_conversion_result = 1;
+    for (int i = 0; i < 5; i++) {
+        int error = 0, freed = conversion_result_frees;
+        uint64_t expected = nfsk_lookup(v, directory, encoding_names[i], &error);
+        require(expected != 0, "canonical lookup fixture");
+        char *name = (char *)1;
+        uint64_t result = nfsk_lookup_name_alloc(v, directory, encoding_names[i], &name, &error);
+        CHECK(result == expected && error == 0 && name && name == conversion_result &&
+              !strcmp(name, encoding_expected[i]) && conversion_result_frees == freed,
+              "owned canonical lookup returns complete spelling without premature free");
+        nfsk_test_free(name);
+        CHECK(!conversion_result && conversion_result_frees == freed + 1,
+              "canonical result has exactly one caller-owned release");
+    }
+    int error = 0, freed = conversion_result_frees;
+    uint64_t target = nfsk_lookup(v, directory, encoding_names[1], &error);
+    char small[8], *name = (char *)1;
+    fail_close_mft = target;
+    CHECK(!nfsk_lookup_name(v, directory, encoding_names[1], small, sizeof small, &error) &&
+          error == ENAMETOOLONG && !conversion_result && conversion_result_frees == freed + 1,
+          "legacy capacity error precedes secondary close failure and frees conversion output");
+    CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0, "legacy short-buffer close failure retains retry ownership");
+
+    freed = conversion_result_frees;
+    fail_close_mft = target;
+    CHECK(!nfsk_lookup_name_alloc(v, directory, encoding_names[1], &name, &error) &&
+          error == EIO && !name && !conversion_result && conversion_result_frees == freed + 1,
+          "failed child close frees owned canonical output without publishing it");
+    CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0, "owned-name child close failure retains retry ownership");
+    fail_close_mft = directory; name = (char *)1;
+    CHECK(!nfsk_lookup_name_alloc(v, directory, encoding_names[1], &name, &error) &&
+          error == EIO && !name && !conversion_result,
+          "failed parent close does not publish a canonical result");
+    CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0, "owned-name parent close failure remains recoverable");
+    fail_close_mft = directory; name = (char *)1;
+    CHECK(!nfsk_lookup_name_alloc(v, directory, "MissingCanonicalName", &name, &error) &&
+          error == ENOENT && !name, "missing name retains first error over failed parent cleanup");
+    CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0, "missing-name secondary close failure remains recoverable");
+
+    for (int i = 0; i < 2; i++) {
+        conversion_error = i ? ENOMEM : EILSEQ;
+        int before = conversion_faults, partial_freed = conversion_partial_frees;
+        name = (char *)1;
+        CHECK(!nfsk_lookup_name_alloc(v, directory, encoding_names[2], &name, &error) &&
+              error == conversion_error && !name && conversion_faults == before + 1 &&
+              !conversion_partial && conversion_partial_frees == partial_freed + 1,
+              "owned lookup conversion failure frees partial output and preserves errno");
+        conversion_error = 0;
+        CHECK(nfsk_lookup_name_alloc(v, directory, encoding_expected[2], &name, &error) != 0 &&
+              name && !strcmp(name, encoding_expected[2]), "canonical conversion failure can retry using decomposed input");
+        nfsk_test_free(name);
+    }
+    name = (char *)1;
+    CHECK(!nfsk_lookup_name_alloc(NULL, directory, encoding_names[1], &name, &error) &&
+          error == EINVAL && !name, "invalid volume clears owned-name output");
+    name = (char *)1;
+    CHECK(!nfsk_lookup_name_alloc(v, directory, NULL, &name, &error) &&
+          error == EINVAL && !name, "invalid input name clears owned-name output");
+    CHECK(!nfsk_lookup_name_alloc(v, directory, encoding_names[1], NULL, &error) &&
+          error == EINVAL, "owned-name lookup rejects a missing output slot");
+
+    char canonical[256];
+    for (int allocated = 0; allocated < 2; allocated++) {
+        int faults = injected_faults;
+        freed = conversion_result_frees; name = NULL;
+        fail_search_mft = target; fail_search_after = 1;
+        uint64_t result = allocated
+            ? nfsk_lookup_name_alloc(v, directory, "a-readme mixed case.txt", &name, &error)
+            : nfsk_lookup_name(v, directory, "a-readme mixed case.txt", canonical, sizeof canonical, &error);
+        CHECK(!result && error == EIO && !name && !conversion_result &&
+              injected_faults == faults + 1 && conversion_result_frees == freed + 1,
+              "later FILE_NAME search error cannot turn a case-insensitive match into success");
+        if (name) nfsk_test_free(name);
+        fail_search_mft = UINT64_MAX; fail_search_after = -1;
+    }
+    CHECK(!conversion_result && !conversion_partial, "canonical lookup leaves no test-owned conversion output");
+    track_conversion_result = 0;
+}
+
+static void parent_attribute_tests(ntfs_fskit_volume *v, uint64_t directory) {
+    int error = 0;
+    uint64_t items[] = {
+        nfsk_lookup(v, directory, "MiXeD.txt", &error),
+        nfsk_lookup(v, directory, "SubDirectory", &error)
+    };
+    require(items[0] && items[1], "parent attribute fixtures");
+    const int errors[] = { EIO, ENXIO, ENOMEM, 0 };
+    for (size_t item = 0; item < sizeof(items) / sizeof(items[0]); item++) {
+        nfsk_attr_t expected, actual;
+        CHECK(nfsk_getattr(v, items[item], &expected) == 0 && expected.parent_ino == directory,
+              "file and directory attributes report their normal stored parent");
+        for (size_t fault = 0; fault < sizeof(errors) / sizeof(errors[0]); fault++) {
+            int previous = injected_faults;
+            fail_search_mft = items[item]; fail_search_after = 0; search_error = errors[fault];
+            int result = nfsk_getattr(v, items[item], &actual);
+            CHECK(result == -(search_error ? search_error : EIO) &&
+                  injected_faults == previous + 1 && search_contexts == 0,
+                  "parent search failure cannot become successful unknown-parent attributes");
+            fail_search_mft = UINT64_MAX; fail_search_after = -1; search_error = EIO;
+            CHECK(nfsk_sync(v) == 0 && nfsk_getattr(v, items[item], &actual) == 0 &&
+                  !memcmp(&expected, &actual, sizeof actual) && search_contexts == 0,
+                  "parent search failure leaves sync clean and full attributes retryable");
+        }
+        for (int fault = 0; fault < 2; fault++) {
+            int previous = injected_faults;
+            fail_context_mft = items[item]; context_error = fault ? 0 : ENOMEM;
+            CHECK(nfsk_getattr(v, items[item], &actual) == -ENOMEM &&
+                  injected_faults == previous + 1 && search_contexts == 0,
+                  "failed parent search-context allocation propagates ENOMEM without ownership");
+            context_error = ENOMEM;
+            CHECK(nfsk_sync(v) == 0 && nfsk_getattr(v, items[item], &actual) == 0 &&
+                  !memcmp(&expected, &actual, sizeof actual) && search_contexts == 0,
+                  "search-context allocation failure can retry with complete attributes");
+        }
+        int previous = injected_faults;
+        fail_search_mft = items[item]; fail_search_after = 0; search_error = ENOENT;
+        CHECK(nfsk_getattr(v, items[item], &actual) == 0 && actual.parent_ino == 0 &&
+              actual.ino == items[item] && actual.type == expected.type &&
+              injected_faults == previous + 1 && search_contexts == 0,
+              "missing FILE_NAME retains successful unknown-parent fallback");
+        fail_search_after = 0; search_error = ENXIO; fail_close_mft = items[item];
+        previous = injected_faults;
+        CHECK(nfsk_getattr(v, items[item], &actual) == -ENXIO &&
+              injected_faults == previous + 2 && search_contexts == 0,
+              "parent search error precedes secondary close failure");
+        fail_search_mft = UINT64_MAX; fail_search_after = -1; search_error = EIO;
+        CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0 &&
+              nfsk_getattr(v, items[item], &actual) == 0 &&
+              !memcmp(&expected, &actual, sizeof actual),
+              "secondary parent-query close failure retains sync error and retry ownership");
+    }
+    nfsk_attr_t root;
+    int previous = injected_faults;
+    fail_context_mft = FILE_root; fail_search_mft = FILE_root; fail_search_after = 0;
+    CHECK(nfsk_getattr(v, NFSK_ROOT_INO, &root) == 0 && root.parent_ino == NFSK_PARENT_OF_ROOT &&
+          injected_faults == previous && search_contexts == 0,
+          "root parent sentinel bypasses FILE_NAME lookup and allocation");
+    fail_context_mft = UINT64_MAX; fail_search_mft = items[0]; fail_search_after = 0;
+    int count = 0;
+    CHECK(nfsk_readdir_attributes(v, directory, 0, &count, count_attributes) == 0 && count == 11 &&
+          injected_faults == previous && fail_search_after == 0 && search_contexts == 0,
+          "attribute enumeration uses its known listing parent without a parent FILE_NAME search");
+    fail_search_mft = UINT64_MAX; fail_search_after = -1;
+}
+
+static int reject_with_close_failure(void *opaque, const char *name, const nfsk_attr_t *attributes, int64_t cookie) {
+    (void)name; (void)attributes; (void)cookie;
+    fail_close_mft = *(uint64_t *)opaque;
+    return 1;
+}
 static listing *new_listing(ntfs_fskit_volume *volume, uint64_t directory) {
     listing *result = calloc(1, sizeof(*result));
     require(result != NULL, "allocate listing");
@@ -182,6 +511,44 @@ static uint64_t lookup(ntfs_fskit_volume *v, uint64_t dir, const char *name) {
     return ino;
 }
 
+static int collect_then_stop(void *opaque, const char *name, uint64_t ino, uint32_t type, int64_t cookie) {
+    int rc = collect(opaque, name, ino, type, cookie);
+    listing *out = opaque;
+    return rc || out->count == out->limit;
+}
+
+static int mutate_then_stop(void *opaque, const char *name, uint64_t ino, uint32_t type, int64_t cookie) {
+    listing *out = opaque;
+    int rc = collect(opaque, name, ino, type, cookie);
+    if (out->count == 7) {
+        int error = 0;
+        require(nfsk_create(out->volume, out->directory, "AAA-callback.txt", NFSK_TYPE_FILE, &error) != 0,
+                "mutation inside enumeration callback");
+        return 1;
+    }
+    return rc;
+}
+
+static void prime_page(ntfs_fskit_volume *v, uint64_t dir) {
+    listing *p = new_listing(v, dir);
+    p->limit = 7;
+    require(nfsk_readdir(v, dir, 0, p, collect) == 0 && p->count == 7 && !p->invalid, "prime page boundary");
+    free(p);
+}
+
+/* Compare with the public API's fresh ordinal walk, including all names, inode
+ * identities, types and cookies. This also specifies behavior after mutation. */
+static int suffix_matches(ntfs_fskit_volume *v, uint64_t dir, int64_t cookie) {
+    listing *all = new_listing(v, dir), *tail = new_listing(v, dir);
+    tail->cookie = cookie;
+    int ok = nfsk_readdir(v, dir, 0, all, collect) == 0 &&
+        nfsk_readdir(v, dir, cookie, tail, collect) == 0 && !all->invalid && !tail->invalid &&
+        all->count >= cookie && tail->count == all->count - cookie &&
+        !memcmp(tail->entries, all->entries + cookie, tail->count * sizeof(record));
+    free(all); free(tail);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     struct stat st;
@@ -196,6 +563,51 @@ int main(int argc, char **argv) {
     uint64_t small = lookup(v, NFSK_ROOT_INO, "enumsmall");
     uint64_t large = lookup(v, NFSK_ROOT_INO, "enumlarge");
     uint64_t empty = lookup(v, NFSK_ROOT_INO, "enumempty");
+    encoding_tests(v, lookup(v, NFSK_ROOT_INO, "EnumEncoding"), small);
+    canonical_lookup_tests(v, lookup(v, NFSK_ROOT_INO, "EnumEncoding"));
+    parent_attribute_tests(v, small);
+    listing *attrs = new_listing(v, small);
+    attrs->nested_directory = empty;
+    CHECK(nfsk_readdir_attributes(v, small, 0, attrs, collect_attributes) == 0 && attrs->count == 11 && !attrs->invalid,
+          "combined enumeration matches every live attribute field for files, directories, links and special items");
+    uint64_t attr_first_ino = attrs->entries[0].ino;
+    free(attrs);
+    for (int page = 1; page <= 64; page = page == 1 ? 7 : page == 7 ? 64 : 65) {
+        attrs = new_listing(v, large);
+        int before, rc = 0;
+        do {
+            before = attrs->count; attrs->limit = before + page;
+            rc = nfsk_readdir_attributes(v, large, attrs->cookie, attrs, collect_attributes);
+        } while (!rc && attrs->count != before);
+        CHECK(!rc && attrs->count == 320 && !attrs->invalid, "combined enumeration preserves rejected-entry cookies at page sizes 1, 7 and 64");
+        free(attrs);
+    }
+    uint64_t linked = lookup(v, small, "MiXeD.txt");
+    CHECK(nfsk_link(v, linked, empty, "CrossParent", &error) == 0, "prepare a hard link in another directory");
+    nfsk_attr_t before_link, after_link;
+    CHECK(nfsk_getattr(v, linked, &before_link) == 0, "read context-free hard-link parent");
+    attrs = new_listing(v, empty);
+    CHECK(nfsk_readdir_attributes(v, empty, 0, attrs, collect_attributes) == 0 && attrs->count == 1 && !attrs->invalid &&
+          nfsk_getattr(v, linked, &after_link) == 0 && after_link.parent_ino == before_link.parent_ino,
+          "combined enumeration uses its listing parent without changing context-free hard-link identity");
+    free(attrs);
+    CHECK(nfsk_remove(v, empty, "CrossParent") == 0, "remove temporary cross-directory link");
+    for (int fault = 0; fault < 3; fault++) {
+        int called = 0, previous = injected_faults;
+        if (fault == 0) fail_open_mft = attr_first_ino;
+        if (fault == 1) fail_close_mft = attr_first_ino;
+        if (fault == 2) fail_attr_mft = attr_first_ino;
+        CHECK(nfsk_readdir_attributes(v, small, 0, &called, count_attributes) == -EIO && !called && injected_faults == previous + 1,
+              "child open, attribute read and close errors stop before publishing attributes");
+        if (fault == 1) CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0, "combined child close retains retry ownership and saved error");
+    }
+    int previous = injected_faults;
+    CHECK(nfsk_readdir_attributes(v, small, 0, &small, reject_with_close_failure) == -EIO && injected_faults == previous + 1,
+          "a rejected entry does not hide a later directory-close error");
+    CHECK(nfsk_sync(v) == -EIO && nfsk_sync(v) == 0, "directory close recovers after a stopped callback");
+    fail_close_mft = attr_first_ino;
+    CHECK(nfsk_getattr(v, attr_first_ino, &after_link) == -EIO && nfsk_sync(v) == -EIO && nfsk_sync(v) == 0,
+          "standalone getattr also reports failed close and retains recovery ownership");
     listing *list = new_listing(v, small);
     list->nested_directory = empty;
     CHECK(nfsk_readdir(v, small, 0, list, collect) == 0 && list->count == 11 && !list->invalid,
@@ -225,8 +637,10 @@ int main(int argc, char **argv) {
     free(list);
 
     list = new_listing(v, large);
+    conversion_calls = 0;
     CHECK(nfsk_readdir(v, large, 0, list, collect) == 0 && list->count == 320 && !list->invalid && allocation_entries > 0,
           "large-directory traversal covers index allocation blocks");
+    printf("DIRECTORY CONVERSION: %d upstream calls for 320 ASCII entries (including callback lookups)\n", conversion_calls);
     int correct_names = 1;
     for (int i = 0; i < 320; i++) {
         char name[64];
@@ -236,6 +650,7 @@ int main(int argc, char **argv) {
     CHECK(correct_names, "all large-directory names preserve stored spelling without omissions");
     listing *pages = new_listing(v, large);
     int rc = 0;
+    int page_index_calls = index_calls;
     for (int page = 0; page < 50; page++) {
         int before = pages->count;
         pages->limit = before + 7;
@@ -245,11 +660,74 @@ int main(int argc, char **argv) {
     CHECK(rc == 0 && pages->count == list->count && !pages->invalid &&
           !memcmp(pages->entries, list->entries, list->count * sizeof(record)),
           "seven-entry pages retry rejected entries with no duplicates, gaps, or cookie changes");
+    CHECK(index_calls - page_index_calls < 320 * 3,
+          "paged index traversal stays linear instead of rescanning every prefix");
+    CHECK(suffix_matches(v, large, 7), "evicted early cookie falls back without changing the listing");
+    prime_page(v, large);
+    CHECK(suffix_matches(v, large, 7) && suffix_matches(v, large, 7),
+          "repeated cached cookie retries the rejected entry consistently");
+    miss_checkpoint = 1;
+    CHECK(suffix_matches(v, large, 7), "missing cached key falls back to the original ordinal walk");
+    miss_checkpoint = 0;
+    prime_page(v, large);
+    fail_next_after = 0;
+    count = 0;
+    CHECK(nfsk_readdir(v, large, 8, &count, count_entry) == -EIO && count == 0,
+          "failure advancing a cached accepted entry is not reported as EOF");
+    fail_next_after = -1;
+    free(pages);
+    pages = new_listing(v, large);
+    for (int page = 0; page < 50; page++) {
+        int before = pages->count;
+        pages->limit = before + 7;
+        rc = nfsk_readdir(v, large, pages->cookie, pages, collect_then_stop);
+        if (rc || pages->count == before) break;
+        prime_page(v, small); /* Interleave another directory on the same volume. */
+    }
+    CHECK(rc == 0 && pages->count == list->count && !pages->invalid &&
+          !memcmp(pages->entries, list->entries, list->count * sizeof(record)),
+          "stop-after-accept and interleaved directories preserve all entries");
     count = 0;
     CHECK(nfsk_readdir(v, large, INT64_MAX, &count, count_entry) == 0 && count == 0,
           "cookie beyond EOF returns an empty listing");
     free(pages);
     free(list);
+
+    prime_page(v, large);
+    uint64_t added = nfsk_create(v, large, "AAA-before-page.txt", NFSK_TYPE_FILE, &error);
+    CHECK(added && suffix_matches(v, large, 7), "create before a page boundary invalidates its old position");
+    prime_page(v, large);
+    CHECK(nfsk_remove(v, large, "AAA-before-page.txt") == 0 && suffix_matches(v, large, 7),
+          "remove before a page boundary invalidates its old position");
+    prime_page(v, large);
+    CHECK(nfsk_rename(v, large, "Entry-0000-MiXeD.txt", large, "ZZZ-renamed.txt") == 0 &&
+          suffix_matches(v, large, 7), "rename across a page boundary keeps fresh-walk semantics");
+    require(nfsk_rename(v, large, "ZZZ-renamed.txt", large, "Entry-0000-MiXeD.txt") == 0, "restore renamed fixture");
+    uint64_t first_ino = lookup(v, large, "Entry-0000-MiXeD.txt");
+    prime_page(v, large);
+    CHECK(nfsk_link(v, first_ino, large, "AAA-link.txt", &error) == 0 && suffix_matches(v, large, 7),
+          "a new hard link invalidates ordinal checkpoints");
+    require(nfsk_remove(v, large, "AAA-link.txt") == 0, "remove temporary hard link");
+    prime_page(v, large);
+    fail_writes = 1;
+    int64_t failed_write = nfsk_write(v, first_ino, 0, "retry", 5, &error);
+    CHECK(failed_write < 0 && error == EIO, "write failure remains visible with a populated page cache");
+    fail_writes = 0;
+    (void)nfsk_sync(v);
+    CHECK(nfsk_sync(v) == 0 && suffix_matches(v, large, 7),
+          "failed-write recovery cannot reuse stale page positions");
+    listing *mutated = new_listing(v, large);
+    CHECK(nfsk_readdir(v, large, 0, mutated, mutate_then_stop) == 0 && mutated->count == 7 &&
+          suffix_matches(v, large, 7), "a callback mutation cannot publish a stale checkpoint afterwards");
+    free(mutated);
+    require(nfsk_remove(v, large, "AAA-callback.txt") == 0, "remove callback fixture");
+    prime_page(v, large);
+    fail_reads = 1;
+    count = 0;
+    CHECK(nfsk_readdir(v, large, 7, &count, count_entry) == -EIO && count == 0,
+          "cached resume still reports directory-open I/O failure");
+    fail_reads = 0;
+    CHECK(suffix_matches(v, large, 7), "cached resume recovers after directory-open failure");
 
     count = 0;
     fail_lookup = 1;

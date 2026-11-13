@@ -1,7 +1,7 @@
 import Foundation
 import FSKit
 
-struct MountedImage: Identifiable, Equatable {
+nonisolated struct MountedImage: Identifiable, Equatable, Sendable {
     let mountPoint: URL
     let source: URL
     let readOnly: Bool
@@ -10,9 +10,13 @@ struct MountedImage: Identifiable, Equatable {
 
     var id: String { "image:" + mountPoint.path }
     var name: String { mountPoint.lastPathComponent }
+
+    func isSameMount(as other: MountedImage) -> Bool {
+        mountPoint == other.mountPoint && source == other.source && fileSystemID == other.fileSystemID
+    }
 }
 
-enum ImageMountError: LocalizedError {
+nonisolated enum ImageMountError: LocalizedError {
     case unsupportedImage
     case extensionUnavailable
     case alreadyMounted
@@ -32,48 +36,127 @@ enum ImageMountError: LocalizedError {
     }
 }
 
+// Filesystem operations run on the preflight queue. Keep permission ownership
+// independent of the MainActor client so it survives cancellation and awaits.
+nonisolated struct ImageMountFileAccess: Sendable {
+    var start: @Sendable (URL) -> Bool
+    var stop: @Sendable (URL) -> Void
+    var scopedURL: @Sendable (URL, Bool) throws -> URL
+
+    static let live = Self(
+        start: { $0.startAccessingSecurityScopedResource() },
+        stop: { $0.stopAccessingSecurityScopedResource() },
+        scopedURL: { source, readOnly in
+            var options: URL.BookmarkCreationOptions = [.withSecurityScope]
+            if readOnly { options.insert(.securityScopeAllowOnlyReadAccess) }
+            let bookmark = try source.bookmarkData(options: options, includingResourceValuesForKeys: nil, relativeTo: nil)
+            var stale = false
+            return try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope],
+                           relativeTo: nil, bookmarkDataIsStale: &stale)
+        })
+}
+
+nonisolated private final class ImageMountScope: Sendable {
+    let url: URL
+    private let access: ImageMountFileAccess
+    private let acquired: Bool
+
+    init(_ url: URL, access: ImageMountFileAccess) {
+        self.url = url
+        self.access = access
+        acquired = access.start(url)
+    }
+
+    deinit { if acquired { access.stop(url) } }
+}
+
+@available(macOS 27.0, *)
+@MainActor
+struct ImageMountClient {
+    var images: () throws -> [MountedImage]
+    var enabled: () async throws -> Bool
+    var submit: (URL, Bool) async throws -> URL
+
+    static var live: Self {
+        Self(images: { try ImageMountService.queryMountedImages() }, enabled: {
+            try await FSClient.shared.installedExtensions.contains {
+                $0.bundleIdentifier == ExtensionStatus.bundleID && $0.isEnabled
+            }
+        }, submit: { url, readOnly in
+            // FSKit forwards this scope to the extension until unload.
+            let resource = FSPathURLResource(url: url, writable: !readOnly)
+            return try await FSClient.shared.mountSingleVolume(
+                resource: resource, bundleID: ExtensionStatus.bundleID,
+                options: ["-o", readOnly ? "rdonly" : "rw"])
+        })
+    }
+}
+
 @MainActor
 enum ImageMountService {
-    @available(macOS 27.0, *)
-    static func mount(_ source: URL, readOnly: Bool) async throws -> URL {
-        let access = source.startAccessingSecurityScopedResource()
-        defer { if access { source.stopAccessingSecurityScopedResource() } }
-        try validateImage(source)
-        let before = mountedImages()
-        let canonicalSource = source.resolvingSymlinksInPath().standardizedFileURL
-        guard !before.contains(where: { $0.source.resolvingSymlinksInPath().standardizedFileURL == canonicalSource }) else {
-            throw ImageMountError.alreadyMounted
+    private static var mounting = false
+    nonisolated private static let preflightQueue = DispatchQueue(label: "com.huanchuan.xntfs.image-preflight", qos: .userInitiated)
+
+    nonisolated private static func preflight<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            preflightQueue.async { continuation.resume(with: Result { try work() }) }
         }
-        let modules = try await FSClient.shared.installedExtensions
-        guard modules.contains(where: { $0.bundleIdentifier == ExtensionStatus.bundleID && $0.isEnabled }) else {
+    }
+
+    @available(macOS 27.0, *)
+    static func mount(_ source: URL, readOnly: Bool, client: ImageMountClient? = nil,
+                      fileAccess: ImageMountFileAccess = .live) async throws -> URL {
+        try Task.checkCancellation()
+        guard !mounting else { throw POSIXError(.EBUSY) }
+        mounting = true
+        defer { mounting = false }
+        let client = client ?? .live
+
+        let (sourceScope, canonicalSource) = try await preflight {
+            let scope = ImageMountScope(source, access: fileAccess)
+            return (scope, try validatedImageURL(source))
+        }
+        defer { withExtendedLifetime(sourceScope) {} }
+        try Task.checkCancellation()
+        // Take the cached snapshot after the potentially slow source read.
+        let before = try client.images()
+        if !before.isEmpty {
+            try await preflight {
+                guard !before.contains(where: { $0.source.resolvingSymlinksInPath().standardizedFileURL == canonicalSource }) else {
+                    throw ImageMountError.alreadyMounted
+                }
+            }
+        }
+        try Task.checkCancellation()
+        guard try await client.enabled() else {
             throw ImageMountError.extensionUnavailable
         }
-
-        // FSKit forwards this scope to the extension, which holds it until unload.
-        var options: URL.BookmarkCreationOptions = [.withSecurityScope]
-        if readOnly { options.insert(.securityScopeAllowOnlyReadAccess) }
-        let bookmark = try source.bookmarkData(options: options, includingResourceValuesForKeys: nil, relativeTo: nil)
-        var stale = false
-        let scoped = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope],
-                             relativeTo: nil, bookmarkDataIsStale: &stale)
-        let scopedAccess = scoped.startAccessingSecurityScopedResource()
-        defer { if scopedAccess { scoped.stopAccessingSecurityScopedResource() } }
-        let resource = FSPathURLResource(url: scoped, writable: !readOnly)
-        let mounted = try await FSClient.shared.mountSingleVolume(
-            resource: resource, bundleID: ExtensionStatus.bundleID,
-            options: ["-o", readOnly ? "rdonly" : "rw"])
+        try Task.checkCancellation()
+        let scoped = try await preflight {
+            ImageMountScope(try fileAccess.scopedURL(sourceScope.url, readOnly), access: fileAccess)
+        }
+        defer { withExtendedLifetime(scoped) {} }
+        try Task.checkCancellation()
+        // Once submitted, cancellation cannot undo a mount. Finish its reply and
+        // verify it rather than abandoning a potentially successful OS operation.
+        let mounted = try await client.submit(scoped.url, readOnly)
         guard !before.contains(where: { $0.mountPoint == mounted }) else {
             throw ImageMountError.alreadyMounted
         }
-        guard mountedImages().contains(where: { $0.mountPoint == mounted }) else {
+        guard try client.images().contains(where: { $0.mountPoint == mounted }) else {
             throw ImageMountError.unexpectedMount
         }
         return mounted
     }
 
-    static func validateImage(_ source: URL) throws {
-        guard source.isFileURL,
-              try source.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+    nonisolated static func validateImage(_ source: URL) throws {
+        _ = try validatedImageURL(source)
+    }
+
+    nonisolated private static func validatedImageURL(_ source: URL) throws -> URL {
+        guard source.isFileURL else { throw ImageMountError.unsupportedImage }
+        let canonical = source.resolvingSymlinksInPath().standardizedFileURL
+        guard try canonical.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
             throw ImageMountError.unsupportedImage
         }
         let file = try FileHandle(forReadingFrom: source)
@@ -83,25 +166,27 @@ enum ImageMountService {
               boot[510] == 0x55, boot[511] == 0xaa else {
             throw ImageMountError.unsupportedImage
         }
+        return canonical
     }
 
     // Path-backed FSKit mounts have no BSD disk and are absent from Disk Arbitration.
     // Read the mount table so they also survive app restarts and Finder unmounts.
     static func mountedImages() -> [MountedImage] {
-        var buffer: UnsafeMutablePointer<statfs>?
-        let count = getmntinfo_r_np(&buffer, MNT_NOWAIT)
-        guard count > 0, let buffer else { return [] }
-        defer { free(buffer) }
-        return (0..<Int(count)).compactMap { index in
-            var entry = buffer[index]
+        (try? queryMountedImages()) ?? []
+    }
+
+    static func queryMountedImages() throws -> [MountedImage] {
+        mountedImages(in: try DiskArbitrationMonitor.queryMountTable())
+    }
+
+    static func mountedImages(in entries: [statfs]) -> [MountedImage] {
+        entries.compactMap { entry in
             guard string(entry.f_fstypename) == DiskArbitrationMonitor.moduleFSType,
                   let source = URL(string: string(entry.f_mntfromname)), source.isFileURL else { return nil }
             let path = string(entry.f_mntonname)
-            // A new mount's cached block counts can still be zero with MNT_NOWAIT.
-            guard statfs(path, &entry) == 0,
-                  string(entry.f_fstypename) == DiskArbitrationMonitor.moduleFSType,
-                  URL(string: string(entry.f_mntfromname)) == source else { return nil }
-            return MountedImage(mountPoint: URL(fileURLWithPath: path),
+            // Cached capacity can initially be zero. Keep the mount visible;
+            // never fall back to blocking filesystem I/O for a display query.
+            return MountedImage(mountPoint: URL(fileURLWithPath: path, isDirectory: true),
                                 source: source,
                                 readOnly: entry.f_flags & UInt32(MNT_RDONLY) != 0,
                                 sizeBytes: entry.f_blocks * UInt64(entry.f_bsize),
@@ -110,7 +195,7 @@ enum ImageMountService {
     }
 
     static func unmount(_ image: MountedImage) async throws {
-        guard mountedImages().contains(image) else { return }
+        guard try queryMountedImages().contains(where: { $0.isSameMount(as: image) }) else { return }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             FileManager.default.unmountVolume(at: image.mountPoint, options: .withoutUI) { error in
                 if let error { continuation.resume(throwing: error) }

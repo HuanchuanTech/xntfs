@@ -2,8 +2,9 @@
 //  ntfs3gVolume.swift
 //  An FSVolume backed by an NTFS filesystem through libntfs-3g.
 //
-//  libntfs-3g is not thread-safe, so every bridge call runs inside `withLock`
-//  (a synchronous critical section — no `await` is held across the lock).
+//  After initialization, libntfs-3g runs on a dedicated serial I/O queue.
+//  FSKit's async callbacks suspend while it works; synchronous properties use
+//  a separate snapshot and never wait for disk I/O.
 //
 
 import FSKit
@@ -32,10 +33,40 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     private let activationBackend: ([String], Bool) throws -> NTFSBackend?
     private let onContainerStatusChange: (FSContainerStatus) -> Void
     private var tornDown = false
+    // Includes an old handle destroyed by a failed activation replacement.
+    private var teardownResult: Int32 = 0
     private var readOnly: Bool
     private var activated = false
     var diagnosticContext: [DiagnosticEvent.Field: String] = [:]
-    private let lock = NSLock()
+    // Drain autoreleased bridge/FSKit temporaries after each callback, even
+    // under a continuous backlog. Strong in-flight arguments/results remain owned.
+    private let ioQueue = DispatchQueue(label: "com.huanchuan.xntfs.volume.io", qos: .userInitiated,
+                                        autoreleaseFrequency: .workItem)
+    private let snapshotLock = NSLock()
+    private let writeAdmissionLock = NSLock()
+    // Protected by writeAdmissionLock: once final teardown is queued, later writes
+    // cannot reach a live handle. Do not retain them behind stalled earlier I/O.
+    private var retirementQueued = false
+    // Property readers need counters only; do not retain/copy the legacy
+    // 1024-byte name or mount-only serial under the snapshot lock.
+    private struct StatisticsSnapshot {
+        let cluster_size: UInt32
+        let total_clusters: UInt64
+        let free_clusters: UInt64
+        let total_files: UInt64
+        let free_files: UInt64
+        let read_only: UInt8
+
+        init(_ statistics: nfsk_statfs_counters_t) {
+            cluster_size = statistics.cluster_size
+            total_clusters = statistics.total_clusters
+            free_clusters = statistics.free_clusters
+            total_files = statistics.total_files
+            free_files = statistics.free_files
+            read_only = statistics.read_only
+        }
+    }
+    private var cachedStatistics: StatisticsSnapshot
     private var items: [UInt64: ntfs3gItem] = [:]
     private let rootItem: ntfs3gItem
     private let legacyOpenUnlink: Bool
@@ -57,17 +88,15 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
             nfsk_backend_free(backend.backend)
             throw posixError(err)
         }
-        var st = nfsk_statfs_t()
-        let statResult = nfsk_statfs(h, &st)
-        guard statResult == 0 else {
+        var st = nfsk_statfs_counters_t()
+        let statResult = nfsk_statfs_counters(h, &st)
+        guard statResult == 0, let cachedName = nfsk_volume_name(h) else {
             nfsk_umount(h)
             nfsk_backend_free(backend.backend)
             backend.cleanup()
             throw posixError(-statResult)
         }
-        let label = withUnsafeBytes(of: st.volume_name) { raw -> String in
-            String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
-        }
+        let label = String(cString: cachedName)
         let volName = label.isEmpty ? "NTFS" : label
         let totalBytes = st.total_clusters &* UInt64(st.cluster_size)
         let root = ntfs3gItem(ino: NFSK_ROOT_INO,
@@ -77,6 +106,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         self.handle = h
         self.backend = backend
         self.readOnly = st.read_only != 0
+        self.cachedStatistics = StatisticsSnapshot(st)
         self.activationBackend = activationBackend
         self.onContainerStatusChange = onContainerStatusChange
         self.rootItem = root
@@ -87,21 +117,91 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         self.items[NFSK_ROOT_INO] = root
     }
 
-    func teardown() {
-        withLock {
-            if tornDown { return }
+    @discardableResult
+    func teardown() async -> Int32 {
+        await withIO(retiring: true) { [self] in
+            if tornDown { return teardownResult }
             tornDown = true
-            if let h = handle { nfsk_umount(h); handle = nil }
+            if let h = handle { teardownResult = nfsk_umount(h); handle = nil }
             if let b = backend { nfsk_backend_free(b.backend); b.cleanup(); backend = nil }
             items.removeAll()
+            return teardownResult
         }
     }
 
-    // MARK: lock helper (synchronous critical section)
+    // MARK: serialized I/O and nonblocking property snapshots
+    // The work item retains each callback's arguments until it resumes the
+    // continuation. Cancellation must not release FSKit buffers or the backend
+    // while synchronous libntfs I/O is still running. Mutable volume state stays
+    // on this queue, except for the locked statistics snapshot and write admission.
     @discardableResult
-    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        lock.lock(); defer { lock.unlock() }
-        return try body()
+    private func withIO<T>(rejectAfterTeardown: Bool = false, _ body: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            if rejectAfterTeardown {
+                writeAdmissionLock.lock()
+                if retirementQueued {
+                    writeAdmissionLock.unlock()
+                    continuation.resume(throwing: posixError(EINVAL))
+                    return
+                }
+            }
+            ioQueue.async(execute: DispatchWorkItem { [self] in
+                let result = Result { try body() }
+                refreshStatistics()
+                continuation.resume(with: result)
+            })
+            if rejectAfterTeardown { writeAdmissionLock.unlock() }
+        }
+    }
+
+    @discardableResult
+    private func withIO<T>(retiring: Bool = false, _ body: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            if retiring {
+                writeAdmissionLock.lock()
+                retirementQueued = true
+            }
+            ioQueue.async(execute: DispatchWorkItem { [self] in
+                let result = body()
+                refreshStatistics()
+                continuation.resume(returning: result)
+            })
+            if retiring { writeAdmissionLock.unlock() }
+        }
+    }
+
+    private func refreshStatistics() {
+        dispatchPrecondition(condition: .onQueue(ioQueue))
+        var statistics = nfsk_statfs_counters_t()
+        statistics.read_only = readOnly ? 1 : 0
+        // Read in-memory counters and the cached serial without copying a name. Do this
+        // before taking snapshotLock; it must never protect a bridge operation.
+        if let h = handle { _ = nfsk_statfs_counters(h, &statistics) }
+        let snapshot = StatisticsSnapshot(statistics)
+        snapshotLock.lock()
+        cachedStatistics = snapshot
+        snapshotLock.unlock()
+    }
+
+    private func statisticsSnapshot() -> StatisticsSnapshot {
+        snapshotLock.lock()
+        defer { snapshotLock.unlock() }
+        return cachedStatistics
+    }
+
+    // FSKit accounts for returned items in its reply handler. Keep that handoff
+    // on the same queue as tryReclaim; resuming an async Swift function here
+    // would leave its eventual reply outside the synchronization boundary.
+    private func replyWithItem(_ reply: @escaping (FSItem?, FSFileName?, Error?) -> Void,
+                               _ body: @escaping () throws -> (FSItem, FSFileName)) {
+        ioQueue.async(execute: DispatchWorkItem { [self] in
+            let result = Result { try body() }
+            refreshStatistics()
+            switch result {
+            case .success(let (item, name)): reply(item, name, nil)
+            case .failure(let error): reply(nil, nil, error)
+            }
+        })
     }
 
     private func item(for ino: UInt64, parentIno: UInt64, name: FSFileName) -> ntfs3gItem {
@@ -141,15 +241,6 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         return attrs
     }
 
-    fileprivate func attributes(ino: UInt64, parentIno: UInt64) -> FSItem.Attributes? {
-        withLock {
-            guard let h = handle else { return nil }
-            var a = nfsk_attr_t()
-            if nfsk_getattr(h, ino, &a) != 0 { return nil }
-            return makeAttributes(a, parentIno: parentIno)
-        }
-    }
-
     // MARK: properties
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let caps = FSVolume.SupportedCapabilities()
@@ -169,21 +260,17 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         // volume's statfs f_fstypename reads "xntfs" — that is how the app tells our
         // mounts apart from the legacy system NTFS driver.
         let stats = FSStatFSResult(fileSystemTypeName: "xntfs")
-        return withLock {
-            guard let h = handle else { return stats }
-            var st = nfsk_statfs_t()
-            guard nfsk_statfs(h, &st) == 0 else { return stats }
-            let bs = Int(st.cluster_size == 0 ? 4096 : st.cluster_size)
-            stats.blockSize = bs
-            stats.ioSize = bs
-            stats.totalBlocks = st.total_clusters
-            stats.availableBlocks = st.free_clusters
-            stats.freeBlocks = st.free_clusters
-            stats.usedBlocks = st.total_clusters > st.free_clusters ? st.total_clusters - st.free_clusters : 0
-            stats.totalFiles = st.total_files
-            stats.freeFiles = st.free_files
-            return stats
-        }
+        let st = statisticsSnapshot()
+        let bs = Int(st.cluster_size == 0 ? 4096 : st.cluster_size)
+        stats.blockSize = bs
+        stats.ioSize = bs
+        stats.totalBlocks = st.total_clusters
+        stats.availableBlocks = st.free_clusters
+        stats.freeBlocks = st.free_clusters
+        stats.usedBlocks = st.total_clusters > st.free_clusters ? st.total_clusters - st.free_clusters : 0
+        stats.totalFiles = st.total_files
+        stats.freeFiles = st.free_files
+        return stats
     }
 
     // FSKit retains unlinked/overwritten open files until their last reference closes.
@@ -192,13 +279,13 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     @available(macOS 26.4, *)
     var requestedMountOptions: FSVolume.MountOptions {
-        get { withLock { readOnly ? [.readOnly] : [] } }
+        get { statisticsSnapshot().read_only != 0 ? [.readOnly] : [] }
         set { }
     }
 
     // MARK: lifecycle
-    private func withRecordedLock<T>(_ action: DiagnosticEvent.Action, _ body: () throws -> T) throws -> T {
-        try withLock {
+    private func withRecordedIO<T>(_ action: DiagnosticEvent.Action, _ body: @escaping () throws -> T) async throws -> T {
+        try await withIO { [self] in
             DiagnosticRecorder.shared.record(action, .started, fields: diagnosticContext)
             do {
                 let result = try body()
@@ -212,8 +299,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
 
-    func quickCheck() throws {
-        try withRecordedLock(.check) {
+    func quickCheck() async throws {
+        try await withRecordedIO(.check) { [self] in
             guard !tornDown, let backend, handle != nil else { throw posixError(ENXIO) }
             guard !activated, readOnly else { throw posixError(EBUSY) }
             var reason: Int32 = 0
@@ -236,37 +323,61 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func activate(options: FSTaskOptions) async throws -> FSItem {
-        try withRecordedLock(.activate) {
+        try await activate(mountOptions: options.taskOptions)
+    }
+
+    func activate(mountOptions: [String]) async throws -> FSItem {
+        try await withRecordedIO(.activate) { [self] in
             guard !tornDown, handle != nil else { throw posixError(ENXIO) }
             guard !activated else { throw posixError(EBUSY) }
             // Disk Arbitration supplies ro/rw here, after loadResource. Reopen before
             // exposing any items; loading metadata itself must never require writes.
-            if let replacement = try activationBackend(options.taskOptions, readOnly) {
-                if let h = handle { nfsk_umount(h); handle = nil }
+            if let replacement = try activationBackend(mountOptions, readOnly) {
+                let closeResult = handle.map { nfsk_umount($0) } ?? 0
+                handle = nil
                 if let b = backend { nfsk_backend_free(b.backend); b.cleanup() }
+                backend = nil
+                guard closeResult == 0 else {
+                    teardownResult = closeResult
+                    nfsk_backend_free(replacement.backend)
+                    replacement.cleanup()
+                    throw posixError(-closeResult)
+                }
                 backend = replacement
                 readOnly = !replacement.writable
                 var err: Int32 = 0
                 guard let h = nfsk_mount(replacement.backend, readOnly, &err) else { throw posixError(err) }
                 handle = h
-                var st = nfsk_statfs_t()
-                let rc = nfsk_statfs(h, &st)
+                var st = nfsk_statfs_counters_t()
+                let rc = nfsk_statfs_counters(h, &st)
                 guard rc == 0 else { throw posixError(-rc) }
                 readOnly = st.read_only != 0
             }
             activated = true
+            // Publish on the same queue as deactivate, after the mount-option
+            // snapshot is ready. Async continuation scheduling must not reorder
+            // the container's active/ready notifications.
+            refreshStatistics()
+            onContainerStatusChange(.active)
+            return rootItem
         }
-        onContainerStatusChange(.active)
-        return rootItem
     }
 
     func deactivate(options: FSDeactivateOptions = []) async throws {
-        withLock { activated = false }
-        onContainerStatusChange(.ready)
+        await withIO { [self] in
+            guard !tornDown else { return }
+            activated = false
+            onContainerStatusChange(.ready)
+        }
     }
 
     func mount(options: FSTaskOptions) async throws {
-        try withRecordedLock(.mount) {
+        try await mount()
+    }
+
+    func mount() async throws {
+        try await withRecordedIO(.mount) { [self] in
+            guard !tornDown, handle != nil else { throw posixError(ENXIO) }
             // Older FSKit cannot request MNT_RDONLY after a writable activation.
             // Require an explicit read-only retry instead of exposing a writable mount.
             if #unavailable(macOS 26.4), readOnly && backend?.writable == true {
@@ -275,9 +386,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
     func unmount() async {
-        withLock {
-            guard let h = handle else { return }
-            let rc = nfsk_sync(h)
+        await withIO { [self] in
+            let rc = synchronizeOnQueue()
             if rc != 0 {
                 DiagnosticRecorder.shared.record(.unmount, .failed, fields: diagnosticContext, error: posixError(-rc))
                 NSLog("[xntfs] flush on unmount failed: errno \(-rc)")
@@ -286,9 +396,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func synchronize(flags: FSSyncFlags) async throws {
-        try withLock {
-            guard let h = handle else { return }
-            let rc = nfsk_sync(h)
+        try await withIO { [self] in
+            let rc = synchronizeOnQueue()
             if rc != 0 {
                 DiagnosticRecorder.shared.record(.sync, .failed, fields: diagnosticContext, error: posixError(-rc))
                 throw posixError(-rc)
@@ -296,9 +405,18 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         }
     }
 
+    private func synchronizeOnQueue() -> Int32 {
+        dispatchPrecondition(condition: .onQueue(ioQueue))
+        if let h = handle { return nfsk_sync(h) }
+        // Queued or repeated sync must not turn failed destruction into success.
+        if teardownResult != 0 { return teardownResult }
+        // Successful retirement is idempotent; an incomplete activation is not.
+        return tornDown ? 0 : -ENXIO
+    }
+
     // MARK: attributes
     func attributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem) async throws -> FSItem.Attributes {
-        try withLock {
+        try await withIO { [self] in
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
             var a = nfsk_attr_t()
             let rc = nfsk_getattr(h, it.ino, &a)
@@ -308,15 +426,21 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem) async throws -> FSItem.Attributes {
-        try withLock {
+        try await withIO { [self] in
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
             return try applyAttributes(newAttributes, ino: it.ino, parent: it.parentIno, handle: h)
         }
     }
 
+    private func sizeRequest(_ request: FSItem.SetAttributesRequest, type: UInt32) throws -> UInt64? {
+        // FSKit requires sizes on directories and symbolic links to be ignored.
+        guard request.isValid(.size), type != UInt32(NFSK_TYPE_DIR), type != UInt32(NFSK_TYPE_SYMLINK) else { return nil }
+        guard request.size <= UInt64(Int64.max) else { throw posixError(EFBIG) }
+        return request.size
+    }
+
     private func metadataRequest(_ request: FSItem.SetAttributesRequest) throws -> nfsk_metadata_t {
-        guard !request.isValid(.backupTime) else { throw posixError(ENOTSUP) }
-        if request.isValid(.size), request.size > UInt64(Int64.max) { throw posixError(EFBIG) }
+        // Unsupported optional fields such as backupTime stay unconsumed.
         var metadata = nfsk_metadata_t()
         if request.isValid(.modifyTime) {
             metadata.valid |= UInt32(NFSK_SET_MTIME)
@@ -342,7 +466,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         return metadata
     }
 
-    // Called with the volume lock held, including while initializing a new item.
+    // Called on ioQueue, including while initializing a new item.
     private func applyAttributes(_ request: FSItem.SetAttributesRequest, ino: UInt64,
                                  parent: UInt64, handle: OpaquePointer) throws -> FSItem.Attributes {
         guard !readOnly else { throw posixError(EROFS) }
@@ -353,11 +477,11 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
         request.consumedAttributes = []
         // Preserve the existing ignored-ownership policy: mode/uid/gid remain
         // unconsumed. Rejecting them here also rejects otherwise valid copy metadata.
-        if request.isValid(.size) {
+        if let size = try sizeRequest(request, type: attributes.type) {
             if attributes.type == UInt32(NFSK_TYPE_FILE) {
-                let rc = nfsk_truncate(handle, ino, request.size)
+                let rc = nfsk_truncate(handle, ino, size)
                 if rc != 0 { throw posixError(-rc) }
-            } else if request.size != attributes.size { throw posixError(EINVAL) }
+            } else if size != attributes.size { throw posixError(EINVAL) }
             request.consumedAttributes.insert(.size)
         }
         if metadata.valid != 0 {
@@ -373,35 +497,38 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     // MARK: lookup / reclaim
+    // FSFileName.string consumes a leading BOM; basenames use the raw UTF8 bytes.
     private func resolvedName(_ name: String, in directory: UInt64, handle: OpaquePointer) throws -> (UInt64, FSFileName) {
         var error: Int32 = 0
-        var canonical = [CChar](repeating: 0, count: 1024)
+        var canonical: UnsafeMutablePointer<CChar>?
+        defer { free(canonical) }
         let ino = name.withCString { requested in
-            canonical.withUnsafeMutableBufferPointer { buffer in
-                nfsk_lookup_name(handle, directory, requested, buffer.baseAddress, buffer.count, &error)
-            }
+            nfsk_lookup_name_alloc(handle, directory, requested, &canonical, &error)
         }
         guard ino != 0 else { throw posixError(error == 0 ? ENOENT : error) }
+        guard let canonical else { throw posixError(EIO) }
         return (ino, FSFileName(string: String(cString: canonical)))
     }
 
-    func lookupItem(named name: FSFileName, inDirectory directory: FSItem) async throws -> (FSItem, FSFileName) {
-        try withLock {
-            guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
+    func lookupItem(named name: FSFileName, inDirectory directory: FSItem,
+                    replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        replyWithItem(replyHandler) { [self] in
+            guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = String(validating: name.data, as: UTF8.self) else { throw posixError(EINVAL) }
             let (ino, fsName) = try resolvedName(nameStr, in: dir.ino, handle: h)
             return (item(for: ino, parentIno: dir.ino, name: fsName), fsName)
         }
     }
 
     func reclaimItem(_ item: FSItem) async throws {
-        try withLock {
+        try await withIO { [self] in
             guard let it = item as? ntfs3gItem else { return }
             guard it.ino != NFSK_ROOT_INO else { return }
-            if legacyOpenUnlink, items[it.ino] === it, let handle {
-                let rc = nfsk_close_item(handle, it.ino)
-                if rc != 0 { throw posixError(-rc) }
-            }
+            var reclaimError: Error?
             let removeCachedItem = {
+                if self.items[it.ino] === it, let handle = self.handle {
+                    let rc = nfsk_close_item(handle, it.ino)
+                    if rc != 0 { reclaimError = posixError(-rc) }
+                }
                 if self.items[it.ino] === it { self.items.removeValue(forKey: it.ino) }
             }
             if #available(macOS 27.0, *) {
@@ -409,6 +536,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
             } else {
                 removeCachedItem()
             }
+            if let reclaimError { throw reclaimError }
         }
     }
 
@@ -423,23 +551,27 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func readSymbolicLink(_ item: FSItem) async throws -> FSFileName {
-        try withLock {
+        try await withIO { [self] in
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
-            var buf = [CChar](repeating: 0, count: 4096)
-            let rc = buf.withUnsafeMutableBufferPointer { nfsk_readlink(h, it.ino, $0.baseAddress, $0.count) }
+            var target: UnsafeMutablePointer<CChar>?
+            defer { free(target) }
+            let rc = nfsk_readlink_alloc(h, it.ino, &target, 4096)
             if rc != 0 { throw posixError(-rc) }
-            return FSFileName(string: String(cString: buf))
+            guard let target else { throw posixError(EIO) }
+            return FSFileName(string: String(cString: target))
         }
     }
 
     // MARK: create / remove / rename
     func createItem(named name: FSFileName, type: FSItem.ItemType, inDirectory directory: FSItem,
-                    attributes newAttributes: FSItem.SetAttributesRequest) async throws -> (FSItem, FSFileName) {
-        try withLock {
-            guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
+                    attributes newAttributes: FSItem.SetAttributesRequest,
+                    replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        replyWithItem(replyHandler) { [self] in
+            guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = String(validating: name.data, as: UTF8.self) else { throw posixError(EINVAL) }
             guard type == .file || type == .directory else { throw posixError(ENOTSUP) }
             _ = try metadataRequest(newAttributes)
             let kind = UInt32(type == .directory ? NFSK_TYPE_DIR : NFSK_TYPE_FILE)
+            _ = try sizeRequest(newAttributes, type: kind)
             var err: Int32 = 0
             let ino = nameStr.withCString { nfsk_create(h, dir.ino, $0, kind, &err) }
             if ino == 0 { throw posixError(err) }
@@ -457,10 +589,12 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     func createSymbolicLink(named name: FSFileName, inDirectory directory: FSItem,
                             attributes newAttributes: FSItem.SetAttributesRequest,
-                            linkContents contents: FSFileName) async throws -> (FSItem, FSFileName) {
-        try withLock {
+                            linkContents contents: FSFileName,
+                            replyHandler: @escaping (FSItem?, FSFileName?, Error?) -> Void) {
+        replyWithItem(replyHandler) { [self] in
             guard let dir = directory as? ntfs3gItem, let h = handle,
-                  let nameStr = name.string, let target = contents.string,
+                  let nameStr = String(validating: name.data, as: UTF8.self),
+                  let target = String(validating: contents.data, as: UTF8.self),
                   !nameStr.utf8.contains(0), !target.utf8.contains(0) else { throw posixError(EINVAL) }
             _ = try metadataRequest(newAttributes)
             var error: Int32 = 0
@@ -481,9 +615,9 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func createLink(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem) async throws -> FSFileName {
-        try withLock {
+        try await withIO { [self] in
             guard let target = item as? ntfs3gItem, let dir = directory as? ntfs3gItem,
-                  let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
+                  let h = handle, let nameStr = String(validating: name.data, as: UTF8.self) else { throw posixError(EINVAL) }
             var err: Int32 = 0
             let rc = nameStr.withCString { nfsk_link(h, target.ino, dir.ino, $0, &err) }
             if rc != 0 { throw posixError(err) }
@@ -492,8 +626,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func removeItem(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem) async throws {
-        try withLock {
-            guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = name.string else { throw posixError(EINVAL) }
+        try await withIO { [self] in
+            guard let dir = directory as? ntfs3gItem, let h = handle, let nameStr = String(validating: name.data, as: UTF8.self) else { throw posixError(EINVAL) }
             let rc = nameStr.withCString { nfsk_remove(h, dir.ino, $0) }
             if rc != 0 { throw posixError(-rc) }
             evictDeletedItem(item, handle: h)
@@ -503,9 +637,10 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName,
                     to destinationName: FSFileName, inDirectory destinationDirectory: FSItem,
                     overItem: FSItem?) async throws -> FSFileName {
-        try withLock {
+        try await withIO { [self] in
             guard let sdir = sourceDirectory as? ntfs3gItem, let ddir = destinationDirectory as? ntfs3gItem,
-                  let h = handle, let src = sourceName.string, let dst = destinationName.string else { throw posixError(EINVAL) }
+                  let h = handle, let src = String(validating: sourceName.data, as: UTF8.self),
+                  let dst = String(validating: destinationName.data, as: UTF8.self) else { throw posixError(EINVAL) }
             let rc = src.withCString { sp in dst.withCString { dp in nfsk_rename(h, sdir.ino, sp, ddir.ino, dp) } }
             if rc != 0 { throw posixError(-rc) }
             if let overItem { evictDeletedItem(overItem, handle: h) }
@@ -521,11 +656,12 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     // MARK: enumeration
     func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier,
                             attributes: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker) async throws -> FSDirectoryVerifier {
-        try withLock {
+        try await withIO { [self] in
             guard let dir = directory as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
             let wantDots = (attributes == nil)
             let c = cookie.rawValue
-            let ctx = EnumContext(volume: self, packer: packer, parentIno: dir.ino, wantAttributes: attributes != nil)
+            guard c <= UInt64(Int64.max) + 2 else { throw posixError(EINVAL) }
+            let ctx = EnumContext(volume: self, packer: packer, parentIno: dir.ino)
 
             if wantDots {
                 if c < 1 {
@@ -534,15 +670,20 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
                     }
                 }
                 if c < 2 {
-                    if !ctx.packRaw(name: "..", ino: dir.ino, type: UInt32(NFSK_TYPE_DIR), nextCookie: 2) {
+                    let parent = dir.ino == NFSK_ROOT_INO ? dir.ino : dir.parentIno
+                    if !ctx.packRaw(name: "..", ino: parent, type: UInt32(NFSK_TYPE_DIR), nextCookie: 2) {
                         return FSDirectoryVerifier(rawValue: 1)
                     }
                 }
             }
             let realSkip: Int64 = c <= 2 ? 0 : Int64(c - 2)
             let ctxPtr = Unmanaged.passUnretained(ctx).toOpaque()
-            let rc = nfsk_readdir(h, dir.ino, realSkip, ctxPtr, enumTrampoline)
-            if rc != 0 && !ctx.stopped { throw posixError(-rc) }
+            let rc = attributes == nil
+                ? nfsk_readdir(h, dir.ino, realSkip, ctxPtr, enumTrampoline)
+                : nfsk_readdir_attributes(h, dir.ino, realSkip, ctxPtr, enumAttributesTrampoline)
+            // A full packer is a normal C callback stop (rc == 0). A later
+            // directory-close error must still reach FSKit.
+            if rc != 0 { throw posixError(-rc) }
             return FSDirectoryVerifier(rawValue: 1)
         }
     }
@@ -560,26 +701,31 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     // MARK: Extended attributes
     func xattr(named name: FSFileName, of item: FSItem) async throws -> Data {
-        try withLock {
+        try await withIO { [self] in
+            // Foundation's string conversion consumes a leading BOM; xattr
+            // names use the exact bytes supplied by FSKit.
             guard let it = item as? ntfs3gItem, let h = handle,
-                  let key = name.string, !key.utf8.contains(0) else { throw posixError(EINVAL) }
+                  let key = String(validating: name.data, as: UTF8.self), !key.utf8.contains(0) else { throw posixError(EINVAL) }
             return try key.withCString { key in
-                let size = nfsk_getxattr(h, it.ino, key, nil, 0)
+                var buffer: UnsafeMutableRawPointer?
+                let size = nfsk_getxattr_alloc(h, it.ino, key, &buffer)
                 if size < 0 { throw posixError(Int32(-size)) }
-                var data = Data(count: Int(size))
-                let read = data.withUnsafeMutableBytes { nfsk_getxattr(h, it.ino, key, $0.baseAddress, $0.count) }
-                if read < 0 { throw posixError(Int32(-read)) }
-                guard read == size else { throw posixError(EIO) }
-                return data
+                guard let buffer else {
+                    guard size == 0 else { throw posixError(EIO) }
+                    return Data()
+                }
+                // The bridge closes libntfs objects before handing off this
+                // allocation. Data owns it across continuation/FSKit replies.
+                return Data(bytesNoCopy: buffer, count: Int(size), deallocator: .free)
             }
         }
     }
 
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem,
                   policy: FSVolume.SetXattrPolicy) async throws {
-        try withLock {
+        try await withIO(rejectAfterTeardown: true) { [self] in
             guard let it = item as? ntfs3gItem, let h = handle,
-                  let key = name.string, !key.utf8.contains(0) else { throw posixError(EINVAL) }
+                  let key = String(validating: name.data, as: UTF8.self), !key.utf8.contains(0) else { throw posixError(EINVAL) }
             let bridgePolicy: Int32
             switch policy {
             case .alwaysSet: bridgePolicy = Int32(NFSK_XATTR_SET)
@@ -598,17 +744,17 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func xattrs(of item: FSItem) async throws -> [FSFileName] {
-        try withLock {
+        try await withIO { [self] in
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
-            let size = nfsk_listxattr(h, it.ino, nil, 0)
+            var buffer: UnsafeMutablePointer<CChar>?
+            let size = nfsk_listxattr_alloc(h, it.ino, &buffer)
             if size < 0 { throw posixError(Int32(-size)) }
+            defer { free(buffer) }
             if size == 0 { return [] }
-            var bytes = [CChar](repeating: 0, count: Int(size))
-            let read = bytes.withUnsafeMutableBufferPointer { nfsk_listxattr(h, it.ino, $0.baseAddress, $0.count) }
-            if read < 0 { throw posixError(Int32(-read)) }
-            guard read == size else { throw posixError(EIO) }
+            guard let buffer else { throw posixError(EIO) }
+            let bytes = UnsafeRawBufferPointer(start: buffer, count: Int(size))
             return try bytes.split(separator: 0).map { name in
-                guard let string = String(bytes: name.map { UInt8(bitPattern: $0) }, encoding: .utf8) else {
+                guard let string = String(validating: name, as: UTF8.self) else {
                     throw posixError(EIO)
                 }
                 return FSFileName(string: string)
@@ -618,7 +764,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     // MARK: ReadWrite
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> Int {
-        try withLock {
+        try await withIO { [self] in
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
             let cap = min(length, buffer.length)
             var err: Int32 = 0
@@ -631,7 +777,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> Int {
-        try withLock {
+        try await withIO(rejectAfterTeardown: true) { [self] in
             guard let it = item as? ntfs3gItem, let h = handle else { throw posixError(EINVAL) }
             var err: Int32 = 0
             let n = contents.withUnsafeBytes { raw in
@@ -644,8 +790,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     // MARK: Volume name / preallocation
     func setVolumeName(_ name: FSFileName) async throws -> FSFileName {
-        try withLock {
-            guard let h = handle, let label = name.string, !label.utf8.contains(0) else { throw posixError(EINVAL) }
+        try await withIO { [self] in
+            guard let h = handle, let label = String(validating: name.data, as: UTF8.self), !label.utf8.contains(0) else { throw posixError(EINVAL) }
             let rc = label.withCString { nfsk_rename_volume(h, $0) }
             if rc != 0 { throw posixError(-rc) }
             self.name = name
@@ -656,7 +802,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     func preallocateSpace(for item: FSItem, at offset: off_t, length: Int,
                           flags: FSVolume.PreallocateFlags) async throws -> Int {
-        try withLock {
+        try await withIO { [self] in
             guard let h = handle, let item = item as? ntfs3gItem else { throw posixError(EINVAL) }
             guard !readOnly else { throw posixError(EROFS) }
             let supported: FSVolume.PreallocateFlags = [.all, .persist, .fromEOF]
@@ -669,9 +815,14 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 
     // MARK: OpenClose
     func openItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
-        try withLock {
+        try await withIO { [self] in
             guard let h = handle, let it = item as? ntfs3gItem else { throw posixError(EINVAL) }
             if readOnly && modes.contains(.write) { throw posixError(EROFS) }
+            if modes.contains(.write) {
+                // Reject before the kernel can cache bytes from a failed write.
+                let rc = nfsk_check_write_access(h, it.ino)
+                if rc != 0 { throw posixError(-rc) }
+            }
             guard legacyOpenUnlink else { return }
             let rc = nfsk_open_item(h, it.ino)
             if rc != 0 { throw posixError(-rc) }
@@ -679,8 +830,8 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
     }
 
     func closeItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
-        guard legacyOpenUnlink, modes.isEmpty else { return }
-        try withLock {
+        guard modes.isEmpty else { return }
+        try await withIO { [self] in
             guard let h = handle, let it = item as? ntfs3gItem else { throw posixError(EINVAL) }
             guard items[it.ino] === it else { return }
             let rc = nfsk_close_item(h, it.ino)
@@ -694,7 +845,7 @@ final class ntfs3gVolume: FSVolume, FSVolume.Operations, FSVolume.PathConfOperat
 extension ntfs3gVolume: FSVolume.SeekRegionHandler {
     func seek(within item: FSItem, from offset: off_t, region: FSVolume.SeekRegion,
               context: FSContext) async throws -> FSSeekRegionResult {
-        try withLock {
+        try await withIO { [self] in
             guard let h = handle, let it = item as? ntfs3gItem else { throw posixError(EINVAL) }
             guard region == .data || region == .hole else { throw posixError(EINVAL) }
             var result: Int64 = 0
@@ -712,14 +863,11 @@ final class EnumContext {
     unowned let volume: ntfs3gVolume
     let packer: FSDirectoryEntryPacker
     let parentIno: UInt64
-    let wantAttributes: Bool
-    var stopped = false
 
-    init(volume: ntfs3gVolume, packer: FSDirectoryEntryPacker, parentIno: UInt64, wantAttributes: Bool) {
+    init(volume: ntfs3gVolume, packer: FSDirectoryEntryPacker, parentIno: UInt64) {
         self.volume = volume
         self.packer = packer
         self.parentIno = parentIno
-        self.wantAttributes = wantAttributes
     }
 
     func packRaw(name: String, ino: UInt64, type: UInt32, nextCookie: UInt64) -> Bool {
@@ -727,34 +875,16 @@ final class EnumContext {
         let ok = packer.packEntry(name: FSFileName(string: name), itemType: itemType,
                                   itemID: FSItem.Identifier(rawValue: ino) ?? .invalid,
                                   nextCookie: FSDirectoryCookie(rawValue: nextCookie), attributes: nil)
-        if !ok { stopped = true }
         return ok
     }
 
-    func pack(name: String, ino: UInt64, type: UInt32, bridgeCookie: Int64) -> Bool {
+    func pack(name: String, ino: UInt64, type: UInt32, bridgeCookie: Int64, attributes: FSItem.Attributes? = nil) -> Bool {
         let itemType = FSItem.ItemType(rawValue: Int(type)) ?? .file
-        var attrs: FSItem.Attributes? = nil
-        if wantAttributes {
-            attrs = volume.enumAttributesRaw(ino: ino, parentIno: parentIno)
-        }
         let next = UInt64(bridgeCookie) + 2
         let ok = packer.packEntry(name: FSFileName(string: name), itemType: itemType,
                                   itemID: FSItem.Identifier(rawValue: ino) ?? .invalid,
-                                  nextCookie: FSDirectoryCookie(rawValue: next), attributes: attrs)
-        if !ok { stopped = true }
+                                  nextCookie: FSDirectoryCookie(rawValue: next), attributes: attributes)
         return ok
-    }
-}
-
-@available(macOS 15.4, *)
-extension ntfs3gVolume {
-    // Called from the readdir trampoline while the lock is already held, so it
-    // must NOT re-take the lock; access the bridge directly.
-    fileprivate func enumAttributesRaw(ino: UInt64, parentIno: UInt64) -> FSItem.Attributes? {
-        guard let h = handle else { return nil }
-        var a = nfsk_attr_t()
-        if nfsk_getattr(h, ino, &a) != 0 { return nil }
-        return makeAttributes(a, parentIno: parentIno, preferContext: true)
     }
 }
 
@@ -766,6 +896,18 @@ let enumTrampoline: @convention(c)
         let ctx = Unmanaged<EnumContext>.fromOpaque(ctxPtr).takeUnretainedValue()
         let cont = ctx.pack(name: String(cString: namePtr), ino: ino, type: type, bridgeCookie: cookie)
         return cont ? 0 : 1
+    }
+
+@available(macOS 15.4, *)
+let enumAttributesTrampoline: @convention(c)
+    (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<nfsk_attr_t>?, Int64) -> Int32 = {
+        ctxPtr, namePtr, attributesPtr, cookie in
+        guard let ctxPtr, let namePtr, let attributesPtr else { return 1 }
+        let ctx = Unmanaged<EnumContext>.fromOpaque(ctxPtr).takeUnretainedValue()
+        let attributes = attributesPtr.pointee
+        let result = ctx.volume.makeAttributes(attributes, parentIno: ctx.parentIno, preferContext: true)
+        return ctx.pack(name: String(cString: namePtr), ino: attributes.ino, type: attributes.type,
+                        bridgeCookie: cookie, attributes: result) ? 0 : 1
     }
 
 // MARK: - Shared helpers

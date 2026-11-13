@@ -84,14 +84,51 @@ nonisolated struct DiagnosticSnapshot: Codable, Sendable {
 }
 
 extension DiagnosticSnapshot {
+    @MainActor private static var activeCaptures = 0
+    private static let maximumActiveCaptures = 4
+
     @MainActor
-    static func capture(model: AppModel) async -> DiagnosticSnapshot {
+    static func capture(model: AppModel) async throws -> DiagnosticSnapshot {
+        try Task.checkCancellation()
+        // Bound the entire capture, including its extension-query prefix, across
+        // all models. No waiting list or shared/stale snapshot for excess callers.
+        guard activeCaptures < maximumActiveCaptures else { throw POSIXError(.EBUSY) }
+        activeCaptures += 1
+        // Cancellation cannot release capacity while a producer still owns work.
+        defer { activeCaptures -= 1 }
         let status = ExtensionStatus()
         await status.refresh()
+        try Task.checkCancellation()
         // The ordinary UI refresh is fire-and-forget. Await a separate read-only
         // observation so the snapshot does not capture the previous UI state.
-        let currentDevices = await model.devicesForDiagnostics()
-        let currentImages = ImageMountService.mountedImages()
+        var errors = DiagnosticError.chain(status.queryError)
+        let currentDevices: [NTFSDevice]
+        do {
+            let observation = try await model.devicesForDiagnostics()
+            currentDevices = observation.devices
+            if !observation.isComplete {
+                // One bounded marker for insufficient evidence, not a claimed I/O errno.
+                errors.append(DiagnosticError(NSError(
+                    domain: "com.huanchuan.xntfs.deviceObservation.incomplete", code: 1)))
+            }
+        } catch let error as CancellationError {
+            throw error
+        } catch {
+            // Preserve partial-snapshot evidence without presenting old UI state
+            // as a fresh observation. The error chain exports numeric codes only.
+            currentDevices = []
+            errors += DiagnosticError.chain(NSError(domain: "com.huanchuan.xntfs.deviceObservation",
+                code: (error as NSError).code, userInfo: [NSUnderlyingErrorKey: error]))
+        }
+        try Task.checkCancellation()
+        let currentImages: [MountedImage]
+        do {
+            currentImages = try ImageMountService.queryMountedImages()
+        } catch {
+            currentImages = []
+            errors += DiagnosticError.chain(NSError(domain: "com.huanchuan.xntfs.imageObservation",
+                code: (error as NSError).code, userInfo: [NSUnderlyingErrorKey: error]))
+        }
         // Copy current state before yielding to the recorder. Historical events keep
         // their own timestamps; a refresh must not rewrite a failed attempt's facts.
         let capturedAt = Date()
@@ -108,10 +145,11 @@ extension DiagnosticSnapshot {
         let state = String(describing: status.state)
         let count = ExtensionStatus.needsLegacyCompatibility || status.queryError != nil ? nil : status.installedCount
         let locations = status.moduleURLs.map(location)
-        let errors = DiagnosticError.chain(status.queryError)
         let deviceRO = model.settings.deviceReadOnly
         let imageRO = model.settings.imageReadOnly
+        try Task.checkCancellation()
         let history = await DiagnosticRecorder.shared.snapshot()
+        try Task.checkCancellation()
         #if arch(arm64)
         let architecture = "arm64"
         #else
@@ -146,6 +184,7 @@ extension NTFSDevice {
     }
     var diagnosticFields: [DiagnosticEvent.Field: String] {
         [.device: id, .kind: diagnosticKind, .state: diagnosticState, .driver: diagnosticDriver,
-         .effectiveReadOnly: String(readOnly), .mediaWritable: String(mediaWritable)]
+         .effectiveReadOnly: mountDriver == .unknown ? "unknown" : String(readOnly),
+         .mediaWritable: String(mediaWritable)]
     }
 }

@@ -1,6 +1,81 @@
 import Foundation
 import CryptoKit
 
+// Opt-in fixture seeded by the release-guard preparation step, never user media.
+func checkCompressedWriteGuard(_ volume: URL, writable: Bool) throws {
+    let file = volume.appendingPathComponent("xntfs-guard-compressed.bin")
+    let empty = volume.appendingPathComponent("xntfs-guard-empty.bin")
+    let original = Data(repeating: 67, count: 66236)
+    let originalXattr = Data("preserved compressed xattr\n".utf8)
+    let key = "com.apple.testCompressed"
+    func failed(_ message: String) -> NSError {
+        NSError(domain: "CompressedGuard", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: message])
+    }
+    func rejected(_ operation: String, _ result: Int, _ expected: Int32) throws {
+        let error = errno
+        print("COMPRESSED GUARD \(operation): result=\(result) errno=\(error)")
+        guard result == -1, error == expected else { throw failed("\(operation): result=\(result) errno=\(error), expected=\(expected)") }
+    }
+    func preserved(_ phase: String) throws {
+        var sidecar = stat()
+        let result = lstat(volume.appendingPathComponent("._" + file.lastPathComponent).path, &sidecar)
+        guard result == -1, errno == ENOENT else { throw failed("\(phase): unexpected AppleDouble sidecar, result=\(result), errno=\(errno)") }
+        let current = try Data(contentsOf: file)
+        let difference = zip(current, original).enumerated().first { $0.element.0 != $0.element.1 }?.offset
+        print("COMPRESSED GUARD \(phase): size=\(current.count), firstDifference=\(String(describing: difference))")
+        guard current == original else { throw failed("\(phase): compressed file bytes changed, size=\(current.count), prefix=\(current.prefix(16).map { String(format: "%02x", $0) }.joined())") }
+        var value = Data(count: originalXattr.count)
+        let count = value.withUnsafeMutableBytes { getxattr(file.path, key, $0.baseAddress, $0.count, 0, 0) }
+        guard count == originalXattr.count, value == originalXattr else { throw failed("\(phase): xattr count=\(count), expected=\(originalXattr.count), errno=\(errno)") }
+    }
+    try preserved("before")
+    guard try Data(contentsOf: empty).isEmpty else { throw failed("compressed empty fixture changed") }
+    if writable {
+        for flags in [O_WRONLY, O_RDWR, O_WRONLY | O_APPEND, O_WRONLY | O_TRUNC, O_WRONLY | O_CREAT] {
+            let opened = open(file.path, flags, mode_t(0600))
+            if opened >= 0 { close(opened) }
+            try rejected("writable open flags=\(flags)", Int(opened), ENOTSUP)
+            try preserved("after-open-\(flags)")
+        }
+        let emptyOpen = open(empty.path, O_RDWR)
+        if emptyOpen >= 0 { close(emptyOpen) }
+        try rejected("empty writable open", Int(emptyOpen), ENOTSUP)
+        // Creation may leave an empty inode when its subsequent open is denied.
+        // It must never hand out a writable descriptor for inherited compression.
+        let inherited = volume.appendingPathComponent("xntfs-guard-directory/new-file.bin")
+        let created = open(inherited.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0600))
+        if created >= 0 { close(created) }
+        try rejected("inherited compressed create/open", Int(created), ENOTSUP)
+        if FileManager.default.fileExists(atPath: inherited.path) {
+            guard try Data(contentsOf: inherited).isEmpty else { throw failed("inherited file is not empty") }
+            try FileManager.default.removeItem(at: inherited)
+        }
+        for size in [off_t(0), off_t(original.count + 700)] {
+            try rejected("path truncate size=\(size)", Int(truncate(file.path, size)), ENOTSUP)
+            try preserved("after-truncate-\(size)")
+        }
+        let fd = open(file.path, O_RDONLY)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(fd) }
+        guard fcntl(fd, F_NOCACHE, 1) == 0 else { throw POSIXError(.EIO) }
+        let blocked = Data("blocked".utf8)
+        for name in [key, "com.apple.releaseGuardNew"] {
+            let result = blocked.withUnsafeBytes { setxattr(file.path, name, $0.baseAddress, $0.count, 0, 0) }
+            try rejected("setxattr \(name)", Int(result), EPERM)
+        }
+        try rejected("removexattr", Int(removexattr(file.path, key, 0)), EPERM)
+        let missing = getxattr(file.path, "com.apple.releaseGuardNew", nil, 0, 0, 0)
+        guard missing == -1, errno == ENOATTR else { throw failed("new xattr appeared: result=\(missing), errno=\(errno)") }
+        let synced = fsync(fd)
+        print("COMPRESSED GUARD fsync: result=\(synced) errno=\(errno)")
+        guard synced == 0 else { throw failed("fsync after rejection: result=\(synced), errno=\(errno)") }
+        try preserved("after")
+        print("PASS compressed guard: writable opens, truncate, existing/new xattr and deletion rejected; old bytes and sync preserved, no AppleDouble sidecar")
+    } else {
+        print("PASS compressed guard: compressed file and xattr readable and unchanged on read-only mount")
+    }
+}
+
 func checkCaseVariants(_ volume: URL, payload: Data, writable: Bool) throws {
     func failed(_ operation: String) -> NSError {
         NSError(domain: "CaseSemantics", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: operation])
@@ -73,6 +148,7 @@ func checkOpenFileLifetime(_ volume: URL) throws {
     print("PASS: uncached read/fstat survive unlink and replacement rename; new path sees replacement data")
 }
 
+setbuf(stdout, nil)
 let device = ProcessInfo.processInfo.environment["XNTFS_TEST_DEVICE"]
 let readOnlyMedia = ProcessInfo.processInfo.environment["XNTFS_TEST_READ_ONLY_MEDIA"] == "1"
 let sourceImage = ProcessInfo.processInfo.environment["XNTFS_TEST_IMAGE"].map { URL(fileURLWithPath: $0) }
@@ -115,6 +191,7 @@ while true {
             guard url.path.hasPrefix("/Volumes/"), type == "xntfs", expectedSource else {
                 throw POSIXError(.EINVAL)
             }
+            print("FILESYSTEM phase=\(phase) type=\(type) source=\(source) target=\(url.path) flags=\(info.f_flags)")
             let payload = Data("Native FSKit image persistence test\n".utf8)
             let file = url.appendingPathComponent("native-integration.txt")
             guard info.f_bavail > info.f_blocks / 2 else { throw POSIXError(.ENOSPC) }
@@ -132,6 +209,15 @@ while true {
                 let staging = url.appendingPathComponent("native-staging.txt")
                 try payload.write(to: staging)
                 try FileManager.default.moveItem(at: staging, to: file)
+                let handle = try FileHandle(forWritingTo: file)
+                do {
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+                print("PASS explicit file sync and close")
                 guard try Data(contentsOf: file) == payload else { throw POSIXError(.EIO) }
                 try checkOpenFileLifetime(url)
                 try payload.write(to: url.appendingPathComponent("MiXeD-integration.txt"))
@@ -155,6 +241,22 @@ while true {
                     let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError ?? error
                     guard underlying.domain == NSPOSIXErrorDomain, underlying.code == Int(EROFS) else { throw error }
                 }
+            }
+            if ProcessInfo.processInfo.environment["XNTFS_TEST_COMPRESSED_GUARD"] == "1" {
+                try checkCompressedWriteGuard(url, writable: phase == "rw")
+            }
+            if ProcessInfo.processInfo.environment["XNTFS_TEST_STABILITY"] == "1",
+               phase == "rw" || phase == "remount-ro" {
+                guard let script = ProcessInfo.processInfo.environment["XNTFS_TEST_STABILITY_SCRIPT"],
+                      let report = ProcessInfo.processInfo.environment["XNTFS_TEST_STABILITY_OUTPUT"] else {
+                    throw POSIXError(.EINVAL)
+                }
+                let load = Process()
+                load.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                load.arguments = ["python3", "-B", script, phase, url.path, report]
+                try load.run()
+                load.waitUntilExit()
+                guard load.terminationStatus == 0 else { throw POSIXError(.EIO) }
             }
             checks += 1
             print("PASS host I/O: \(phase)")

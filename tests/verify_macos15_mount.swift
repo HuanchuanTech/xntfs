@@ -42,6 +42,23 @@ do {
             throw CheckError.invalid("No mounted volume under /Volumes")
         }
         print(path)
+    case "attachment":
+        try require(args.count == 5, "attachment INFO_PLIST OWNED_IMAGE WHOLE PARTITION")
+        let expected = URL(fileURLWithPath: args[2]).resolvingSymlinksInPath().path
+        let info = try plist(args[1]) as? [String: Any] ?? [:]
+        let images = info["images"] as? [[String: Any]] ?? []
+        let matches = images.filter {
+            guard let path = $0["image-path"] as? String else { return false }
+            return URL(fileURLWithPath: path).resolvingSymlinksInPath().path == expected
+        }
+        try require(matches.count == 1, "Exactly one current attachment for the owned image is required")
+        let devices = (matches[0]["system-entities"] as? [[String: Any]] ?? [])
+            .compactMap { $0["dev-entry"] as? String }
+        try require(args[3].range(of: #"^/dev/disk[0-9]+$"#, options: .regularExpression) != nil
+                    && "/dev/" + args[4] == args[3] + "s1"
+                    && devices.contains(args[3]) && devices.contains("/dev/" + args[4]),
+                    "Current whole/partition devices must belong to the owned image")
+        print("PASS: current attachment belongs to the owned image")
     case "check":
         try require(getuid() != 0, "Host I/O checks must run as the desktop user")
         let phase = args[1], path = args[2], device = args[3]
@@ -59,6 +76,15 @@ do {
             try require(!readOnly, "Writable request remained read-only")
             let staging = root.appendingPathComponent("unified-flow-staging.txt")
             try payload.write(to: staging)
+            let handle = try FileHandle(forWritingTo: staging)
+            do {
+                try handle.synchronize()
+                try handle.close()
+            } catch {
+                try? handle.close()
+                throw error
+            }
+            print("PASS: explicit file sync and close")
             try FileManager.default.moveItem(at: staging, to: target)
             try require(try Data(contentsOf: target) == payload, "Readback differs")
         } else {

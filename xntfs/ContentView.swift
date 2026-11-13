@@ -373,7 +373,7 @@ struct DeviceDetailView: View {
                         Task { await model.unmount(device) }
                     } label: { Label("Eject", systemImage: "eject.fill") }
 
-                    if let url = device.state.mountPoint {
+                    if let url = device.state.mountPoint, device.mountDriver != .unknown {
                         Button {
                             NSWorkspace.shared.activateFileViewerSelecting([url])
                         } label: { Label("Reveal in Finder", systemImage: "folder") }

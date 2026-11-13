@@ -13,29 +13,42 @@ struct MountSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openWindow) private var openWindow
-    let device: NTFSDevice
+    // Keep the target of this presentation even when its parent is refreshed.
+    @State private var device: NTFSDevice
 
     @State private var readOnly = false
     @State private var busy = false
     @State private var errorText: String?
     @State private var systemCommand: String?
 
+    init(device: NTFSDevice) {
+        _device = State(initialValue: device)
+    }
+
+    private var currentDevice: NTFSDevice? {
+        model.devices.first { $0.isSameDevice(as: device) }
+    }
+
     var body: some View {
+        let current = currentDevice
+        let mediaWritable = current?.mediaWritable ?? device.mediaWritable
+        let visibleError = current == nil ? MountError.diskNotFound(device.id).localizedDescription : errorText
+        let visibleSystemCommand = current == nil ? nil : systemCommand
         VStack(alignment: .leading, spacing: 16) {
             Text("Mount \(device.displayName)").font(.title2).bold()
             Text("Mounts under /Volumes.").font(.callout).foregroundStyle(.secondary)
 
             Toggle("Mount read-only", isOn: $readOnly)
-                .disabled(busy || !device.mediaWritable)
-            if !device.mediaWritable {
+                .disabled(busy || current == nil || !mediaWritable)
+            if !mediaWritable {
                 Text("This volume is read-only (e.g. an image attached read-only) and can only be mounted read-only.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            if let errorText {
+            if let errorText = visibleError {
                 Divider()
-                Text(errorText).font(.callout).foregroundStyle(systemCommand == nil ? .red : .primary)
-                if let systemCommand { CopyableCommand(command: systemCommand) }
+                Text(errorText).font(.callout).foregroundStyle(visibleSystemCommand == nil ? .red : .primary)
+                if let systemCommand = visibleSystemCommand { CopyableCommand(command: systemCommand) }
                 Button("Open Disk Utility") { DiskUtility.open() }
                 Button("Report a Problem...") { openWindow(id: "problem-report") }
             }
@@ -48,32 +61,48 @@ struct MountSheet: View {
                     .disabled(busy)
                 Button("Mount") { Task { await doMount() } }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(busy)
+                    .disabled(busy || current == nil)
             }
         }
         .padding(20)
         .frame(width: 520)
-        .frame(minHeight: errorText == nil ? 230 : 320)
+        .frame(minHeight: visibleError == nil ? 230 : 320)
         .interactiveDismissDisabled(busy)
         .onAppear {
-            readOnly = !device.mediaWritable ? true
+            readOnly = !mediaWritable ? true
                 : (device.kind == .diskImage ? model.settings.imageReadOnly : model.settings.deviceReadOnly)
         }
         // The sandbox denial doesn't depend on the access mode, so keep the shown command in
         // sync with the toggle instead of leaving a stale rw/readOnly command to be copied.
-        .onChange(of: readOnly) { _, newValue in
-            guard systemCommand != nil else { return }
-            systemCommand = SystemMountCommand.diskutil(bsdName: device.id, readOnly: newValue || !device.mediaWritable)
+        .onChange(of: readOnly) { _, _ in updateSystemCommand() }
+        .onChange(of: current?.mediaWritable) { _, writable in
+            if writable == false { readOnly = true }
+            updateSystemCommand()
         }
+    }
+
+    private func updateSystemCommand() {
+        guard systemCommand != nil else { return }
+        guard let current = currentDevice else { systemCommand = nil; return }
+        systemCommand = SystemMountCommand.diskutil(bsdName: current.id, readOnly: readOnly || !current.mediaWritable)
     }
 
     private func doMount() async {
         guard !busy else { return }
         errorText = nil
         systemCommand = nil
+        guard let current = currentDevice else {
+            errorText = MountError.diskNotFound(device.id).localizedDescription
+            return
+        }
         busy = true
         defer { busy = false }
-        switch await model.mount(device, readOnly: readOnly) {
+        let outcome = await model.mount(current, readOnly: readOnly || !current.mediaWritable)
+        guard currentDevice != nil else {
+            errorText = MountError.diskNotFound(device.id).localizedDescription
+            return
+        }
+        switch outcome {
         case .mounted: dismiss()
         case .failed(let msg): errorText = msg
         case .needsSystemMount(let msg, let command):

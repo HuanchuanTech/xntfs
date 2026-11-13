@@ -15,14 +15,16 @@ struct AttachedDeviceTests {
             throw Failure("Expected one enabled installed extension: \(status.diagnosticReport)")
         }
         print("EXTENSION \(status.moduleURLs[0].path)")
+        if CommandLine.arguments.dropFirst() == ["--status-only"] { return }
         let name = CommandLine.arguments[1]
         let readOnlyMedia = ProcessInfo.processInfo.environment["XNTFS_TEST_READ_ONLY_MEDIA"] == "1"
-        let model = AppModel()
+        let model = AppModel(monitor: DiskArbitrationMonitor(), settings: AppSettings(defaults: nil))
         model.start()
         let original = try await waitForDevice(model, name: name) { !$0.state.isMounted }
         guard original.kind == .diskImage, original.mediaWritable != readOnlyMedia, original.registryEntryID != nil else {
             throw Failure("Unexpected disposable image media properties")
         }
+        print("DEVICE name=\(name) registry=\(original.registryEntryID!) writable=\(original.mediaWritable)")
         var stale = original
         stale.registryEntryID = original.registryEntryID! ^ 1
         let monitor = DiskArbitrationMonitor()!
@@ -42,7 +44,7 @@ struct AttachedDeviceTests {
             if case .mounted = await model.mount(mounted, readOnly: !readOnly) {
                 throw Failure("Accepted a duplicate mount")
             }
-            let reopened = AppModel()
+            let reopened = AppModel(monitor: DiskArbitrationMonitor(), settings: AppSettings(defaults: nil))
             reopened.start()
             let recovered = try await waitForDevice(reopened, name: name) { $0.state.isMounted }
             guard recovered.mountedByXntfs, recovered.readOnly == readOnly else { throw Failure("Incorrect recovered mount") }

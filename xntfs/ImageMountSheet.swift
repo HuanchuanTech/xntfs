@@ -70,7 +70,7 @@ struct ImageDetailView: View {
                 LabeledContent("Name", value: image.name)
                 LabeledContent("Image file", value: image.source.path)
                     .textSelection(.enabled)
-                LabeledContent("Capacity", value: image.sizeBytes.humanSize)
+                LabeledContent("Capacity", value: image.sizeBytes == 0 ? String(localized: "Unknown") : image.sizeBytes.humanSize)
                 LabeledContent("Format", value: "NTFS (xntfs)")
                 LabeledContent("Mounted at", value: image.mountPoint.path)
                 LabeledContent("Access") {
